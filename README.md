@@ -1,5 +1,15 @@
 # wasmsh
 
+## 本 Fork 的项目目标
+
+面向 AI 助手提供统一的 Bash 兼容沙箱，减少对宿主 PowerShell / sh 和系统工具环境的依赖。主交付物为 GitHub Actions 编译的独立 sh WASM，不包含 WASM Python / Pyodide。
+
+- [项目目标、范围与里程碑](docs/project-goals.md)
+- [时间回调、网络黑白名单与 external 管道需求](docs/design/ai-shell-requirements.md)
+- [独立 WASM 的 GitHub Actions 构建计划](docs/guides/standalone-wasm-build-plan.md)
+
+以上文档描述本 Fork 的目标和待实施工作，不代表功能已经实现。以下保留上游介绍，其中 Python、集群部署和发布渠道不属于本 Fork 的主交付范围。
+
 **Bash-compatible shell runtime in Rust, compiled to WebAssembly. Runs in browsers, inside Pyodide, and as a horizontally-scaled sandbox pool on Kubernetes — all from one codebase.**
 
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen)](.github/workflows/ci.yml)
