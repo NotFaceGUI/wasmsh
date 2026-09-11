@@ -3164,6 +3164,7 @@ mod wasm_bindings {
                 })
         }
 
+        #[allow(clippy::needless_pass_by_value)] // JS handles are passed by value
         fn parse_number(value: JsValue, field: &str) -> Result<f64, String> {
             value
                 .as_f64()
@@ -3204,21 +3205,17 @@ mod wasm_bindings {
 
     impl ExternalProcess for JsExternalProcess {
         fn write_stdin(&mut self, data: &[u8]) -> ExternalProcessWrite {
-            let response = match self.call("write_stdin", data) {
-                Ok(response) => response,
-                Err(_) => {
-                    return ExternalProcessWrite {
-                        accepted: 0,
-                        would_block: false,
-                        closed: true,
-                    }
-                }
+            let Ok(response) = self.call("write_stdin", data) else {
+                return ExternalProcessWrite {
+                    accepted: 0,
+                    would_block: false,
+                    closed: true,
+                };
             };
             let accepted = js_sys::Reflect::get(&response, &JsValue::from_str("accepted"))
                 .ok()
                 .and_then(|value| Self::parse_number(value, "accepted").ok())
-                .map(|value| value.max(0.0) as usize)
-                .unwrap_or(0);
+                .map_or(0, |value| value.max(0.0) as usize);
             let would_block = js_sys::Reflect::get(&response, &JsValue::from_str("would_block"))
                 .ok()
                 .and_then(|value| value.as_bool())
@@ -3301,6 +3298,7 @@ mod wasm_bindings {
     }
 
     impl JsClockProvider {
+        #[allow(clippy::needless_pass_by_value)] // JS handles are passed by value
         fn callback_error(value: JsValue) -> ClockError {
             ClockError::Callback(
                 value
@@ -3309,6 +3307,7 @@ mod wasm_bindings {
             )
         }
 
+        #[allow(clippy::needless_pass_by_value)] // JS handles are passed by value
         fn number(value: JsValue, label: &str) -> Result<f64, ClockError> {
             let value = value
                 .as_f64()
@@ -3323,6 +3322,7 @@ mod wasm_bindings {
 
         /// Monotonic readings (`performance.now()`) are legitimately
         /// fractional, unlike the integer Unix-millisecond wall clock.
+        #[allow(clippy::needless_pass_by_value)] // JS handles are passed by value
         fn monotonic_number(value: JsValue, label: &str) -> Result<f64, ClockError> {
             let value = value
                 .as_f64()
@@ -3571,7 +3571,7 @@ mod wasm_bindings {
                 .set_clock_provider(Box::new(JsClockProvider { callback }));
         }
 
-        /// Remove the clock capability. Date and SigV4 then fail rather than
+        /// Remove the clock capability. `Date` and `SigV4` then fail rather than
         /// falling back to a startup timestamp or a fabricated default.
         pub fn clear_clock_callback(&mut self) {
             self.runtime.set_clock_provider(Box::new(UnavailableClock));
