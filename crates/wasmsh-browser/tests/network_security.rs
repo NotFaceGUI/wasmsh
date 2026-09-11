@@ -7,10 +7,14 @@
 //! These tests require network access and will be skipped if
 //! `mayflower.de` is unreachable.
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use wasmsh_browser::WorkerRuntime;
-use wasmsh_protocol::{HostCommand, WorkerEvent};
+use wasmsh_protocol::{HostCommand, NetworkDefaultAction, NetworkPolicyConfig, WorkerEvent};
 use wasmsh_utils::net_types::{
     HostAllowlist, HttpRequest, HttpResponse, NetworkBackend, NetworkError,
 };
@@ -37,7 +41,8 @@ impl NetworkBackend for NativeNetworkBackend {
     fn fetch(&self, request: &HttpRequest) -> Result<HttpResponse, NetworkError> {
         self.allowlist.check(&request.url)?;
 
-        let ureq_req = ureq::request(&request.method, &request.url);
+        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        let ureq_req = agent.request(&request.method, &request.url);
         let mut req = ureq_req;
         for (key, value) in &request.headers {
             req = req.set(key, value);
@@ -70,6 +75,12 @@ impl NetworkBackend for NativeNetworkBackend {
                 })
             }
             Err(ureq::Error::Status(status, resp)) => {
+                let mut headers = Vec::new();
+                for name in resp.headers_names() {
+                    if let Some(value) = resp.header(&name) {
+                        headers.push((name, value.to_string()));
+                    }
+                }
                 let mut body = Vec::new();
                 resp.into_reader()
                     .take(1024 * 1024)
@@ -77,7 +88,7 @@ impl NetworkBackend for NativeNetworkBackend {
                     .unwrap_or(0);
                 Ok(HttpResponse {
                     status,
-                    headers: vec![],
+                    headers,
                     body,
                 })
             }
@@ -130,6 +141,7 @@ fn init_runtime_with_network(allowed_hosts: Vec<String>) -> WorkerRuntime {
     rt.handle_command(HostCommand::Init {
         step_budget: 0,
         allowed_hosts,
+        network_policy: None,
     });
     rt
 }
@@ -342,6 +354,7 @@ fn curl_no_backend_returns_error() {
     rt.handle_command(HostCommand::Init {
         step_budget: 0,
         allowed_hosts: vec![],
+        network_policy: None,
     });
     let events = rt.handle_command(HostCommand::Run {
         input: "curl https://mayflower.de".into(),
@@ -434,4 +447,66 @@ fn curl_pipe_to_shell_command() {
         line_count > 5,
         "expected multiple lines from mayflower.de, got {line_count}"
     );
+}
+
+#[test]
+fn denied_redirect_target_is_never_received_by_controlled_server() {
+    let allowed_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let allowed_port = allowed_listener.local_addr().unwrap().port();
+    let denied_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let denied_port = denied_listener.local_addr().unwrap().port();
+    denied_listener.set_nonblocking(true).unwrap();
+
+    let denied_hits = Arc::new(Mutex::new(0_u32));
+    let denied_hits_thread = Arc::clone(&denied_hits);
+    let denied_thread = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_millis(750);
+        while std::time::Instant::now() < deadline {
+            match denied_listener.accept() {
+                Ok((mut stream, _)) => {
+                    *denied_hits_thread.lock().unwrap() += 1;
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ndenied");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let redirect_location = format!("http://127.0.0.1:{denied_port}/private");
+    let allowed_thread = thread::spawn(move || {
+        let (mut stream, _) = allowed_listener.accept().unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request);
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {redirect_location}\r\nContent-Length: 0\r\n\r\n"
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let mut rt = WorkerRuntime::new();
+    // Let the inner transport accept both ports. The runtime-level structured
+    // policy must be the component that prevents the denied hop from reaching
+    // the transport.
+    rt.set_network_backend(Box::new(NativeNetworkBackend::new(vec!["*".into()])));
+    let init_events = rt.handle_command(HostCommand::Init {
+        step_budget: 0,
+        allowed_hosts: Vec::new(),
+        network_policy: Some(NetworkPolicyConfig {
+            enabled: true,
+            default_action: NetworkDefaultAction::Deny,
+            allow: vec![format!("127.0.0.1:{allowed_port}")],
+            deny: vec![format!("127.0.0.1:{denied_port}")],
+        }),
+    });
+    assert!(matches!(init_events.as_slice(), [WorkerEvent::Version(_)]));
+    let events = rt.handle_command(HostCommand::Run {
+        input: format!("curl -sL http://127.0.0.1:{allowed_port}/redirect"),
+    });
+    assert_ne!(extract_exit_code(&events), Some(0));
+    allowed_thread.join().unwrap();
+    denied_thread.join().unwrap();
+    assert_eq!(*denied_hits.lock().unwrap(), 0);
 }

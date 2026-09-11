@@ -1,18 +1,20 @@
 # 独立 sh WASM：GitHub Actions 构建计划
 
-状态：待实施工作流设计；本次仅编写文档，没有运行云端构建或发布产物。总体目标见 [项目目标](../project-goals.md)。
+状态：M0-M4 的代码和本地验收入口已在当前分支实施；GitHub Actions、浏览器
+云端构建和正式发布仍待运行。正式产物不能以本地手工 wasm-bindgen 目录替代。
+总体目标见 [项目目标](../project-goals.md)。
 
 ## 1. 现有流程的可复用部分与阻碍
 
 | 文件 | 当前情况 | 处理要求 |
 | --- | --- | --- |
-| [wasm-build.yml](../../.github/workflows/wasm-build.yml) | 已构建 bundler/web/nodejs，但绑定 `mayflower-k8s-runners`，同一流程另建 Pyodide；无手动触发 | 改成独立 sh 工作流，提供 workflow_dispatch，使用本 fork 可用 runner |
-| [release.yml](../../.github/workflows/release.yml) | 最终 Release 依赖 Pyodide、crates/npm/PyPI 与容器发布 | 单独建立 standalone release 链路，不继承上游密钥或包发布目标 |
-| [ci.yml](../../.github/workflows/ci.yml) | 主 CI 同样使用上游 runner，外部 fork PR 被跳过 | 配套迁移核心检查；公开 PR 使用隔离的 GitHub-hosted runner，不能把跳过当通过 |
+| [wasm-build.yml](../../.github/workflows/wasm-build.yml) | 已迁移为独立 sh candidate、实物验证和 GitHub-hosted 三平台消费矩阵；尚无本地云端 run 证据 | 保持 `workflow_dispatch`、固定工具和最终上传门禁 |
+| [release.yml](../../.github/workflows/release.yml) | 已建立 standalone release 链路，并让 Release 等待 browser 与三平台 host matrix | 不继承上游密钥或包发布目标；tag 发布仍待实际 run 验证 |
+| [ci.yml](../../.github/workflows/ci.yml) | 主 CI 使用 GitHub-hosted runner 做核心 Rust/WASM 检查 | 公开 PR 不依赖上游 runner；standalone 产物验证由 wasm-build workflow 提供 |
 | [setup-rust action](../../.github/actions/setup-rust/action.yml) | 从 rust-toolchain.toml 读取版本，安装系统编译依赖 | 复用版本单一来源；评估 Ubuntu runner 是否需要现有 apt 安装步骤 |
 | [rust-toolchain.toml](../../rust-toolchain.toml) | 固定 Rust 1.95.0，同时声明 unknown-unknown 和 emscripten | shell 主链路仅要求 unknown-unknown；移除默认 emscripten 安装需求或拆分 legacy 配置 |
 | [Cargo.toml](../../Cargo.toml) | 已有独立 browser crate；Pyodide crates 被 workspace exclude | 不需要先删除 Python 源码才能构建 shell；避免全 workspace 命令带入无关服务端交付 |
-| [standalone build.sh](../../e2e/standalone/build.sh) | wasm-pack 输出到 E2E fixture，含本地 macOS 工具路径 | 抽出可参数化独立构建入口，移除宿主特定路径假设 |
+| [standalone build.sh](../../e2e/standalone/build.sh) | 仅负责把参数化 standalone builder 输出放入 E2E fixture | 正式构建使用 `tools/standalone/build.sh`，不在 E2E job 重编译 |
 | [standalone E2E](../../e2e/standalone/package.json) | 已有 Playwright 套件与 package-lock.json | 使用锁文件安装；验证即将上传的产物，避免另建一份不同二进制 |
 
 现有 wasm-build 的注释记录 GitHub-hosted runner 上发生过 worker 超时与 `WebAssembly.Table.grow()` 失败。因此迁移到 `ubuntu-24.04` 是待验证的实施选择，不是已验证修复。先以 Chromium 单 worker、有限并发运行，记录资源与错误；若仍失败，诊断编译/内存行为或选择本项目可用的 runner，不能删除 E2E 门禁掩盖问题。
@@ -39,7 +41,10 @@ wasmsh-standalone-<version>-<commit>/
   SHA256SUMS
 ```
 
-`host/` 是后续接入层交付要求，当前仓库尚没有满足本设计的独立宿主包。M0 只能标记基础 shell 产物，不能宣称 external/live-clock 已具备。
+`host/` 是接入层交付目录；包含有限输入 executor、基于
+`StartRun`/`PollRun` 的非阻塞 Node stream executor，以及一个逐请求、禁止自动
+重定向的 Node HTTP(S) broker。M1-M3 的 Rust/WASM/Node 路径已有本地证据；
+browser native-process 和跨平台云端最终证据仍不能从本地测试推导。
 
 build-manifest 至少包括版本、源 commit、构建 run ID、Rust/wasm-pack/wasm-opt/Node 版本、目标、特性与资源限制配置；SHA256SUMS 覆盖最终发布文件（清单自身除外）。报告 WASM 原始大小和 gzip 大小，首个成功基线之后再制定体积回归阈值。
 
@@ -84,15 +89,16 @@ concurrency 按 workflow/ref 区分，可取消旧分支构建；正式版本发
 ### C. test-final-artifacts
 
 - Node 从产物目录加载，执行 `printf hello | wc -c`、文件写读、cwd/变量跨 Run 保存、退出状态与会话隔离。
-- web 将同一已优化产物放入 fixture 运行 Playwright；不要在测试 job 又重新编译一次。检查初始化与 Worker 通信、基础 shell、真实宿主网络桥接。
-- bundler 在最小锁定依赖的消费项目中实际打包并加载，防止只验证 Node 导致 ESM/package metadata 错误漏检。
-- Windows/Linux/macOS 的 JS 宿主矩阵下载同一 WASM 包测试基础行为；external 使用小型跨平台测试程序制造 stdin、双输出、大流量、非零退出和取消场景。浏览器只验其声明支持的工具能力。
+- web 将同一已优化产物放入 fixture 运行 Playwright；不要在测试 job 又重新编译一次。检查初始化与 Worker 通信、基础 shell、clock、二进制 VFS、权限拒绝和 browser broker 限制。
+- bundler 在最小锁定依赖的消费项目中实际加载并运行 clock/VFS/权限断言，防止只验证 Node 导致 ESM/package metadata 错误漏检；当前 smoke 使用锁定的 `esbuild 0.28.2` 打包 JS，同时保留 wasm-bindgen glue 与 WASM ESM 模块的共享链接。
+- Windows/Linux/macOS 的 JS 宿主矩阵下载同一 WASM 包测试 clock、真实本地 HTTP broker、external、隔离和取消；external 使用小型跨平台测试程序制造 stdin、双输出、大流量、非零退出和进程回收场景。
 - 无 Python 环境/禁外网启动测试必须通过；网络功能使用本地可控服务器。纯浏览器 CORS/重定向限制单独记录，不能把 CORS 失败当作策略阻断成功。
 - 外部进程测试记录回收状态；测试结束没有残留子进程。失败上传 trace、stdout/stderr、manifest 和资源信息。
 
 ### D. package / release
 
 - 对验证过的原文件打包，不重新编译或优化；校验解包后的 SHA-256 并从干净目录再次做最小加载。
+- manifest 必须记录每个 target 的 WASM 字节数、gzip 大小和 SHA-256；`VERSION`、每个 target `package.json`、host 声明和完整 `SHA256SUMS` 必须一致。
 - main/手动构建上传可下载 artifact；tag 流程发布独立 standalone GitHub Release，长期消费不依赖临时 artifact 保留期。
 - 第一期不要求 npm/crates.io/PyPI/GHCR 发布；移除对上游包名、组织镜像和 trusted publishing 的依赖。
 - 发布说明列出已完成需求、接口版本、宿主要求与未支持能力；M1-M3 未完成时不能称为 AI 沙箱改造完整版。

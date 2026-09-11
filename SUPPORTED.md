@@ -1,5 +1,28 @@
 # Supported Syntax and Commands
 
+## Fork Delivery Status
+
+The standalone artifact is the primary AI-shell delivery. Its base tier is
+the in-process Bash-compatible runtime, POSIX virtual filesystem, binary
+protocol events, session isolation, and cooperative step-budget cancellation.
+The complete Node host tier adds live clock callbacks, structured network
+policy plus a redirect-aware broker, finite external commands, and progressive
+external pipelines. The final-artifact Node/bundler smoke and Playwright suite
+exercise these against a real build; that suite is wired into
+`.github/workflows/wasm-build.yml` but the cloud run is pending, so treat local
+Windows results as the only executed evidence so far. The browser worker has no
+native process executor.
+
+Known limits: the included browser network path refuses synchronous XHR because
+it cannot enforce redirect policy before the next request; browser native
+external processes require a separate trusted broker; `Cancel` is cooperative;
+and the runtime is not a full GNU Bash, PTY, or job-control implementation.
+Windows/Linux/macOS host consumption is defined in
+`.github/workflows/wasm-build.yml`; this local Windows run cannot provide
+cloud runner evidence for Linux/macOS. See
+[`docs/implementation-tracker.md`](docs/implementation-tracker.md) for the
+actual verification status.
+
 ## Shell Syntax
 
 ### Implemented
@@ -167,7 +190,7 @@ All utilities operate on the in-process VFS (no OS calls).
 | `uname`      | Done   | Print system information (static sandbox values) |
 | `hostname`   | Done   | Print hostname (static sandbox value) |
 | `sleep`      | Done   | Delay (no-op in sandbox; returns immediately) |
-| `date`       | Done   | Print date/time |
+| `date`       | Done   | Uses the host clock callback in standalone production mode; fixed time and legacy `WASMSH_DATE` are explicit test/compatibility modes. |
 
 ### Simple utilities (18)
 
@@ -189,7 +212,7 @@ All utilities operate on the in-process VFS (no OS calls).
 | `cksum`      | Done   | Print CRC checksum and byte count |
 | `tsort`      | Done   | Topological sort |
 | `install`    | Done   | Copy files and set attributes |
-| `timeout`    | Done   | Run command with time limit |
+| `timeout`    | Rejected | Returns status 125 with a diagnostic. The synchronous sandbox cannot preempt an in-process command; host adapters enforce a real wall-clock limit for external processes. |
 | `cal`        | Done   | Display a calendar |
 
 ### Diff and patch (2)
@@ -262,7 +285,11 @@ All utilities operate on the in-process VFS (no OS calls).
 | `curl`       | Done   | HTTP client — GET/POST/HEAD/PUT/DELETE/PATCH; multi-URL (positional + `--next`/`-:` + `--remote-name-all`); request shaping (`-H`, `-d`/`--data-ascii`/`--data-binary`/`--data-raw`/`--data-urlencode`/`--json`, `@file` bodies, `-F`/`--form-string` multipart, `-T`/`--upload-file`, `-G`/`--get`, `-r`/`--range`, `-b`/`--cookie` (literal or `@file`), `-z`/`--time-cond`, `--compressed` with gzip/deflate decoding); auth (`-u` basic, `--oauth2-bearer`, `-n`/`--netrc`/`--netrc-file`, `--aws-sigv4`, `-A`, `-e`); config expansion (`-K`/`--config FILE`); response shaping (`-i`/`-D`, `-o`/`-O`/`-J`, `--output-dir`, `--create-dirs`, `-w` tokens incl. `url_effective`, `method`, `scheme`, `urlnum`, `num_headers`, `header{X}`, `json`, `header_json`, `http_version`, `content_type`, `size_download`, `--fail`/`--fail-with-body`); sandbox limits (`--max-time`, `--connect-timeout`, `--max-filesize`, `--max-redirs`, `--retry*`). Cosmetic/transport-controlled flags (`--http*`, `--tlsv*`, `-4`/`-6`, `--tcp-*`, `--resolve`, `-#`, `-k`, `--path-as-is`, `-Z`/`--parallel`, …) are silently accepted so scripts written for real curl run unchanged. Tier-4 flags that require capabilities the sandbox cannot safely expose (FTP/SMTP, proxies, client certs, Unix sockets, DoH, SOCKS, cookie jar, `--trace*`, …) are rejected with a "not supported in sandbox" diagnostic. |
 | `wget`       | Done   | File downloader — multi-URL, `-O`/`--output-document` (incl. `-`), `--header`, `--user=`/`--password=` basic auth, `--post-data=`, `--tries=`, `--timeout=`, `--content-disposition`, quiet mode. `--no-check-certificate`/`--server-response`/`--show-progress` accepted as silent no-ops. |
 
-Network access requires an allowlist of permitted hosts configured at sandbox initialization. Without an allowlist, both commands return an error. See [ADR-0021](docs/adr/adr-0021-network-capability.md).
+Network access requires an allowlist or structured policy configured at
+sandbox initialization. Without it, both commands return an error. Standalone
+Node consumers must install the shipped no-redirect network broker; the
+browser fixture intentionally refuses its synchronous XHR path. See
+[ADR-0021](docs/adr/adr-0021-network-capability.md).
 
 ---
 
@@ -438,10 +465,14 @@ Arithmetic is available in `$(( ))`, `(( ))`, `let`, and `declare -i` contexts. 
 
 | Target | Triple | FS Backend | Python | Build Command |
 |--------|--------|------------|--------|---------------|
-| **Standalone** | `wasm32-unknown-unknown` | `MemoryFs` (in-process) | N/A | `just build-standalone` |
-| **Pyodide** | `wasm32-unknown-emscripten` | `EmscriptenFs` (libc, shared with Python) | In-process via `PyRun_SimpleString` | `just build-pyodide` |
+| **Standalone** | `wasm32-unknown-unknown` | `MemoryFs` (in-process) | No Python runtime | `just build-standalone` |
+| **Pyodide legacy** | `wasm32-unknown-emscripten` | `EmscriptenFs` (libc, shared with Python) | In-process via `PyRun_SimpleString` | `just build-pyodide` |
 
-### Pyodide-only commands
+### Pyodide-only legacy profile
+
+The following commands and package-install behavior belong to the separate
+Pyodide build. They are not present in, and are not downloaded by, the
+standalone artifact.
 
 | Command | Flags | Description |
 |---------|-------|-------------|

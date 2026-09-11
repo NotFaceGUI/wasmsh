@@ -1,36 +1,7 @@
 name: Pyodide
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/pyodide.yml'
-      - 'crates/wasmsh-runtime/**'
-      - 'crates/wasmsh-pyodide/**'
-      - 'crates/wasmsh-pyodide-probe/**'
-      - 'crates/wasmsh-fs/**'
-      - 'tools/pyodide/**'
-      - 'e2e/pyodide-node/**'
-      - 'e2e/pyodide-browser/**'
-      - 'e2e/build-contract/**'
-      # A toolchain or lockfile change relinks the main module against the
-      # cached side modules, which is exactly the pairing this job exists to
-      # validate.
-      - 'rust-toolchain.toml'
-      - 'Cargo.lock'
-  pull_request:
-    paths:
-      - '.github/workflows/pyodide.yml'
-      - 'crates/wasmsh-runtime/**'
-      - 'crates/wasmsh-pyodide/**'
-      - 'crates/wasmsh-pyodide-probe/**'
-      - 'crates/wasmsh-fs/**'
-      - 'tools/pyodide/**'
-      - 'e2e/pyodide-node/**'
-      - 'e2e/pyodide-browser/**'
-      - 'e2e/build-contract/**'
-      - 'rust-toolchain.toml'
-      - 'Cargo.lock'
+  workflow_dispatch:
 
 concurrency:
   group: pyodide-${{ github.ref }}

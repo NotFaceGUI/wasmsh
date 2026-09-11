@@ -8,20 +8,42 @@
 - [时间回调、网络黑白名单与 external 管道需求](docs/design/ai-shell-requirements.md)
 - [独立 WASM 的 GitHub Actions 构建计划](docs/guides/standalone-wasm-build-plan.md)
 
-以上文档描述本 Fork 的目标和待实施工作，不代表功能已经实现。以下保留上游介绍，其中 Python、集群部署和发布渠道不属于本 Fork 的主交付范围。
+以上文档描述目标、边界和验收证据；实际已实现能力以
+[`SUPPORTED.md`](SUPPORTED.md) 与实施跟踪为准。当前主交付是独立 standalone
+sh WASM；Python、集群部署和发布渠道属于保留的 legacy profile，不会进入
+standalone 产物。
 
-**Bash-compatible shell runtime in Rust, compiled to WebAssembly. Runs in browsers, inside Pyodide, and as a horizontally-scaled sandbox pool on Kubernetes — all from one codebase.**
+## Standalone quick start
 
-[![CI](https://img.shields.io/badge/CI-passing-brightgreen)](.github/workflows/ci.yml)
+使用已解包的 standalone artifact 运行 Node 接入示例：
+
+```sh
+node examples/standalone/node.mjs path/to/wasmsh-standalone-<version>-<commit>
+```
+
+示例加载 `nodejs/` 产物，安装实时 host clock，验证二进制 VFS，并通过
+`shell: false` 的固定 external 注册传递 stdin。完整的 Node、browser、bundler
+API 和网络 broker 约束见
+[Standalone WASM embedding](docs/guides/standalone-embedding.md)。
+
+**Bash-compatible shell runtime in Rust, compiled to WebAssembly.** The primary
+delivery of this fork is the standalone sh WASM built by this repository's
+GitHub Actions; browsers, Pyodide, and the Kubernetes sandbox pool are legacy
+profiles retained from upstream and are not part of the standalone artifact.
+
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![crates.io](https://img.shields.io/crates/v/wasmsh-runtime.svg)](https://crates.io/crates/wasmsh-runtime)
-[![npm](https://img.shields.io/npm/v/@mayflowergmbh/wasmsh-pyodide.svg)](https://www.npmjs.com/package/@mayflowergmbh/wasmsh-pyodide)
+[![standalone WASM](https://img.shields.io/badge/build-standalone%20wasm-blue)](.github/workflows/wasm-build.yml)
 
 ## What it is
 
-A sandbox for LLM agents that need a shell, Python, and a filesystem without giving the model host access. Bash with 88 utilities (grep, sed, awk, jq, tar, curl, …), Python 3.13 with pip/micropip for pure-Python packages, a virtual filesystem — all running in-process as WebAssembly, with no OS processes and no network unless explicitly allowed.
+A sandbox for AI agents that need a Bash-compatible shell and a virtual
+filesystem without giving the script implicit host access. The primary
+standalone delivery runs the shell in WebAssembly with 88 utilities, binary
+events, no Python runtime, no native processes by default, and no network
+unless a host capability is explicitly installed. Python/Pyodide remains a
+separate legacy profile.
 
-Three deployment modes from one core:
+Primary and legacy deployment modes from one core:
 
 | Target | When | Entry point |
 |-|-|-|
@@ -35,7 +57,9 @@ Three deployment modes from one core:
 
 LLM-generated shell commands are adversarial input. wasmsh is built so a bad `rm -rf /` or a curl to an exfil host cannot escape the sandbox:
 
-- **WASM boundary.** No syscalls, no `std::fs`, no host `exec` in any shipped profile. The wasm module only sees what the embedder hands it.
+- **WASM boundary.** The standalone WASM core has no syscalls or `std::fs`.
+  Node native processes are an explicit, fixed registration through the
+  shipped host adapter, never an implicit shell command.
 - **Capability-based VFS.** Every session gets an isolated in-memory filesystem; nothing on the host is visible unless the embedder mounts it.
 - **Network allowlist.** `curl` / `wget` route through a host-mediated broker that enforces a per-session hostname allowlist. Empty list = no network.
 - **Step budgets.** Every command runs with a bounded step count; runaway loops and fork-bombs terminate deterministically.
@@ -46,7 +70,9 @@ Full surface in [docs/reference/sandbox-and-capabilities.md](docs/reference/sand
 
 ### Fast and dense
 
-No containers, no VMs, no OS processes per session. Starting a sandbox is a wasm snapshot restore, not a `docker run`:
+The standalone core needs no container or VM and starts as a WASM instance;
+optional Node external commands are separate host processes only when the
+caller registers them:
 
 - **~300 ms cold spawn**, **~6 ms snapshot restore** once the template worker is warm
 - **~1.5 ms** per warm bash command, **~3 ms** per warm `python3 -c` round-trip through the dispatcher
@@ -115,14 +141,27 @@ Runnable examples covering every deployment shape:
 
 ## Install
 
+The primary deliverable is the standalone sh WASM artifact produced by
+[`.github/workflows/wasm-build.yml`](.github/workflows/wasm-build.yml). A
+successful run uploads `wasmsh-standalone-<version>-<commit>` with the three
+loaders, type declarations, host adapters, license, `VERSION`, and a SHA256
+manifest; tagged `v*` builds publish the same verified archive as a Release.
+
+Build locally with `bash tools/standalone/build.sh dist/standalone-pkg` (needs
+the pinned wasm-pack, wasm-bindgen-cli, and Binaryen 117 from
+[`tools/standalone/versions.env`](tools/standalone/versions.env)) or run
+`just ci` for the Rust checks.
+
+The registry packages below (`crates.io`, npm, PyPI, container images) belong
+to the upstream Pyodide/Kubernetes profile and are **not** published by this
+fork; do not expect the standalone shell there.
+
 | Registry | Package | Install |
 |-|-|-|
 | crates.io | `wasmsh-runtime` | `cargo add wasmsh-runtime` |
 | npm | `@mayflowergmbh/wasmsh-pyodide` | `npm i @mayflowergmbh/wasmsh-pyodide` |
 | PyPI | `wasmsh-pyodide-runtime` | `pip install wasmsh-pyodide-runtime` |
 | Containers | `ghcr.io/mayflower/wasmsh-{dispatcher,runner}` | `docker pull` |
-
-Pre-built tarballs and image digests: [GitHub Releases](https://github.com/mayflower/wasmsh/releases). Build from source: `just ci` (Rust), `just build-standalone`, `just build-pyodide`.
 
 ## Docs
 

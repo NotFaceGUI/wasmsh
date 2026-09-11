@@ -138,6 +138,11 @@ export async function createNodeSession() {
 }
 
 export async function createBrowserWorkerSession(options) {
+  const hasAllowedHosts = Object.hasOwn(options, "allowedHosts") && options.allowedHosts !== undefined;
+  const hasNetworkPolicy = Object.hasOwn(options, "networkPolicy") && options.networkPolicy !== undefined;
+  if (hasAllowedHosts && hasNetworkPolicy) {
+    throw new Error("networkPolicy and allowedHosts cannot both be configured");
+  }
   const worker =
     options.worker ??
     new Worker(resolveBrowserWorkerPath(), { name: "wasmsh-pyodide" });
@@ -146,7 +151,9 @@ export async function createBrowserWorkerSession(options) {
     assetBaseUrl: options.assetBaseUrl,
     stepBudget: options.stepBudget ?? 0,
     initialFiles: normalizeInitialFiles(options.initialFiles),
-    allowedHosts: options.allowedHosts ?? [],
+    ...(hasNetworkPolicy
+      ? { networkPolicy: options.networkPolicy }
+      : { allowedHosts: options.allowedHosts ?? [] }),
   });
   return session;
 }

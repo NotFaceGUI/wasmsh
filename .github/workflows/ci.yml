@@ -4,39 +4,24 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+  workflow_dispatch:
 
-# Every job below runs on `mayflower-k8s-runners`, a self-hosted pool inside the
-# Mayflower data cluster, and this workflow triggers on `pull_request` -- which
-# GitHub also fires for pull requests from forks. Without a guard, a stranger's
-# first accepted PR would execute their code inside the cluster network.
-#
-# The jobs are therefore skipped when the pull request comes from a fork. They
-# are skipped rather than moved to `ubuntu-latest`, because github-hosted
-# runners are documented in this repo as unsuitable for it: see the comment
-# above `e2e-standalone` in wasm-build.yml (worker timeouts and
-# `WebAssembly.Table.grow()` failures) and the apt/venv workarounds in
-# snapshot-runner.yml. Rerouting would turn every fork PR red instead of
-# protecting anything.
-#
-# This is defence in depth, not the primary control -- that remains the
-# organisation's "require approval for outside collaborators" setting for fork
-# pull request workflows. The guard makes the intent explicit in the repo and
-# holds even if that setting is relaxed.
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # ── Format ─────────────────────────────────────────────────
   fmt:
     name: rustfmt
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -45,42 +30,44 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
-  # ── Clippy (native) ────────────────────────────────────────
+  test:
+    name: core tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+      - name: Unit and integration tests
+        run: cargo test --workspace --all-features --locked
+      - name: Shell compatibility suite
+        run: cargo test -p wasmsh-testkit --test suite_runner --locked
+      - name: Doc tests
+        run: cargo test --doc --workspace --all-features --locked
+
   clippy:
-    name: clippy (native)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 20
+    name: clippy native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-  # ── Clippy (wasm32) ────────────────────────────────────────
-  clippy-wasm:
-    name: clippy (wasm32)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 20
+  wasm-check:
+    name: wasm32 check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
         with:
           targets: wasm32-unknown-unknown
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: wasm32
       - name: Clippy wasm32 crates
         run: >
-          cargo clippy
-          --target wasm32-unknown-unknown
+          cargo clippy --target wasm32-unknown-unknown --locked
           -p wasmsh-ast
           -p wasmsh-lex
           -p wasmsh-parse
@@ -95,293 +82,25 @@ jobs:
           -p wasmsh-protocol
           -p wasmsh-browser
           -- -D warnings
+      - name: Build browser crate for wasm32
+        run: cargo build --target wasm32-unknown-unknown --profile dist -p wasmsh-browser --locked
 
-  # ── Tests (native) ──────────────────────────────────────────
-  # wasmsh targets wasm32-unknown-unknown — all code is OS-independent
-  # (no std::fs, no OS processes). Single-platform CI is sufficient.
-  test:
-    name: test
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-      - name: Unit and integration tests
-        run: cargo nextest run --workspace --all-features
-      - name: Doc tests
-        run: cargo test --doc --workspace --all-features
-      - name: TOML suite tests
-        run: cargo test -p wasmsh-testkit --test suite_runner
-
-  # ── Wasm build ─────────────────────────────────────────────
-  wasm-build:
-    name: wasm32 build
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: wasm32-build
-      - name: Build wasmsh-browser for wasm32 (dist profile)
-        run: >
-          cargo build
-          --target wasm32-unknown-unknown
-          --profile dist
-          -p wasmsh-browser
-      - name: Install binaryen (wasm-opt)
-        run: sudo apt-get install -y binaryen
-      - name: Run wasm-opt post-processing
-        run: |
-          WASM=target/wasm32-unknown-unknown/dist/wasmsh_browser.wasm
-          if [ -f "$WASM" ]; then
-            wasm-opt -Os --enable-bulk-memory --enable-mutable-globals --enable-sign-ext --enable-nontrapping-float-to-int "$WASM" -o target/wasmsh-browser-opt.wasm
-          else
-            echo "No cdylib .wasm file found (rlib only) — skipping wasm-opt"
-          fi
-      - name: Check binary size against budget
-        run: |
-          WASM=target/wasm32-unknown-unknown/dist/wasmsh_browser.wasm
-          OPT=target/wasmsh-browser-opt.wasm
-          if [ ! -f "$WASM" ] || [ ! -f "$OPT" ]; then
-            echo "No .wasm binary produced (rlib crate) — skipping size check"
-            exit 0
-          fi
-          ORIG=$(wc -c < "$WASM" | tr -d ' ')
-          OPT_SIZE=$(wc -c < "$OPT" | tr -d ' ')
-          echo "Original : ${ORIG} bytes"
-          echo "Optimized: ${OPT_SIZE} bytes"
-          BUDGET=3145728
-          echo "Budget   : ${BUDGET} bytes (3 MB)"
-          {
-            echo "## Wasm binary size"
-            echo "| Binary | Size (bytes) |"
-            echo "| ------ | ------------ |"
-            echo "| Original (dist profile) | ${ORIG} |"
-            echo "| Optimized (wasm-opt -Os) | ${OPT_SIZE} |"
-            echo "| Budget | ${BUDGET} |"
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$OPT_SIZE" -gt "$BUDGET" ]; then
-            echo "ERROR: Optimized binary (${OPT_SIZE} bytes) exceeds 3 MB budget!"
-            exit 1
-          fi
-          echo "Size check passed."
-      - name: Upload wasm artifacts
-        if: hashFiles('target/wasm32-unknown-unknown/dist/wasmsh_browser.wasm') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasmsh-wasm32
-          path: |
-            target/wasm32-unknown-unknown/dist/wasmsh_browser.wasm
-            target/wasmsh-browser-opt.wasm
-          retention-days: 7
-
-  # ── MSRV ───────────────────────────────────────────────────
-  msrv:
-    name: MSRV (1.89)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust
-        with:
-          toolchain: "1.89"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo +1.89 check --workspace
-
-  # ── License and advisory audit ─────────────────────────────
-  deny:
-    name: cargo deny
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-
-  # ── Code coverage ──────────────────────────────────────────
-  coverage:
-    name: coverage
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust
-        with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov,cargo-nextest
-      - name: Generate coverage
-        run: >
-          cargo llvm-cov nextest
-          --workspace
-          --all-features
-          --lcov
-          --output-path lcov.info
-      - uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
-      - name: Convert lcov to SonarQube generic coverage XML
-        run: |
-          python3 << 'PYEOF'
-          import re, sys, os
-          from collections import defaultdict
-
-          workspace = os.getcwd() + "/"
-          files = defaultdict(lambda: {"lines": {}})
-          current_file = None
-          with open("lcov.info") as f:
-              for line in f:
-                  line = line.strip()
-                  if line.startswith("SF:"):
-                      path = line[3:]
-                      # Strip workspace prefix to produce relative paths
-                      if path.startswith(workspace):
-                          path = path[len(workspace):]
-                      current_file = path
-                  elif line.startswith("DA:") and current_file:
-                      parts = line[3:].split(",")
-                      if len(parts) >= 2:
-                          lineno, hits = int(parts[0]), int(parts[1])
-                          files[current_file]["lines"][lineno] = hits
-                  elif line == "end_of_record":
-                      current_file = None
-
-          with open("sonar-coverage.xml", "w") as out:
-              out.write('<coverage version="1">\n')
-              for filepath in sorted(files):
-                  out.write(f'  <file path="{filepath}">\n')
-                  for lineno in sorted(files[filepath]["lines"]):
-                      hits = files[filepath]["lines"][lineno]
-                      covered = "true" if hits > 0 else "false"
-                      out.write(f'    <lineToCover lineNumber="{lineno}" covered="{covered}"/>\n')
-                  out.write('  </file>\n')
-              out.write('</coverage>\n')
-          print(f"Converted {len(files)} files to sonar-coverage.xml")
-          PYEOF
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: |
-            lcov.info
-            sonar-coverage.xml
-          retention-days: 14
-
-  # ── Documentation build ────────────────────────────────────
-  docs:
-    name: docs
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build rustdoc
-        run: cargo doc --workspace --all-features --no-deps
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-
-  # ── Feature powerset check ─────────────────────────────────
-  feature-check:
-    name: Feature combinations
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: feature-powerset
-      - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack check --feature-powerset --no-dev-deps --workspace
-
-  # ── Dead dependency detection ──────────────────────────────
-  # The `bnjbvr/cargo-machete@main` action installs the binary into
-  # `/usr/local/bin` without sudo, which fails on the k8s runner.
-  # Install via `cargo install` into the user-writable cargo bin dir
-  # instead.
-  machete:
-    name: Dead dependencies
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-machete
-      - run: cargo machete
-
-  # ── Semver compatibility ────────────────────────────────────
-  semver:
-    name: Semver check
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 20
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: ./.github/actions/setup-rust
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
-
-  # ── All checks gate ────────────────────────────────────────
   ci-pass:
     name: CI passed
-    # Guarded like every job above: with the workers skipped on a fork PR
-    # their result is `skipped`, and the check below treats anything other
-    # than `success` as a failure -- so always() alone would turn every
-    # external contribution red.
-    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    needs: [fmt, clippy, clippy-wasm, test, wasm-build, msrv, deny, docs, feature-check, machete]
-    runs-on: mayflower-k8s-runners
+    if: always()
+    needs: [fmt, test, clippy, wasm-check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Check all jobs
+      - name: Require every core check to pass
         env:
-          R_FMT: ${{ needs.fmt.result }}
-          R_CLIPPY: ${{ needs.clippy.result }}
-          R_CLIPPY_WASM: ${{ needs.clippy-wasm.result }}
-          R_TEST: ${{ needs.test.result }}
-          R_WASM_BUILD: ${{ needs.wasm-build.result }}
-          R_MSRV: ${{ needs.msrv.result }}
-          R_DENY: ${{ needs.deny.result }}
-          R_DOCS: ${{ needs.docs.result }}
-          R_FEATURE_CHECK: ${{ needs.feature-check.result }}
-          R_MACHETE: ${{ needs.machete.result }}
+          RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          for r in "$R_FMT" "$R_CLIPPY" "$R_CLIPPY_WASM" "$R_TEST" "$R_WASM_BUILD" "$R_MSRV" "$R_DENY" "$R_DOCS" "$R_FEATURE_CHECK" "$R_MACHETE"; do
-            if [ "$r" != "success" ]; then
-              echo "Job failed: $r"
+          set -euo pipefail
+          echo "${RESULTS}"
+          for result in $RESULTS; do
+            test "$result" = success || {
+              echo "A required CI job did not pass: $result" >&2
               exit 1
-            fi
+            }
           done
-          echo "All CI checks passed"

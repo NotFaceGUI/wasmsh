@@ -1,7 +1,7 @@
 name: LangChain Adapters (LLM)
 
 # LLM-dependent integration + end-to-end tests for the langchain-wasmsh
-# adapters.  Manually dispatched (and run on a weekly schedule) because
+# adapters. Manually dispatched because
 # these tests call the Anthropic API and need a valid `ANTHROPIC_API_KEY`.
 #
 # Required secrets (set at repository or `integration-tests` environment level):
@@ -20,9 +20,6 @@ on:
           - python
           - npm
           - browser-e2e
-  schedule:
-    # Weekly at 02:00 UTC Monday.  Low-traffic slot on Anthropic's API.
-    - cron: "0 2 * * 1"
 
 concurrency:
   group: langchain-adapters-llm-${{ github.ref }}

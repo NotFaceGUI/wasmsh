@@ -52,11 +52,19 @@ export function syncHttpFetchNode(
     const args = IS_DENO
       ? ["run", `--allow-net=${host}`, fetchHelperPath]
       : [fetchHelperPath];
+    const requestedTimeout =
+      typeof optionsObj?.timeout_ms === "number" && optionsObj.timeout_ms > 0
+        ? optionsObj.timeout_ms
+        : 0;
+    const outerTimeout = Math.min(
+      300000,
+      Math.max(60000, requestedTimeout + 1000),
+    );
     const out = execFileSync(
       process.execPath,
       args,
       {
-        timeout: HELPER_OUTER_TIMEOUT_MS,
+        timeout: outerTimeout,
         encoding: "utf-8",
         input,
         stdio: ["pipe", "pipe", "ignore"],

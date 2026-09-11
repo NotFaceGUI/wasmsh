@@ -99,6 +99,93 @@ test("302 to allowed subdomain is followed (per-hop re-check passes)", async () 
   });
 });
 
+test("cross-origin redirects strip sensitive headers before the next fetch", async () => {
+  const calls = [];
+  const fake = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    calls.push({ url, headers: new Headers(init.headers) });
+    if (calls.length === 1) {
+      return new Response("", {
+        status: 302,
+        headers: { Location: "https://api.allowed.test/data" },
+      });
+    }
+    return new Response("ok", { status: 200 });
+  };
+  await withMembrane(["allowed.test", "*.allowed.test"], fake, async (brokered) => {
+    const response = await brokered("https://allowed.test/start", {
+      headers: {
+        Authorization: "Bearer secret",
+        Cookie: "session=secret",
+        "Proxy-Authorization": "Basic secret",
+        "X-Trace": "kept",
+      },
+    });
+    assert.equal(await response.text(), "ok");
+    assert.equal(calls[1].headers.get("authorization"), null);
+    assert.equal(calls[1].headers.get("cookie"), null);
+    assert.equal(calls[1].headers.get("proxy-authorization"), null);
+    assert.equal(calls[1].headers.get("x-trace"), "kept");
+  });
+});
+
+test("cross-origin redirects keep sensitive headers removed after returning", async () => {
+  const calls = [];
+  const fake = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    calls.push({ url, headers: new Headers(init.headers) });
+    if (calls.length === 1) {
+      return new Response("", {
+        status: 302,
+        headers: { Location: "https://other.allowed.test/middle" },
+      });
+    }
+    if (calls.length === 2) {
+      return new Response("", {
+        status: 302,
+        headers: { Location: "https://allowed.test/back" },
+      });
+    }
+    return new Response("ok", { status: 200 });
+  };
+  await withMembrane(["allowed.test", "*.allowed.test"], fake, async (brokered) => {
+    const response = await brokered("https://allowed.test/start", {
+      headers: {
+        Authorization: "Bearer secret",
+        Cookie: "session=secret",
+        "Proxy-Authorization": "Basic secret",
+        "X-Trace": "kept",
+      },
+    });
+    assert.equal(await response.text(), "ok");
+    assert.equal(calls[1].headers.get("authorization"), null);
+    assert.equal(calls[2].headers.get("authorization"), null);
+    assert.equal(calls[2].headers.get("cookie"), null);
+    assert.equal(calls[2].headers.get("proxy-authorization"), null);
+    assert.equal(calls[2].headers.get("x-trace"), "kept");
+  });
+});
+
+test("cross-origin redirects reject SigV4 authorization before the next fetch", async () => {
+  let calls = 0;
+  const fake = async () => {
+    calls += 1;
+    return new Response("", {
+      status: 302,
+      headers: { Location: "https://api.allowed.test/data" },
+    });
+  };
+  await withMembrane(["allowed.test", "*.allowed.test"], fake, async (brokered) => {
+    await assert.rejects(
+      () => brokered("https://allowed.test/start", {
+        headers: { Authorization: "AWS4-HMAC-SHA256 Credential=example" },
+      }),
+      (error) => error.code === "WASMSH_HOST_DENIED",
+    );
+    assert.equal(calls, 1);
+  });
+});
+
 test("302 to loopback IP is rejected by per-hop check", async () => {
   const calls = [];
   const fake = async (input) => {

@@ -31,6 +31,8 @@ hifijson = { workspace = true }
 saphyr = { workspace = true }
 foldhash = { workspace = true }
 zip = { workspace = true }
+serde = { workspace = true }
+wasmsh-protocol = { workspace = true }
 
 [package.metadata.cargo-machete]
 ignored = ["md-5", "digest"]

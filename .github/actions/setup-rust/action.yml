@@ -1,14 +1,9 @@
-name: Setup Rust toolchain (k8s runner)
+name: Setup Rust toolchain
 description: >-
-  Install the Rust toolchain and the system build dependencies needed
-  for cargo to compile build scripts on the bare `mayflower-k8s-runners`
-  pool.  Bundles `dtolnay/rust-toolchain` with the apt-get install of
-  `build-essential` (gcc, cc, libc-dev, make) and `pkg-config`, which
-  github-hosted ubuntu-latest runners ship by default but the k8s runner
-  image does not.
-
-  With no `toolchain` input the channel comes from `rust-toolchain.toml`,
-  so CI compiles with the same rustc a developer gets from rustup.
+  Install the exact Rust toolchain selected by rust-toolchain.toml. The
+  primary workflows run on GitHub-hosted runners, whose system compiler
+  dependencies are part of the runner image; this action does not install a
+  second system toolchain or an Emscripten target.
 
 inputs:
   toolchain:
@@ -30,10 +25,6 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Install build essentials (gcc, cc, libc-dev, pkg-config)
-      shell: bash
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config
-
     - name: Resolve toolchain channel
       id: resolve
       shell: bash

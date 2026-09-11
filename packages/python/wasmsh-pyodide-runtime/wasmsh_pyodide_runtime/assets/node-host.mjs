@@ -75,6 +75,7 @@ class WasmshNodeHost {
     this.module = null;
     this.runtimeBridge = null;
     this._allowedHosts = [];
+    this._networkPolicy = null;
     // PTC bridge state. Keyed by host_call id; entries hold the deferred
     // promise that resolves when the host posts a matching host_call_result.
     this._pendingHostCalls = new Map();
@@ -179,18 +180,32 @@ class WasmshNodeHost {
     return this.runtimeBridge.sendHostCommand(command);
   }
 
-  async init({ stepBudget = 0, initialFiles = [], allowedHosts = [] } = {}) {
+  async init({
+    stepBudget = 0,
+    initialFiles = [],
+    allowedHosts,
+    networkPolicy = undefined,
+  } = {}) {
     await this.ensureBooted();
-    this._allowedHosts = allowedHosts;
+    if (networkPolicy !== undefined && allowedHosts !== undefined) {
+      throw new Error("networkPolicy and allowedHosts cannot both be configured");
+    }
+    const effectiveAllowedHosts = allowedHosts ?? [];
+    const networkConfig = networkPolicy !== undefined
+      ? networkPolicy
+      : effectiveAllowedHosts;
+    this._allowedHosts = effectiveAllowedHosts;
+    this._networkPolicy = networkPolicy ?? null;
     // Install the JS fetch membrane on the host's globalThis so Pyodide's
     // `js.fetch` / `pyodide.http.pyfetch` / `micropip` all go through the
     // same allowlist as curl. The membrane is idempotent across re-init
     // calls and the original fetch is captured inside a JS closure that
     // is not reachable from user Python. Audit F2.
-    installFetchMembrane(globalThis, allowedHosts);
-    const events = this.sendHostCommand({
-      Init: { step_budget: stepBudget, allowed_hosts: allowedHosts },
-    });
+    installFetchMembrane(globalThis, networkConfig);
+    const init = networkPolicy === undefined
+      ? { step_budget: stepBudget, allowed_hosts: effectiveAllowedHosts }
+      : { step_budget: stepBudget, network_policy: networkPolicy };
+    const events = this.sendHostCommand({ Init: init });
     for (const file of initialFiles) {
       this.sendHostCommand({
         WriteFile: {
@@ -304,6 +319,7 @@ class WasmshNodeHost {
     return installPackages(reqs, pyodide, {
       isBundled: (name) => bundled.has(name),
       allowedHosts: this._allowedHosts,
+      networkPolicy: this._networkPolicy,
       deps: options.deps,
     });
   }

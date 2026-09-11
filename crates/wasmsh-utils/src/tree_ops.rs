@@ -429,6 +429,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             util_tree(&mut ctx, argv)
         };
@@ -566,6 +567,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             util_tree(&mut ctx, &["tree", "/file.txt"])
         };

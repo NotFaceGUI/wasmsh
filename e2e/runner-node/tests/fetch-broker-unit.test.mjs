@@ -255,6 +255,105 @@ test("assertAllowedHost throws HostDeniedError for off-list hosts", async () => 
   );
 });
 
+test("broker re-checks every redirect hop and never calls a denied target", async () => {
+  const calls = [];
+  const broker = createFetchBroker({
+    fetchImpl: async (url, init) => {
+      calls.push({ url, redirect: init.redirect });
+      return new Response("", {
+        status: 302,
+        headers: { location: "https://blocked.example/private" },
+      });
+    },
+  });
+
+  await assert.rejects(
+    () => broker.fetchJson({
+      url: "https://allowed.example/start",
+      method: "GET",
+      headers: [],
+      body_base64: "",
+      follow_redirects: true,
+    }, {
+      enabled: true,
+      default_action: "deny",
+      allow: ["allowed.example", "*.allowed.example"],
+      deny: ["blocked.example"],
+    }),
+    /host denied/,
+  );
+  assert.deepEqual(calls, [{ url: "https://allowed.example/start", redirect: "manual" }]);
+});
+
+test("broker gives deny precedence over wildcard allow and supports explicit default allow", async () => {
+  const calls = [];
+  const broker = createFetchBroker({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return new Response("ok", { status: 200 });
+    },
+  });
+  const policy = {
+    enabled: true,
+    default_action: "allow",
+    allow: ["*"],
+    deny: ["blocked.example"],
+  };
+
+  await assert.rejects(
+    () => broker.fetchJson({
+      url: "https://blocked.example/",
+      method: "GET",
+      headers: [],
+      body_base64: "",
+      follow_redirects: false,
+    }, policy),
+    /host denied/,
+  );
+  const response = await broker.fetchJson({
+    url: "https://unlisted.example/",
+    method: "GET",
+    headers: [],
+    body_base64: "",
+    follow_redirects: false,
+  }, policy);
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls, ["https://unlisted.example/"]);
+});
+
+test("broker strips sensitive headers on cross-origin redirects", async () => {
+  const calls = [];
+  const broker = createFetchBroker({
+    fetchImpl: async (url, init) => {
+      calls.push({ url, headers: new Headers(init.headers) });
+      if (calls.length === 1) {
+        return new Response("", {
+          status: 302,
+          headers: { location: "https://api.allowed.example/data" },
+        });
+      }
+      return new Response("ok", { status: 200 });
+    },
+  });
+  const response = await broker.fetchJson({
+    url: "https://allowed.example/start",
+    method: "GET",
+    headers: [
+      ["authorization", "Bearer secret"],
+      ["cookie", "session=secret"],
+      ["proxy-authorization", "Basic secret"],
+      ["x-trace", "kept"],
+    ],
+    body_base64: "",
+    follow_redirects: true,
+  }, ["allowed.example", "*.allowed.example"]);
+  assert.equal(response.status, 200);
+  assert.equal(calls[1].headers.get("authorization"), null);
+  assert.equal(calls[1].headers.get("cookie"), null);
+  assert.equal(calls[1].headers.get("proxy-authorization"), null);
+  assert.equal(calls[1].headers.get("x-trace"), "kept");
+});
+
 test("createBrokerClient returns request_overflow when payload exceeds request buffer", () => {
   const buffers = createBrokerBuffers({ requestBytes: 64, responseBytes: 1024 });
   const fakeParent = { postMessage: () => {} };

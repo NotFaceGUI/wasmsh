@@ -196,9 +196,34 @@ export async function createRunnerServer(options = {}) {
           return;
         }
         const body = await readJson(request, { maxBytes: maxRequestBodyBytes });
+        const hasAllowedHosts = Object.hasOwn(body, "allowedHosts");
+        const hasAllowedHostsSnake = Object.hasOwn(body, "allowed_hosts");
+        const hasNetworkPolicy = Object.hasOwn(body, "networkPolicy");
+        const hasNetworkPolicySnake = Object.hasOwn(body, "network_policy");
+        if (hasAllowedHosts && hasAllowedHostsSnake) {
+          throw Object.assign(
+            new Error("allowedHosts and allowed_hosts cannot both be configured"),
+            { code: "WASMSH_INVALID_NETWORK_POLICY" },
+          );
+        }
+        if (hasNetworkPolicy && hasNetworkPolicySnake) {
+          throw Object.assign(
+            new Error("networkPolicy and network_policy cannot both be configured"),
+            { code: "WASMSH_INVALID_NETWORK_POLICY" },
+          );
+        }
         const session = await runner.createSession({
           sessionId: body.sessionId,
-          allowedHosts: body.allowedHosts ?? [],
+          ...(hasAllowedHosts
+            ? { allowedHosts: body.allowedHosts }
+            : hasAllowedHostsSnake
+              ? { allowedHosts: body.allowed_hosts }
+            : {}),
+          ...(hasNetworkPolicy
+            ? { networkPolicy: body.networkPolicy }
+            : hasNetworkPolicySnake
+              ? { networkPolicy: body.network_policy }
+              : {}),
           stepBudget: body.stepBudget ?? 0,
           initialFiles: (body.initialFiles ?? []).map((file) => ({
             path: file.path,
@@ -337,6 +362,10 @@ export async function createRunnerServer(options = {}) {
       }
       if (error?.code === "WASMSH_REQUEST_BODY_TOO_LARGE") {
         json(response, 413, { ok: false, error: message, code: error.code });
+        return;
+      }
+      if (error?.code === "WASMSH_INVALID_NETWORK_POLICY") {
+        json(response, 400, { ok: false, error: message, code: error.code });
         return;
       }
       // Internal runner service — log 500s server-side so operators can

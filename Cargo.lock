@@ -2424,6 +2424,8 @@ version = "0.8.0"
 dependencies = [
  "indexmap",
  "posix-regex",
+ "serde",
+ "serde_json",
  "smol_str",
  "wasmsh-ast",
  "wasmsh-builtins",
@@ -2456,6 +2458,7 @@ dependencies = [
  "wasmsh-parse",
  "wasmsh-protocol",
  "wasmsh-runtime",
+ "wasmsh-utils",
 ]
 
 [[package]]
@@ -2475,10 +2478,12 @@ dependencies = [
  "miniz_oxide",
  "posix-regex",
  "saphyr",
+ "serde",
  "sha1",
  "sha2",
  "url",
  "wasmsh-fs",
+ "wasmsh-protocol",
  "wasmsh-state",
  "zip",
 ]

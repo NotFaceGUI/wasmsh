@@ -16,6 +16,7 @@ wasmsh-parse = { workspace = true }
 wasmsh-hir = { workspace = true }
 wasmsh-runtime = { workspace = true }
 wasmsh-protocol = { workspace = true }
+wasmsh-utils = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 

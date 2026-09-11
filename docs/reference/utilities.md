@@ -390,7 +390,7 @@ Small POSIX coreutils with focused implementations:
 | `cksum` [file...] | CRC checksum and byte count |
 | `tsort` [file] | Topological sort |
 | `install` src dst | Copy file (permissions and ownership are no-ops in the VFS) |
-| `timeout` duration cmd | Run a command with a timeout (cooperative — observed at the next VM step) |
+| `timeout` duration cmd | Not supported in the synchronous sandbox: returns status 125 with a diagnostic. Host adapters enforce a real wall-clock limit for external processes. |
 | `cal` [month] [year] | Display a calendar |
 
 ## Pipeline composition examples

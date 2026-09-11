@@ -1,0 +1,13 @@
+# Shell scripts are executed on Linux CI; a CRLF checkout would break the
+# shebang and `set -euo pipefail` parsing.
+*.sh text eol=lf
+# Node ESM scripts and the standalone host adapters are run directly by Node
+# on all three CI platforms; keep them LF so a Windows working copy cannot
+# introduce CR into a hash-verified artifact.
+*.mjs text eol=lf
+*.js text eol=lf
+*.d.ts text eol=lf
+*.wit text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

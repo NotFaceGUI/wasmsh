@@ -1,544 +1,243 @@
-name: Release
+name: Standalone Release
 
 on:
   push:
-    tags:
-      - "v*"
-
-permissions:
-  contents: write
-  id-token: write  # needed for PyPI trusted publishing
+    tags: ["v*"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: standalone-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # ── Validate before release ────────────────────────────────
-  validate:
-    name: validate
-    runs-on: mayflower-k8s-runners
+  validate-core:
+    name: Validate release source
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-      - name: Run all tests
-        run: cargo nextest run --workspace --all-features
-        env:
-          RUSTFLAGS: "-D warnings"
-      - name: Run TOML suite
-        run: cargo test -p wasmsh-testkit --test suite_runner
-        env:
-          RUSTFLAGS: "-D warnings"
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+          components: rustfmt,clippy
+      - run: cargo fmt --all --check
+      # Gate the release on the default feature set, which is what the
+      # standalone artifact actually builds. Optional features are advisory
+      # (see wasm-build.yml) because their Ubuntu build is unverified.
+      - run: cargo test --workspace --locked
+      - run: cargo test -p wasmsh-testkit --test suite_runner --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  # ── Build standalone wasm32 artifacts ─────────────────────
-  build-standalone:
-    name: build standalone wasm32
-    needs: validate
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 20
+  build-candidate:
+    name: Build release candidate
+    needs: validate-core
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - name: Install wasm-opt (binaryen)
-        run: sudo apt-get install -y binaryen
-      - name: Build with wasm-pack (bundler)
-        run: wasm-pack build crates/wasmsh-browser --target bundler --release --out-dir ../../pkg/bundler
-      - name: Build with wasm-pack (web)
-        run: wasm-pack build crates/wasmsh-browser --target web --release --out-dir ../../pkg/web
-      - name: Build with wasm-pack (nodejs)
-        run: wasm-pack build crates/wasmsh-browser --target nodejs --release --out-dir ../../pkg/nodejs
-      - name: Optimize with wasm-opt
-        run: |
-          for dir in pkg/bundler pkg/web pkg/nodejs; do
-            for f in "$dir"/*.wasm; do
-              if [ -f "$f" ]; then
-                wasm-opt -Os --enable-bulk-memory --enable-mutable-globals --enable-sign-ext --enable-nontrapping-float-to-int "$f" -o "$f.opt"
-                mv "$f.opt" "$f"
-              fi
-            done
-          done
-      - name: Package standalone artifact
-        env:
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          mkdir -p release-standalone
-          cp -r pkg/bundler release-standalone/bundler
-          cp -r pkg/web release-standalone/web
-          cp -r pkg/nodejs release-standalone/nodejs
-          cp LICENSE README.md SUPPORTED.md release-standalone/
-          echo "$TAG_NAME" > release-standalone/VERSION
-          tar czf "wasmsh-standalone-${TAG_NAME}.tar.gz" -C release-standalone .
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasmsh-standalone
-          path: "wasmsh-standalone-*.tar.gz"
-
-  # ── Build Pyodide artifact ───────────────────────────────
-  build-pyodide:
-    name: build pyodide
-    needs: validate
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      # ── Tier-2 cache: Pyodide source + emsdk ────────────────────
-      # The Pyodide build is the dominant cost in CI (~30 min).  Most
-      # of that time is the emsdk install (~5 min) and the CPython +
-      # libffi + pyodide-build builds.  Both are version-locked: they
-      # only need to rebuild when `tools/pyodide/versions.env` changes
-      # (the single source of truth for PYODIDE_VERSION + EMSCRIPTEN
-      # _VERSION).  Cache the whole `pyodide-src/` tree keyed on its
-      # hash so subsequent CI runs skip straight to the wasmsh staticlib
-      # build + final emcc relink.
-      #
-      # Safety: even if a cached pyodide.asm.wasm contains stale code,
-      # build-custom.sh deletes it when the freshly-built wasmsh
-      # staticlib is newer (see "Runtime lib is newer than" guard
-      # added in 0e447bb).  Per-patch idempotency from b1ad993 means
-      # cached patched files don't double-apply on re-run.
-      #
-      # No `restore-keys` fallback: a versions.env bump must rebuild
-      # from scratch, not silently reuse an old emsdk install.
-      - name: Cache Pyodide source + emsdk
-        uses: actions/cache@v4
-        with:
-          path: tools/pyodide/pyodide-src
-          key: pyodide-toolchain-${{ runner.os }}-${{ hashFiles('tools/pyodide/versions.env', 'rust-toolchain.toml') }}
-      - uses: ./.github/actions/setup-rust
-        with:
-          targets: wasm32-unknown-emscripten
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: pyodide-release
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - name: Install just
-        uses: extractions/setup-just@v2
-      - name: Install Pyodide build deps
-        run: sudo apt-get install -y wget ccache xz-utils autoconf automake libtool
-      - name: Build custom Pyodide
-        run: just build-pyodide
-        env:
-          SED: sed
-      - name: Package runtime assets
-        run: just package-pyodide-runtime
-      # Build-contract canary — see comment in .github/workflows/pyodide.yml.
-      - name: Run emscripten build-contract test
-        run: just test-emscripten-probe
-      # Gate the release on the Pyodide E2E suite.  The build step alone is
-      # not sufficient: v0.5.7 and v0.5.8 both produced "successful" wasm
-      # artifacts that failed to load compiled side modules at runtime.
-      # Running the full e2e suite against the freshly built wasm is the
-      # thing that would have caught both regressions before publish.
-      - name: Run Pyodide Node E2E against the built wasm
-        run: just test-e2e-pyodide-node
-      - name: Package Pyodide dist artifact
-        env:
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          cp LICENSE README.md SUPPORTED.md dist/pyodide-custom/
-          echo "$TAG_NAME" > dist/pyodide-custom/VERSION
-          tar czf "wasmsh-pyodide-${TAG_NAME}.tar.gz" -C dist/pyodide-custom .
-      - name: Upload npm package
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasmsh-pyodide-npm
-          path: packages/npm/wasmsh-pyodide/
-      - name: Upload python package
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasmsh-pyodide-runtime-py
-          path: packages/python/wasmsh-pyodide-runtime/
-      - name: Upload pyodide dist
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasmsh-pyodide-dist
-          path: "wasmsh-pyodide-*.tar.gz"
-
-  # ── Publish Rust crates to crates.io ──────────────────────
-  # Gated on build-pyodide so the whole release either lands together or
-  # not at all.  Historically publish-crates ran in parallel with
-  # build-pyodide, and at v0.5.8 the crates landed on crates.io while
-  # build-pyodide failed — leaving 15 orphaned crates that could only be
-  # yanked.  Never again.
-  publish-crates:
-    name: publish crates.io
-    needs: [validate, build-standalone, build-pyodide]
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
-      - name: Publish workspace crates (sequential, respecting rate limits)
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: |
-          # Publish order must respect the workspace dep graph so each
-          # `cargo publish` call resolves its deps against what already
-          # landed on crates.io earlier in the loop.  Layered by
-          # dependency depth — never reorder without re-running
-          # `cargo tree` / the graph check against the workspace:
-          #   L0 (no intra-workspace deps): ast, state, fs, protocol
-          #   L1 (deps -> L0):              lex, builtins, utils
-          #   L2 (deps -> L0..L1):          parse, expand
-          #   L3 (deps -> L0..L2):          hir
-          #   L4 (deps -> L0..L3):          ir  ← depends on hir since b8d98b2
-          #   L5:                           vm
-          #   L6:                           runtime
-          #   L7:                           json-bridge, browser, testkit
-          #   tail (no workspace deps):     dispatcher
-          CRATES=(
-            wasmsh-ast wasmsh-state wasmsh-fs wasmsh-protocol
-            wasmsh-lex wasmsh-builtins wasmsh-utils
-            wasmsh-parse wasmsh-expand
-            wasmsh-hir
-            wasmsh-ir
-            wasmsh-vm
-            wasmsh-runtime
-            wasmsh-json-bridge wasmsh-browser wasmsh-testkit
-            wasmsh-dispatcher
-          )
-          publish_crate() {
-            local crate=$1
-            local deadline=$((SECONDS + 900))
-            while true; do
-              output=$(cargo publish -p "$crate" --no-verify 2>&1) && {
-                echo "$output"
-                return 0
-              }
-              echo "$output"
-              if echo "$output" | grep -q "already exists"; then
-                echo "$crate already published, skipping"
-                return 0
-              fi
-              if echo "$output" | grep -q "429" && [ $SECONDS -lt $deadline ]; then
-                local wait=$((deadline - SECONDS))
-                echo "Rate limited, retrying in 120s (${wait}s left before giving up)..."
-                sleep 120
-              else
-                return 1
-              fi
-            done
-          }
-          for crate in "${CRATES[@]}"; do
-            echo "::group::Publishing $crate"
-            publish_crate "$crate"
-            echo "::endgroup::"
-            sleep 15
-          done
-
-  # ── Publish npm package (trusted publishing via OIDC) ─────
-  # MUST run on a github-hosted runner (`ubuntu-latest`).  npm publish
-  # with sigstore provenance refuses self-hosted runners — when
-  # `id-token: write` + the npm-publish environment trusted publisher
-  # config is in effect, npm auto-enables provenance and the registry
-  # rejects bundles built on `self-hosted` (or k8s) runners with:
-  #   "Error verifying sigstore provenance bundle: Unsupported GitHub
-  #    Actions runner environment: 'self-hosted'. Only 'github-hosted'
-  #    runners are supported when publishing with provenance."
-  publish-npm:
-    name: publish npm
-    needs: build-pyodide
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: npm-publish
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22.22.1"
-      - name: Install npm with OIDC trusted publishing support
-        # Pinned, not `npm@latest`. The node version above is pinned
-        # exactly, so a floating npm eventually resolves to a release that
-        # requires a newer node than this job has and the publish dies
-        # after every other artifact is already live: npm 12.0.2 wants
-        # node ^22.22.2 while this runner is on 22.22.1. 11.19.0 is the
-        # newest npm that supports OIDC trusted publishing on node 22.
-        # Bump both pins together.
-        run: npm install -g npm@11.19.0 && npm --version
-      - name: Download npm package
-        uses: actions/download-artifact@v4
-        with:
-          name: wasmsh-pyodide-npm
-          path: package/
-      - name: Verify package contents
-        run: |
-          ls -la package/
-          node -e "const p = require('./package/package.json'); console.log(p.name + '@' + p.version)"
-      - name: Verify the package installs and boots
-        # `ls` and a version print say the artifact exists, not that it
-        # works. This package is almost entirely assets, and the failure
-        # mode is a file silently absent from `files`/`package-data` —
-        # exactly how `lib/baseline/boot-plan.mjs` went missing in
-        # 0.5.10-0.6.2. Installing the real tarball into a clean project
-        # and booting a session is the only check that notices.
+      - name: Load pinned tool versions
+        id: versions
+        shell: bash
         run: |
           set -euo pipefail
-          tarball="$(npm pack ./package/ --pack-destination "$RUNNER_TEMP" | tail -1)"
-          workdir="$RUNNER_TEMP/verify-npm"
-          mkdir -p "$workdir" && cd "$workdir"
-          npm init -y >/dev/null
-          npm install --no-audit --no-fund "$RUNNER_TEMP/$tarball"
-          node - <<'JS'
-          const { createNodeSession } = await import("@mayflowergmbh/wasmsh-pyodide");
-          const session = await createNodeSession();
-          try {
-            const result = await session.run("echo release-check; exit 3");
-            if (result.exitCode !== 3 || !result.output.includes("release-check")) {
-              throw new Error("unexpected result: " + JSON.stringify(result));
-            }
-          } finally {
-            await session.close();
-          }
-          console.log("npm package verified");
-          JS
-      - name: Publish to npm
-        run: |
-          npm publish ./package/ --access public 2>&1 || {
-            if npm view "$(node -e "const p=require('./package/package.json');console.log(p.name+'@'+p.version)")" version 2>/dev/null; then
-              echo "Version already published, skipping"
-            else
-              exit 1
-            fi
-          }
-
-  # ── Publish Python package to PyPI (trusted publishing) ───
-  # MUST run on a github-hosted runner (`ubuntu-latest`).  PyPI
-  # trusted publishing via OIDC requires the GHA OIDC token endpoint
-  # at `run-actions-1-azure-eastus.actions.githubusercontent.com`,
-  # which is not reachable from the k8s runner pool (30s SSL handshake
-  # timeout in v0.5.9 release run).
-  publish-pypi:
-    name: publish pypi
-    needs: build-pyodide
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: pypi-publish
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: Download python package
-        uses: actions/download-artifact@v4
-        with:
-          name: wasmsh-pyodide-runtime-py
-          path: package/
-      - name: Build sdist and wheel
-        run: |
-          pip install build
-          cd package && python -m build
-      - name: Verify the wheel carries every asset
-        # `package-data` globs in this project are one directory deep and
-        # do not recurse, so a new subdirectory under `assets/` is dropped
-        # from the wheel unless someone remembers to add its glob. That is
-        # not hypothetical: `assets/lib/baseline/boot-plan.mjs` was missing
-        # from 0.5.10-0.6.2 and only surfaced as ERR_MODULE_NOT_FOUND in a
-        # downstream adapter. Compare the wheel against the source tree
-        # instead of against a hand-maintained list.
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import pathlib
-          import sys
-          import zipfile
-
-          wheel = next(pathlib.Path("package/dist").glob("*.whl"))
-          packaged = {
-              name.split("wasmsh_pyodide_runtime/", 1)[1]
-              for name in zipfile.ZipFile(wheel).namelist()
-              if "wasmsh_pyodide_runtime/assets/" in name
-          }
-          source_root = pathlib.Path("package/wasmsh_pyodide_runtime")
-          expected = {
-              str(path.relative_to(source_root))
-              for path in (source_root / "assets").rglob("*")
-              if path.is_file()
-          }
-          missing = sorted(expected - packaged)
-          if missing:
-              print(f"{len(missing)} asset(s) missing from {wheel.name}:")
-              for name in missing:
-                  print("   ", name)
-              sys.exit(1)
-          print(f"{wheel.name}: all {len(expected)} assets packaged")
-          PY
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: package/dist/
-          skip-existing: true
-
-  # ── Publish container images to GHCR ──────────────────────
-  # Tag-triggered build + push of the dispatcher and runner images
-  # referenced by deploy/helm/wasmsh.  Consumers of the chart pin by
-  # digest; the image digests are captured into `image-digests.json` and
-  # attached to the GitHub Release so downstream deployments can bump the
-  # chart values without re-running the build.
-  #
-  # Runs on the in-cluster runner pool (Docker + BuildKit available),
-  # matching the rest of the build-heavy jobs.  publish-npm / publish-pypi
-  # must stay on github-hosted runners for OIDC reasons, but image
-  # publishing has no such constraint.
-  publish-images:
-    name: publish container images
-    needs: [validate, build-pyodide]
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      dispatcher-digest: ${{ steps.build-dispatcher.outputs.digest }}
-      runner-digest: ${{ steps.build-runner.outputs.digest }}
-    steps:
-      - uses: actions/checkout@v4
-      # The runner image bakes prebuilt Pyodide assets.  Re-download the
-      # npm package artifact produced by build-pyodide instead of
-      # rebuilding Pyodide from source (which would add ~30 min to the
-      # release).
-      - name: Download pyodide npm package artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: wasmsh-pyodide-npm
-          path: packages/npm/wasmsh-pyodide
-      - name: Verify pyodide assets present
-        run: |
-          test -f packages/npm/wasmsh-pyodide/assets/pyodide.asm.wasm \
-            || (echo "missing pyodide.asm.wasm from build-pyodide artifact" >&2 && exit 1)
-      - name: Compute image tags
-        id: tags
-        env:
-          # Pinned by `on.push.tags: v*` — still routed through env to
-          # keep shell expansion away from ${{ }} templating.
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          TAG="$REF_NAME"
-          VERSION="${TAG#v}"
+          source tools/standalone/versions.env
           {
-            echo "tag=${TAG}"
-            echo "version=${VERSION}"
+            echo "node-version=$NODE_VERSION"
+            echo "wasm-pack-version=$WASM_PACK_VERSION"
+            echo "wasm-bindgen-version=$WASM_BINDGEN_CLI_VERSION"
           } >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: actions/setup-node@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build + push dispatcher image
-        id: build-dispatcher
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/docker/Dockerfile.dispatcher
-          push: true
-          platforms: linux/amd64
-          tags: |
-            ghcr.io/mayflower/wasmsh-dispatcher:${{ steps.tags.outputs.tag }}
-            ghcr.io/mayflower/wasmsh-dispatcher:${{ steps.tags.outputs.version }}
-            ghcr.io/mayflower/wasmsh-dispatcher:latest
-          cache-from: type=gha,scope=dispatcher
-          cache-to: type=gha,scope=dispatcher,mode=max
-          provenance: true
-          sbom: true
-      - name: Build + push runner image
-        id: build-runner
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/docker/Dockerfile.runner
-          push: true
-          platforms: linux/amd64
-          tags: |
-            ghcr.io/mayflower/wasmsh-runner:${{ steps.tags.outputs.tag }}
-            ghcr.io/mayflower/wasmsh-runner:${{ steps.tags.outputs.version }}
-            ghcr.io/mayflower/wasmsh-runner:latest
-          cache-from: type=gha,scope=runner
-          cache-to: type=gha,scope=runner,mode=max
-          provenance: true
-          sbom: true
-      - name: Record image digests
-        env:
-          TAG: ${{ steps.tags.outputs.tag }}
-          DISPATCHER_DIGEST: ${{ steps.build-dispatcher.outputs.digest }}
-          RUNNER_DIGEST: ${{ steps.build-runner.outputs.digest }}
+          node-version: ${{ steps.versions.outputs.node-version }}
+          cache: npm
+          cache-dependency-path: e2e/standalone/package-lock.json
+      - name: Install pinned wasm tooling
         run: |
-          # Use jq so the digest values are JSON-encoded safely rather
-          # than being spliced as raw text into a heredoc.
-          jq -n \
-            --arg version "$TAG" \
-            --arg dispatcher_digest "$DISPATCHER_DIGEST" \
-            --arg runner_digest "$RUNNER_DIGEST" \
-            '{
-               version: $version,
-               dispatcher: {
-                 repository: "ghcr.io/mayflower/wasmsh-dispatcher",
-                 digest: $dispatcher_digest
-               },
-               runner: {
-                 repository: "ghcr.io/mayflower/wasmsh-runner",
-                 digest: $runner_digest
-               }
-             }' > image-digests.json
-          cat image-digests.json
-      - name: Upload image digests artifact
-        uses: actions/upload-artifact@v4
+          binaryen_dir="$(bash tools/standalone/install-binaryen.sh "$RUNNER_TEMP/wasmsh-binaryen")"
+          echo "$binaryen_dir/bin" >> "$GITHUB_PATH"
+          cargo install wasm-pack --version "${{ steps.versions.outputs.wasm-pack-version }}" --locked --force
+          cargo install wasm-bindgen-cli --version "${{ steps.versions.outputs.wasm-bindgen-version }}" --locked --force
+      - run: bash tools/standalone/build.sh dist/standalone-pkg
+      - name: Package and checksum release candidate
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: node tools/standalone/package.mjs dist/standalone-pkg dist/standalone
+      - uses: actions/upload-artifact@v4
         with:
-          name: wasmsh-image-digests
-          path: image-digests.json
+          name: wasmsh-release-candidate
+          path: dist/standalone/*.tar.gz
+          if-no-files-found: error
+          retention-days: 3
 
-  # ── Create GitHub Release ──────────────────────────────────
-  release:
-    name: github release
-    needs: [build-standalone, build-pyodide, publish-crates, publish-npm, publish-pypi, publish-images]
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 10
+  test-final-artifacts:
+    name: Verify release candidate
+    needs: build-candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: Download standalone artifact
-        uses: actions/download-artifact@v4
+      - name: Load pinned Node version
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          source tools/standalone/versions.env
+          echo "node-version=$NODE_VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
         with:
-          name: wasmsh-standalone
-      - name: Download pyodide dist
-        uses: actions/download-artifact@v4
+          node-version: ${{ steps.versions.outputs.node-version }}
+          cache: npm
+          cache-dependency-path: e2e/standalone/package-lock.json
+      - uses: actions/download-artifact@v4
         with:
-          name: wasmsh-pyodide-dist
-      - name: Download image digests
-        uses: actions/download-artifact@v4
+          name: wasmsh-release-candidate
+          path: candidate
+      - name: Extract and verify release candidate
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(find candidate -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+          test -n "$archive"
+          mkdir -p extracted
+          tar -xzf "$archive" -C extracted
+          root=$(find extracted -mindepth 1 -maxdepth 1 -type d -print -quit)
+          test -n "$root"
+          node tools/standalone/verify-package.mjs "$root"
+          (cd "$root" && sha256sum -c SHA256SUMS)
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+      - run: node tools/standalone/node-smoke.mjs "${{ steps.extract.outputs.root }}"
+      - run: node tools/standalone/external-smoke.mjs
+      - name: Install locked browser test dependencies
+        working-directory: e2e/standalone
+        run: npm ci
+      - run: node --experimental-wasm-modules tools/standalone/bundler-smoke.mjs "${{ steps.extract.outputs.root }}"
+      - name: Install pinned Chromium browser
+        working-directory: e2e/standalone
+        run: npx playwright install chromium --with-deps
+      - name: Put verified web target in browser fixture
+        shell: bash
+        env:
+          ARTIFACT_ROOT: ${{ steps.extract.outputs.root }}
+        run: |
+          set -euo pipefail
+          rm -rf e2e/standalone/fixture/pkg
+          mkdir -p e2e/standalone/fixture/pkg
+          cp -R "$ARTIFACT_ROOT/web/." e2e/standalone/fixture/pkg/
+      - name: Run browser verification
+        working-directory: e2e/standalone
+        run: npx playwright test
+      - name: Upload browser diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          name: wasmsh-image-digests
-      - name: Create release
+          name: standalone-release-browser-report
+          path: |
+            e2e/standalone/playwright-report/
+            e2e/standalone/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  upload-tested-artifact:
+    name: Upload tested release artifact
+    needs: [test-final-artifacts, host-matrix]
+    if: ${{ needs.test-final-artifacts.result == 'success' && needs.host-matrix.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasmsh-release-candidate
+          path: candidate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasmsh-standalone-release
+          path: candidate/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  host-matrix:
+    name: Release host consumption (${{ matrix.os }})
+    needs: build-candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned Node version
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          source tools/standalone/versions.env
+          echo "node-version=$NODE_VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.versions.outputs.node-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasmsh-release-candidate
+          path: candidate
+      - name: Extract and verify the shared release candidate
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(find candidate -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+          test -n "$archive"
+          mkdir -p extracted
+          tar -xzf "$archive" -C extracted
+          root=$(find extracted -mindepth 1 -maxdepth 1 -type d -print -quit)
+          test -n "$root"
+          node tools/standalone/verify-package.mjs "$root"
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+      - name: Run Node, clock, network, external, isolation, and cancellation smoke
+        run: node tools/standalone/node-smoke.mjs "${{ steps.extract.outputs.root }}"
+      - name: Run native external host smoke
+        run: node tools/standalone/external-smoke.mjs
+      - name: Install locked bundler smoke dependency
+        working-directory: e2e/standalone
+        run: npm ci --ignore-scripts
+      - name: Run bundler consumer smoke
+        run: node --experimental-wasm-modules tools/standalone/bundler-smoke.mjs "${{ steps.extract.outputs.root }}"
+
+  github-release:
+    name: Publish standalone GitHub Release
+    needs: [test-final-artifacts, host-matrix]
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.test-final-artifacts.result == 'success' && needs.host-matrix.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasmsh-release-candidate
+          path: release
+      - name: Create release from tested archive
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: |
-            wasmsh-*.tar.gz
-            image-digests.json
+          files: release/*.tar.gz
           draft: false
           prerelease: false

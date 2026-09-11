@@ -10,14 +10,20 @@
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
 
-use wasmsh_protocol::{DiagnosticLevel, HostCommand, WorkerEvent, PROTOCOL_VERSION};
+use wasmsh_protocol::{
+    DiagnosticLevel, HostCommand, NetworkPolicyConfig, WorkerEvent, PROTOCOL_VERSION,
+};
 use wasmsh_runtime::{ExternalCommandHandler, WorkerRuntime};
 use wasmsh_utils::net_types::{
-    HostAllowlist, HttpRequest, HttpResponse, NetworkBackend, NetworkError,
+    validate_http_url, HostAllowlist, HttpRequest, HttpResponse, NetworkBackend, NetworkError,
+    NetworkPolicy,
 };
 
 /// Create a network backend for the allowed-host configuration from `Init`.
 pub type NetworkBackendFactory = Box<dyn Fn(Vec<String>) -> Box<dyn NetworkBackend>>;
+
+/// Create a network backend for the structured policy configuration.
+pub type NetworkPolicyBackendFactory = Box<dyn Fn(NetworkPolicyConfig) -> Box<dyn NetworkBackend>>;
 
 /// Configuration for a shared JSON runtime handle.
 #[allow(
@@ -31,6 +37,8 @@ pub struct JsonRuntimeConfig {
     /// Factory used to install a deterministic network backend on every
     /// `Init`. When unset, a deny-all backend is used.
     pub network_backend_factory: Option<NetworkBackendFactory>,
+    /// Factory used for the structured `network_policy` configuration.
+    pub network_policy_backend_factory: Option<NetworkPolicyBackendFactory>,
 }
 
 /// Shared JSON runtime handle used by both Pyodide and the WASI P2 component.
@@ -45,6 +53,7 @@ pub struct JsonRuntimeConfig {
 pub struct JsonRuntimeHandle {
     runtime: WorkerRuntime,
     network_backend_factory: NetworkBackendFactory,
+    network_policy_backend_factory: NetworkPolicyBackendFactory,
 }
 
 impl JsonRuntimeHandle {
@@ -61,11 +70,16 @@ impl JsonRuntimeHandle {
         if let Some(handler) = config.external_handler {
             runtime.set_external_handler(handler);
         }
+        let legacy_factory = config.network_backend_factory.unwrap_or_else(|| {
+            Box::new(|allowed_hosts| Box::new(DenyingNetworkBackend::new(allowed_hosts)))
+        });
+        let policy_factory = config
+            .network_policy_backend_factory
+            .unwrap_or_else(|| Box::new(|_| Box::new(UnavailableNetworkBackend)));
         Self {
             runtime,
-            network_backend_factory: config.network_backend_factory.unwrap_or_else(|| {
-                Box::new(|allowed_hosts| Box::new(DenyingNetworkBackend::new(allowed_hosts)))
-            }),
+            network_backend_factory: legacy_factory,
+            network_policy_backend_factory: policy_factory,
         }
     }
 
@@ -73,7 +87,28 @@ impl JsonRuntimeHandle {
     /// `Vec<WorkerEvent>` back to JSON.
     #[must_use]
     pub fn handle_json(&mut self, input: &str) -> String {
-        let cmd: HostCommand = match serde_json::from_str(input) {
+        let value: serde_json::Value = match serde_json::from_str(input) {
+            Ok(value) => value,
+            Err(error) => {
+                return serialize_events(&[WorkerEvent::Diagnostic(
+                    DiagnosticLevel::Error,
+                    format!("invalid JSON command: {error}"),
+                )]);
+            }
+        };
+
+        if let Some(init) = value.get("Init").and_then(serde_json::Value::as_object) {
+            let has_network_policy = init
+                .get("network_policy")
+                .is_some_and(|policy| !policy.is_null());
+            if init.contains_key("allowed_hosts") && has_network_policy {
+                return serialize_events(&[WorkerEvent::Diagnostic(
+                    DiagnosticLevel::Error,
+                    "network_policy and allowed_hosts cannot both be configured".into(),
+                )]);
+            }
+        }
+        let cmd: HostCommand = match serde_json::from_value(value) {
             Ok(command) => command,
             Err(error) => {
                 return serialize_events(&[WorkerEvent::Diagnostic(
@@ -84,11 +119,24 @@ impl JsonRuntimeHandle {
         };
 
         if let HostCommand::Init {
-            ref allowed_hosts, ..
+            ref allowed_hosts,
+            ref network_policy,
+            ..
         } = cmd
         {
-            self.runtime
-                .set_network_backend((self.network_backend_factory)(allowed_hosts.clone()));
+            if let Some(policy) = network_policy {
+                if let Err(error) = NetworkPolicy::try_from_config(policy.clone()) {
+                    return serialize_events(&[WorkerEvent::Diagnostic(
+                        DiagnosticLevel::Error,
+                        format!("invalid network policy: {error}"),
+                    )]);
+                }
+            }
+            let backend = match network_policy {
+                Some(policy) => (self.network_policy_backend_factory)(policy.clone()),
+                None => (self.network_backend_factory)(allowed_hosts.clone()),
+            };
+            self.runtime.set_network_backend(backend);
         }
 
         let events = self.runtime.handle_command(cmd);
@@ -215,6 +263,7 @@ mod tests {
             &serde_json::to_string(&HostCommand::Init {
                 step_budget: 100_000,
                 allowed_hosts: Vec::new(),
+                network_policy: None,
             })
             .unwrap(),
         );
@@ -236,5 +285,64 @@ mod tests {
             ),
             "expected invalid JSON diagnostic"
         );
+    }
+
+    #[test]
+    fn structured_network_policy_is_validated_during_init() {
+        let mut handle = JsonRuntimeHandle::new();
+        let payload = handle.handle_json(
+            r#"{"Init":{"step_budget":0,"network_policy":{"enabled":true,"default_action":"deny","allow":["*.example.com"],"deny":["blocked.example.com"]}}}"#,
+        );
+        assert_eq!(
+            decode_events(&payload),
+            vec![WorkerEvent::Version(PROTOCOL_VERSION.to_string())]
+        );
+
+        let invalid = handle.handle_json(
+            r#"{"Init":{"step_budget":0,"network_policy":{"enabled":true,"allow":["api.*.example.com"]}}}"#,
+        );
+        assert!(matches!(
+            decode_events(&invalid).as_slice(),
+            [WorkerEvent::Diagnostic(DiagnosticLevel::Error, message)]
+                if message.contains("invalid network policy")
+        ));
+    }
+
+    #[test]
+    fn structured_and_legacy_network_config_conflict_is_rejected() {
+        let mut handle = JsonRuntimeHandle::new();
+        let payload = handle.handle_json(
+            r#"{"Init":{"step_budget":0,"allowed_hosts":["example.com"],"network_policy":{"enabled":true}}}"#,
+        );
+        assert!(matches!(
+            decode_events(&payload).as_slice(),
+            [WorkerEvent::Diagnostic(DiagnosticLevel::Error, message)]
+                if message.contains("cannot both be configured")
+        ));
+
+        let empty_legacy = handle.handle_json(
+            r#"{"Init":{"step_budget":0,"allowed_hosts":[],"network_policy":{"enabled":true}}}"#,
+        );
+        assert!(matches!(
+            decode_events(&empty_legacy).as_slice(),
+            [WorkerEvent::Diagnostic(DiagnosticLevel::Error, message)]
+                if message.contains("cannot both be configured")
+        ));
+    }
+}
+
+#[derive(Debug)]
+struct UnavailableNetworkBackend;
+
+impl NetworkBackend for UnavailableNetworkBackend {
+    fn check_url(&self, url: &str) -> Result<(), NetworkError> {
+        validate_http_url(url)
+    }
+
+    fn fetch(&self, request: &HttpRequest) -> Result<HttpResponse, NetworkError> {
+        validate_http_url(&request.url)?;
+        Err(NetworkError::Other(
+            "transport does not provide a network backend".to_string(),
+        ))
     }
 }

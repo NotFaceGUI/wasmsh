@@ -21,6 +21,16 @@ export interface ListDirResult {
   output: string;
 }
 
+export interface NetworkPolicyConfig {
+  enabled: boolean;
+  default_action?: "deny" | "allow";
+  allow?: string[];
+  deny?: string[];
+}
+
+/** Backwards-compatible name for the structured network policy config. */
+export type NetworkPolicy = NetworkPolicyConfig;
+
 export interface NodeSessionOptions {
   assetDir?: string;
   nodeExecutable?: string;
@@ -28,6 +38,8 @@ export interface NodeSessionOptions {
   initialFiles?: InitialFileInput[];
   /** Hostnames allowed for network access (empty = deny all). */
   allowedHosts?: string[];
+  /** Structured network policy; do not combine with allowedHosts. */
+  networkPolicy?: NetworkPolicy;
   /** Request timeout in milliseconds (default: 300000 = 5 minutes). 0 disables. */
   timeoutMs?: number;
 }
@@ -39,6 +51,8 @@ export interface BrowserSessionOptions {
   initialFiles?: InitialFileInput[];
   /** Hostnames allowed for network access (empty = deny all). */
   allowedHosts?: string[];
+  /** Structured network policy; do not combine with allowedHosts. */
+  networkPolicy?: NetworkPolicy;
   /** Request timeout in milliseconds (default: 300000 = 5 minutes). 0 disables. */
   timeoutMs?: number;
 }
@@ -107,12 +121,12 @@ export interface WasmshSession {
    *
    * Supported requirement formats:
    * - `emfs:/path/to/wheel.whl` — install from the in-sandbox Emscripten filesystem
-   * - `https://host/pkg-1.0-py3-none-any.whl` — download and install (requires allowedHosts)
-   * - `"six"` — resolve from PyPI and install (requires allowedHosts incl. pypi.org)
+   * - `https://host/pkg-1.0-py3-none-any.whl` — download and install (requires network policy access)
+   * - `"six"` — resolve from PyPI and install (requires access to pypi.org)
    *
    * Only pure-Python wheels (py3-none-any) are supported.
    *
-   * Security: `file:` URIs are rejected. Network installs will require `allowedHosts`.
+   * Security: `file:` URIs are rejected. Network installs require the session policy to allow the target.
    */
   installPythonPackages(
     requirements: string | string[],

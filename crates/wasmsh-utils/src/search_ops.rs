@@ -980,6 +980,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             util_rg(&mut ctx, argv)
         };
@@ -1274,6 +1275,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             util_fd(&mut ctx, argv)
         };

@@ -45,7 +45,7 @@ sequenceDiagram
     participant Host
     participant Runtime as WorkerRuntime
 
-    Host->>Runtime: Init { step_budget, allowed_hosts }
+    Host->>Runtime: Init { step_budget, network_policy }
     Runtime-->>Host: Version("0.1.0")
 
     Host->>Runtime: WriteFile { path, data }
@@ -110,7 +110,8 @@ Initialise the shell runtime. Must be sent before any other command.
 | Field           | Type          | Description |
 |-----------------|---------------|-------------|
 | `step_budget`   | `u64`         | Maximum VM steps per execution. `0` disables the budget. The VM checks the budget at instruction boundaries; runaway scripts hit the limit and exit with a diagnostic. |
-| `allowed_hosts` | `Vec<String>` | Hostnames / IPs allowed for network access. Empty = no network. Patterns: exact host (`api.example.com`), wildcard (`*.example.com`), IP (`192.168.1.100`), host with port (`api.example.com:8080`). See [ADR-0021](../adr/adr-0021-network-capability.md). |
+| `allowed_hosts` | `Vec<String>` | Legacy host patterns. Empty = no network. It maps to enabled allowlist mode and cannot be sent with `network_policy`. |
+| `network_policy` | `NetworkPolicyConfig?` | Structured policy: `enabled`, `default_action` (`deny` or `allow`), `allow`, and `deny`. Deny is evaluated first; disabled policies deny all. Rules support exact hosts, strict `*.example.com` subdomains, `*`, ports, IPv4, and bracketed IPv6. Invalid rules fail initialization. |
 
 **Response**: `Version("0.1.0")`.
 
@@ -245,7 +246,7 @@ variant with its name. Field names are `snake_case`.
 `Init`:
 
 ```json
-{ "Init": { "step_budget": 100000, "allowed_hosts": ["pypi.org", "*.pythonhosted.org"] } }
+{ "Init": { "step_budget": 100000, "network_policy": { "enabled": true, "default_action": "deny", "allow": ["pypi.org", "*.pythonhosted.org"], "deny": [] } } }
 ```
 
 `Run`:
@@ -318,6 +319,6 @@ through the Pyodide / Emscripten module. See
 ## See Also
 
 - [Architecture: Execution Flow](../explanation/architecture.md#execution-flow) for what happens between `Run` / `StartRun` and the resulting events.
-- [Sandbox and Capabilities](sandbox-and-capabilities.md) for the security model behind `step_budget` and `allowed_hosts`.
+- [Sandbox and Capabilities](sandbox-and-capabilities.md) for the security model behind `step_budget` and `network_policy`.
 - [Embedding wasmsh](../guides/embedding.md) for how to drive the protocol from a host.
-- [ADR-0021](../adr/adr-0021-network-capability.md) for the network allowlist design.
+- [ADR-0021](../adr/adr-0021-network-capability.md) for the network policy design.

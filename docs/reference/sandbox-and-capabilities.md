@@ -18,11 +18,12 @@ In particular:
   interpreter. Neither backend touches the host's real filesystem.
 - The script has **no network access** unless the host explicitly
   allowlists hostnames at `Init` time.
-- The script has **no process model**. There is no `fork`, no `exec`, and
-  no job control. `kill`, `wait`, `jobs` are not supported. The host can
-  inject modeled POSIX-style signals into the current shell session, and
-  trap handlers run inside the shell runtime rather than via an OS process
-  tree. Stop/continue signals therefore do not suspend or resume real jobs.
+- The WASM script has **no ambient process model**. There is no `fork`, no
+  shell-spawned `exec`, and no job control. A trusted host may explicitly
+  register a fixed external executable; only that registration can create a
+  host process, and `kill`, `wait`, and `jobs` still are not shell features.
+  Modeled signals target the shell session; the Node stream adapter separately
+  reaps or kills its registered process tree on completion/cancel.
 - The script **cannot run arbitrary native code**. Builtins, utilities,
   and external command handlers are the only ways to enter native code,
   and all of them are registered statically by the host.
@@ -55,6 +56,7 @@ Set `step_budget` via `HostCommand::Init`:
 rt.handle_command(HostCommand::Init {
     step_budget: 100_000,
     allowed_hosts: vec![],
+    network_policy: None,
 });
 ```
 
@@ -83,10 +85,12 @@ truncated and the command exits.
 This protects the host from `yes | head` style scripts that would
 otherwise pin a buffer on the wire indefinitely.
 
-## Network allowlist
+## Network policy
 
-wasmsh ships two networking utilities: `curl` and `wget`. Both are gated
-by `allowed_hosts`. The mechanism is:
+wasmsh ships two networking utilities: `curl` and `wget`. Both use the same
+`NetworkPolicy` matcher and every actual backend request is checked before I/O.
+The default is `enabled: false`, which disables networking. The legacy
+`allowed_hosts` array maps to enabled allowlist mode.
 
 1. The host provides a list of patterns at `Init`.
 2. `curl`/`wget` check the requested URL against the allowlist before any
@@ -94,19 +98,42 @@ by `allowed_hosts`. The mechanism is:
 3. Denied requests fail with an error and a diagnostic; they never touch
    the network.
 
+Structured configuration example:
+
+```json
+{
+  "network_policy": {
+    "enabled": true,
+    "default_action": "deny",
+    "allow": ["example.com", "*.example.com:443"],
+    "deny": ["blocked.example.com"]
+  }
+}
+```
+
 ### Pattern syntax
 
 | Pattern                  | Matches                                     |
 |--------------------------|---------------------------------------------|
 | `api.example.com`        | Exactly that host on any port               |
-| `*.example.com`          | Any subdomain (but not `example.com` itself) |
+| `*.example.com`          | Any strict subdomain (but not `example.com` itself) |
+| `*`                      | Any valid HTTP(S) host when explicitly configured |
 | `192.168.1.100`          | That IP exactly                             |
+| `[2001:db8::1]:8080`     | That IPv6 address and port                 |
 | `api.example.com:8080`   | That host on that specific port             |
 
-An empty list disables network access entirely. There is no wildcard
-"allow everything"; if you want to permit any host you must list each
-one. This is intentional — it makes review of the host configuration
-mechanical.
+An empty legacy list disables network access entirely. Structured policies
+support `default_action: "deny"` for allowlist mode, `"allow"` for blacklist
+mode, and combinations of both lists. A matching `deny` rule is always
+evaluated first and cannot be overridden by `allow`. Sending both policy
+forms is an initialization error, even when `allowed_hosts` is empty.
+
+Rules and URLs are normalized for case, a trailing dot, IDNA, effective
+HTTP/HTTPS default ports, IPv6 representation, and label boundaries. Partial
+wildcards, regular expressions, CIDR, userinfo, malformed hosts, and invalid
+ports are rejected during initialization. Redirect following is manual and
+rechecks every hop; a browser synchronous XHR backend is refused unless a
+trusted redirect-aware broker is installed.
 
 See [ADR-0021](../adr/adr-0021-network-capability.md) for the design
 rationale.
@@ -128,30 +155,34 @@ This is a deliberate design choice (see
 [Design decisions: Virtual system commands](../explanation/design-decisions.md#virtual-system-commands)).
 Reproducible output for tests and no host fingerprinting.
 
-## Deterministic clock
+## Clock capability
 
-`date` returns a fixed value (`2026-01-01 00:00:00 UTC`) by default. This
-is also for reproducibility: the same script run twice produces the same
-output.
+Standalone production sessions use a host-installed synchronous clock
+callback. Each `date` command samples the callback once, and SigV4 uses the
+same capability. The callback returns a safe integer Unix timestamp in
+milliseconds; a missing, throwing, or invalid callback fails the command
+instead of fabricating a startup timestamp.
 
-To override the value for a particular session, set `WASMSH_DATE`:
-
-```sh
-WASMSH_DATE="2024-06-15 12:00:00 UTC" date
+```js
+shell.set_clock_callback(() => Date.now());
+shell.set_fixed_time_ms(1767225600000n); // explicit deterministic test mode
+shell.clear_clock_callback();            // time-dependent commands fail
 ```
 
-`WASMSH_DATE` is read from the shell environment, so you can set it once
-in a script preamble, in the host's `initialFiles`, or per-command.
+The low-level legacy `UtilContext` may use `WASMSH_DATE` only when no runtime
+clock provider is installed. It is not a production override and does not
+change the shared SigV4 clock. `$SECONDS` and execution timing use a separate
+monotonic clock. VFS file timestamps retain their existing virtual semantics.
 
 ## Recognised environment variables
 
 | Variable        | Read by    | Effect |
 |-----------------|------------|--------|
-| `WASMSH_DATE`   | `date`     | Override the deterministic clock value. |
-| `HOME`          | `cd`, tilde expansion | Default working directory and `~` target. Defaults to `/home/user` if unset. |
-| `PWD` / `OLDPWD`| `cd`       | Maintained by `cd`; readable by scripts. |
-| `IFS`           | word splitting | Field separator characters. |
-| `PATH`          | `command -v`, source resolution | Search path for commands and `source` lookups. |
+| `WASMSH_DATE`   | legacy low-level `date` | Explicit compatibility input only when no runtime clock provider is installed; it cannot override standalone production clock callbacks. |
+| `HOME`          | `cd`, tilde expansion | Seeded to `/home/user` at `Init`; the `~` target and `cd` destination. Explicit overwrites are preserved. |
+| `PWD` / `OLDPWD`| `cd`       | `PWD` is seeded to `/` at `Init` and both are maintained by `cd`; readable by scripts. |
+| `IFS`           | word splitting | Field separator characters. Defaults to space/tab/newline when unset. |
+| `PATH`          | `command -v`, source resolution | Seeded to `/usr/bin:/bin` at `Init`; search path for commands and `source` lookups. |
 | `BASH_REMATCH`  | `[[ … =~ … ]]` | Regex capture groups. |
 | `RANDOM`        | dynamic    | 16-bit value from an internal XorShift PRNG; writable to reseed. |
 | `LINENO`        | dynamic    | Current source line. |
@@ -173,10 +204,9 @@ responsible for them:
 
 - **Memory pressure.** A script can allocate a multi-megabyte string in
   the wasm heap. Cap your wasm module memory at the host level.
-- **Wall-clock total runtime.** `step_budget` bounds steps, not wall
-  time. A spinning Pyodide-side computation in a `python` external
-  command is not counted against `step_budget`. Set host-level timeouts
-  if needed.
+- **Wall-clock total runtime.** `step_budget` bounds steps, not all wall
+  time. Registered native processes have host-side timeouts, while a host
+  must still enforce an outer deadline around the WASM call.
 - **Concurrent runtime instances.** Each `WorkerRuntime` is independent;
   if you spawn many you must manage them yourself.
 - **Persistence.** State is in-memory and reset by `Init`. Use

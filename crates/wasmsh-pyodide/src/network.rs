@@ -8,7 +8,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
 use wasmsh_utils::net_types::{
-    HostAllowlist, HttpRequest, HttpResponse, NetworkBackend, NetworkError,
+    HttpRequest, HttpResponse, NetworkBackend, NetworkError, NetworkPolicy, NetworkPolicyConfig,
 };
 
 extern "C" {
@@ -36,7 +36,7 @@ extern "C" {
 
 /// Network backend for the Pyodide Emscripten target.
 pub struct PyodideNetworkBackend {
-    allowlist: HostAllowlist,
+    policy: NetworkPolicy,
 }
 
 /// RAII guard that frees a `libc::malloc`-allocated C string on drop.
@@ -62,10 +62,25 @@ impl Drop for JsAllocCString {
 }
 
 impl PyodideNetworkBackend {
+    /// Construct a backend from a validated structured policy.
+    pub fn from_policy(policy: NetworkPolicy) -> Self {
+        Self { policy }
+    }
+
+    /// Fallible legacy constructor for hosts that still provide
+    /// `allowed_hosts` as a bare array.
+    pub fn try_new(allowed_hosts: Vec<String>) -> Result<Self, String> {
+        let policy = NetworkPolicy::try_from_allowed_hosts(allowed_hosts)
+            .map_err(|error| error.to_string())?;
+        Ok(Self { policy })
+    }
+
     pub fn new(allowed_hosts: Vec<String>) -> Self {
-        Self {
-            allowlist: HostAllowlist::new(allowed_hosts),
-        }
+        Self::try_new(allowed_hosts).unwrap_or_else(|_| {
+            let policy = NetworkPolicy::try_from_config(NetworkPolicyConfig::default())
+                .expect("default network policy must be valid");
+            Self { policy }
+        })
     }
 }
 
@@ -125,11 +140,11 @@ struct JsFetchOptions {
 
 impl NetworkBackend for PyodideNetworkBackend {
     fn check_url(&self, url: &str) -> Result<(), NetworkError> {
-        self.allowlist.check(url)
+        self.policy.check(url)
     }
 
     fn fetch(&self, request: &HttpRequest) -> Result<HttpResponse, NetworkError> {
-        self.allowlist.check(&request.url)?;
+        self.policy.check(&request.url)?;
 
         let url_c =
             CString::new(request.url.as_str()).map_err(|e| NetworkError::Other(e.to_string()))?;

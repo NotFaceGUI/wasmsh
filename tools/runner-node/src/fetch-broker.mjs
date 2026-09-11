@@ -1,4 +1,9 @@
-import { assertAllowedHost, HostDeniedError } from "./network-policy.mjs";
+import {
+  assertNetworkAllowed,
+  HostDeniedError,
+  InvalidUrlError,
+  TooManyRedirectsError,
+} from "./network-policy.mjs";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -64,7 +69,32 @@ async function readBodyWithLimit(response, byteLimit) {
   return out;
 }
 
-class BrokerPayloadTooLargeError extends Error {
+function shouldDowngradeToGet(status) {
+  return status === 301 || status === 302 || status === 303;
+}
+
+function isRedirectStatus(status) {
+  return status === 301 || status === 302 || status === 303 ||
+    status === 307 || status === 308;
+}
+
+function sameOrigin(from, to) {
+  return new URL(from).origin === new URL(to).origin;
+}
+
+function headerValue(headers, name) {
+  return new Headers(headers).get(name);
+}
+
+function stripCrossOriginSensitiveHeaders(headers) {
+  const sanitized = new Headers(headers);
+  for (const name of ["authorization", "cookie", "proxy-authorization", "host"]) {
+    sanitized.delete(name);
+  }
+  return sanitized;
+}
+
+export class BrokerPayloadTooLargeError extends Error {
   constructor(message) {
     super(message);
     this.name = "BrokerPayloadTooLargeError";
@@ -77,6 +107,12 @@ function classifyBrokerError(error) {
   }
   if (error instanceof BrokerPayloadTooLargeError) {
     return "payload_too_large";
+  }
+  if (error instanceof InvalidUrlError) {
+    return "invalid_url";
+  }
+  if (error instanceof TooManyRedirectsError) {
+    return "too_many_redirects";
   }
   if (error?.name === "AbortError" || error?.name === "TimeoutError") {
     return "timeout";
@@ -91,25 +127,93 @@ export function createFetchBroker({
   responseByteLimit = DEFAULT_BROKER_RESPONSE_BYTES,
 } = {}) {
   return {
-    async fetchJson(request, allowedHosts) {
-      assertAllowedHost(request.url, allowedHosts);
-      const response = await fetchImpl(request.url, {
-        method: request.method,
-        headers: request.headers,
-        body: request.body_base64 ? Buffer.from(request.body_base64, "base64") : undefined,
-        redirect: request.follow_redirects ? "follow" : "manual",
-        signal: AbortSignal.timeout(fetchTimeoutMs),
-      });
-      // Reserve ~1 KiB of the response envelope for headers + JSON framing
-      // so a body that fits under the cap still serialises into the shared
-      // buffer without overflow.
-      const bodyCap = Math.max(0, responseByteLimit - 1024);
-      const bodyBytes = await readBodyWithLimit(response, bodyCap);
-      return {
-        status: response.status,
-        headers: Array.from(response.headers.entries()),
-        body_base64: Buffer.from(bodyBytes).toString("base64"),
-      };
+    async fetchJson(request, networkConfig) {
+      const policy = assertNetworkAllowed(request.url, networkConfig);
+      let currentUrl = request.url;
+      let method = String(request.method || "GET").toUpperCase();
+      let headers = Array.isArray(request.headers) ? request.headers : [];
+      let body = request.body_base64
+        ? Buffer.from(request.body_base64, "base64")
+        : undefined;
+      const options = request.options && typeof request.options === "object"
+        ? request.options
+        : {};
+      const requestedBodyLimit = Number(options.max_response_bytes);
+      const bodyCap = Math.max(
+        0,
+        Math.min(
+          responseByteLimit - 1024,
+          Number.isFinite(requestedBodyLimit) && requestedBodyLimit >= 0
+            ? requestedBodyLimit
+            : responseByteLimit - 1024,
+        ),
+      );
+      const requestedRedirectLimit = Number(options.max_redirs);
+      const maxRedirects = Number.isInteger(requestedRedirectLimit) && requestedRedirectLimit >= 0
+        ? Math.min(requestedRedirectLimit, 20)
+        : 20;
+      const requestedTimeout = Number(options.timeout_ms);
+      const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+        ? Math.min(requestedTimeout, fetchTimeoutMs)
+        : fetchTimeoutMs;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        let redirects = 0;
+        while (true) {
+          assertNetworkAllowed(currentUrl, policy);
+          const response = await fetchImpl(currentUrl, {
+            method,
+            headers,
+            body,
+            // The broker owns redirect handling. This must stay manual even
+            // when the guest requested follow_redirects=true.
+            redirect: "manual",
+            signal: controller.signal,
+          });
+          const location = response.headers.get("location");
+          if (!request.follow_redirects || !isRedirectStatus(response.status) || !location) {
+            const bodyBytes = await readBodyWithLimit(response, bodyCap);
+            return {
+              status: response.status,
+              headers: Array.from(response.headers.entries()),
+              body_base64: Buffer.from(bodyBytes).toString("base64"),
+            };
+          }
+          if (redirects >= maxRedirects) {
+            try { await response.body?.cancel(); } catch { /* best effort */ }
+            throw new TooManyRedirectsError(maxRedirects);
+          }
+          let nextUrl;
+          try {
+            nextUrl = new URL(location, currentUrl).toString();
+          } catch (error) {
+            try { await response.body?.cancel(); } catch { /* best effort */ }
+            throw new InvalidUrlError(location, error);
+          }
+          assertNetworkAllowed(nextUrl, policy);
+          if (!sameOrigin(currentUrl, nextUrl)) {
+            if (headerValue(headers, "authorization")?.startsWith("AWS4-HMAC-SHA256 ")) {
+              try { await response.body?.cancel(); } catch { /* best effort */ }
+              throw new HostDeniedError(
+                nextUrl,
+                "cross-origin signed redirect is not allowed",
+              );
+            }
+            headers = stripCrossOriginSensitiveHeaders(headers);
+          }
+          if (shouldDowngradeToGet(response.status) && !["GET", "HEAD"].includes(method)) {
+            method = "GET";
+            body = undefined;
+          }
+          try { await response.body?.cancel(); } catch { /* best effort */ }
+          currentUrl = nextUrl;
+          redirects += 1;
+        }
+      } finally {
+        clearTimeout(timer);
+      }
     },
     async handleFetchMessage(message) {
       const control = new Int32Array(message.controlBuffer);
@@ -121,7 +225,10 @@ export function createFetchBroker({
 
       let response;
       try {
-        response = await this.fetchJson(request, message.allowedHosts);
+        response = await this.fetchJson(
+          request,
+          message.networkPolicy ?? message.allowedHosts ?? [],
+        );
       } catch (error) {
         const reason = classifyBrokerError(error);
         if (reason === "host_denied") {
@@ -171,13 +278,14 @@ export function createBrokerClient({
   const responseView = new Uint8Array(responseBuffer);
 
   return {
-    fetchSync(url, method, headersJson, bodyBase64, followRedirects) {
+    fetchSync(url, method, headersJson, bodyBase64, followRedirects, optionsObj) {
       const payload = encoder.encode(JSON.stringify({
         url,
         method,
         headers: JSON.parse(headersJson || "[]"),
         body_base64: bodyBase64 || "",
         follow_redirects: Boolean(followRedirects),
+        options: optionsObj && typeof optionsObj === "object" ? optionsObj : {},
       }));
       if (payload.length > requestView.byteLength) {
         return {

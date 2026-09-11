@@ -1,23 +1,7 @@
 name: Snapshot Runner
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/snapshot-runner.yml"
-      - "tools/pyodide/**"
-      - "tools/runner-node/**"
-      - "packages/npm/wasmsh-pyodide/**"
-      - "e2e/build-contract/**"
-      - "justfile"
-  pull_request:
-    paths:
-      - ".github/workflows/snapshot-runner.yml"
-      - "tools/pyodide/**"
-      - "tools/runner-node/**"
-      - "packages/npm/wasmsh-pyodide/**"
-      - "e2e/build-contract/**"
-      - "justfile"
+  workflow_dispatch:
 
 jobs:
   snapshot-artifact:

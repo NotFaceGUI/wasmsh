@@ -1,0 +1,17 @@
+[test]
+name = "expr-regex-match"
+tags = ["utility", "gap"]
+tier = "P2"
+requires = ["expr"]
+
+[input]
+script = """
+expr abcdef : 'abc'
+expr hello : 'hel*'
+expr hello : 'xyz'
+expr abc123 : '[a-z]*'
+"""
+
+[expect]
+status = 0
+stdout = "3\n4\n0\n3\n"

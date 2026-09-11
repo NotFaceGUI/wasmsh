@@ -1,41 +1,7 @@
 name: Remote Sandbox E2E
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/remote-sandbox-e2e.yml"
-      - "crates/wasmsh-dispatcher/**"
-      - "tools/runner-node/**"
-      - "packages/npm/langchain-wasmsh/**"
-      - "packages/python/langchain-wasmsh/**"
-      - "packages/npm/wasmsh-pyodide/**"
-      - "deploy/docker/Dockerfile.dispatcher"
-      - "deploy/docker/Dockerfile.runner"
-      - "deploy/docker/compose.dispatcher-test.yml"
-      - "deploy/helm/wasmsh/**"
-      - "e2e/dispatcher-compose/**"
-      - "e2e/kind/**"
-      - "pnpm-workspace.yaml"
-      - "pnpm-lock.yaml"
-      - "justfile"
-  pull_request:
-    paths:
-      - ".github/workflows/remote-sandbox-e2e.yml"
-      - "crates/wasmsh-dispatcher/**"
-      - "tools/runner-node/**"
-      - "packages/npm/langchain-wasmsh/**"
-      - "packages/python/langchain-wasmsh/**"
-      - "packages/npm/wasmsh-pyodide/**"
-      - "deploy/docker/Dockerfile.dispatcher"
-      - "deploy/docker/Dockerfile.runner"
-      - "deploy/docker/compose.dispatcher-test.yml"
-      - "deploy/helm/wasmsh/**"
-      - "e2e/dispatcher-compose/**"
-      - "e2e/kind/**"
-      - "pnpm-workspace.yaml"
-      - "pnpm-lock.yaml"
-      - "justfile"
+  workflow_dispatch:
 
 concurrency:
   group: remote-sandbox-e2e-${{ github.ref }}

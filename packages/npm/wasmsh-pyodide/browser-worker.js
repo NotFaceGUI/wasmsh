@@ -16,6 +16,7 @@ let installHelpers = null;
 let runtimeBridge = null;
 let assetBaseUrl = null;
 let sessionAllowedHosts = [];
+let sessionNetworkPolicy = null;
 /** Map of package name -> wheel file from pyodide-lock.json. */
 let bundledPackageFiles = new Map();
 /** Cache of package name -> locally served status. */
@@ -123,25 +124,8 @@ function runtimeBridgeModule() {
  * Parameters are WASM pointers (C strings + byte buffer). Returns a pointer
  * to a JSON C string allocated with malloc. The Rust caller frees it.
  */
-// Default cap on response body size when no per-request cap is supplied.
-// Matches the Rust-side DECOMPRESS_OUTPUT_LIMIT so the worker never holds
-// more than ~64 MiB of fetch output regardless of caller config.
-const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
-const DEFAULT_FETCH_TIMEOUT_MS = 30000;
-
-function parseFetchOptions(module, optionsPtr) {
-  if (!optionsPtr) {
-    return {};
-  }
-  try {
-    const raw = module.UTF8ToString(optionsPtr);
-    if (!raw) return {};
-    const obj = JSON.parse(raw);
-    return obj && typeof obj === "object" ? obj : {};
-  } catch {
-    return {};
-  }
-}
+const BROWSER_XHR_REFUSAL =
+  "synchronous XHR is refused because this browser worker cannot guarantee per-hop redirect policy";
 
 function createNetworkStubs(module) {
   return {
@@ -154,67 +138,16 @@ function createNetworkStubs(module) {
       followRedirects,
       optionsPtr,
     ) {
-      const url = module.UTF8ToString(urlPtr);
-      const method = module.UTF8ToString(methodPtr);
-      const headersJson = module.UTF8ToString(headersJsonPtr);
-      const opts = parseFetchOptions(module, optionsPtr);
-      const timeoutMs =
-        typeof opts.timeout_ms === "number" && opts.timeout_ms > 0
-          ? opts.timeout_ms
-          : DEFAULT_FETCH_TIMEOUT_MS;
-      const maxResponseBytes =
-        typeof opts.max_response_bytes === "number" && opts.max_response_bytes > 0
-          ? opts.max_response_bytes
-          : DEFAULT_MAX_RESPONSE_BYTES;
-
-      let bodyBytes = null;
-      if (bodyPtr !== 0 && bodyLen > 0) {
-        bodyBytes = new Uint8Array(module.HEAPU8.buffer, bodyPtr, bodyLen).slice();
-      }
-
-      let result;
-      try {
-        const xhr = new XMLHttpRequest();
-        xhr.open(method, url, false); // synchronous — works in Web Workers
-        xhr.timeout = timeoutMs;
-        const headers = JSON.parse(headersJson || "[]");
-        for (const [key, value] of headers) {
-          xhr.setRequestHeader(key, value);
-        }
-        xhr.responseType = "arraybuffer";
-        xhr.send(bodyBytes);
-
-        const respHeaders = xhr
-          .getAllResponseHeaders()
-          .split("\r\n")
-          .filter((h) => h)
-          .map((h) => {
-            const idx = h.indexOf(": ");
-            return idx >= 0 ? [h.slice(0, idx), h.slice(idx + 2)] : [h, ""];
-          });
-
-        const respBytes = new Uint8Array(xhr.response || new ArrayBuffer(0));
-        if (respBytes.byteLength > maxResponseBytes) {
-          result = JSON.stringify({
-            status: 0,
-            headers: [],
-            body_base64: "",
-            error: `response exceeds max_response_bytes (${respBytes.byteLength} > ${maxResponseBytes})`,
-          });
-          return module.stringToNewUTF8(result);
-        }
-        const bodyBase64 = protocol().encodeBase64(respBytes);
-
-        result = JSON.stringify({
-          status: xhr.status,
-          headers: respHeaders,
-          body_base64: bodyBase64,
-        });
-      } catch (e) {
-        result = JSON.stringify({ status: 0, headers: [], body_base64: "", error: e.message });
-      }
-
-      return module.stringToNewUTF8(result);
+      // Browser XHR follows redirects internally. The response URL is only
+      // observable after the request, which is too late to prevent a denied
+      // target from receiving the request. A trusted redirect-aware broker
+      // must be supplied before this path can be enabled.
+      return module.stringToNewUTF8(JSON.stringify({
+        status: 0,
+        headers: [],
+        body_base64: "",
+        error: BROWSER_XHR_REFUSAL,
+      }));
     },
   };
 }
@@ -313,10 +246,19 @@ const methods = {
     assetBaseUrl: baseUrl,
     stepBudget = 0,
     initialFiles = [],
-    allowedHosts = [],
+    allowedHosts,
+    networkPolicy = undefined,
   }) {
     await ensureBooted(baseUrl);
-    sessionAllowedHosts = allowedHosts;
+    if (networkPolicy !== undefined && allowedHosts !== undefined) {
+      throw new Error("networkPolicy and allowedHosts cannot both be configured");
+    }
+    const effectiveAllowedHosts = allowedHosts ?? [];
+    const networkConfig = networkPolicy !== undefined
+      ? networkPolicy
+      : effectiveAllowedHosts;
+    sessionAllowedHosts = effectiveAllowedHosts;
+    sessionNetworkPolicy = networkPolicy ?? null;
     // Install the JS fetch membrane on this worker's `self` global BEFORE
     // any Init/Run reaches Pyodide. Pyodide's `js` proxy resolves
     // `js.fetch`, `pyodide.http.pyfetch`, and `micropip`'s HTTP through
@@ -324,11 +266,12 @@ const methods = {
     // curl. Audit F2: this browser path was previously protected only by
     // the (Python-globals-exposed, hence bypassable) Python preamble.
     if (fetchMembraneHelpers) {
-      fetchMembraneHelpers.installFetchMembrane(self, allowedHosts);
+      fetchMembraneHelpers.installFetchMembrane(self, networkConfig);
     }
-    const events = sendHostCommand({
-      Init: { step_budget: stepBudget, allowed_hosts: allowedHosts },
-    });
+    const init = networkPolicy === undefined
+      ? { step_budget: stepBudget, allowed_hosts: effectiveAllowedHosts }
+      : { step_budget: stepBudget, network_policy: networkPolicy };
+    const events = sendHostCommand({ Init: init });
     for (const file of initialFiles) {
       sendHostCommand({
         WriteFile: {
@@ -391,6 +334,7 @@ const methods = {
     return installHelpers.installPackages(reqs, pyodideRef, {
       isBundled: isBundledPackage,
       allowedHosts: sessionAllowedHosts,
+      networkPolicy: sessionNetworkPolicy,
       deps: options.deps,
     });
   },

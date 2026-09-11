@@ -74,6 +74,9 @@ e2e/*/node_modules/
 # None of these should ever be committed; they are either cargo `target`
 # dirs, downloaded SDK trees, or snapshot artifacts rebuilt per run.
 /artifacts/
+/dist/standalone/
+/dist/standalone-extracted/
+/dist/standalone-pkg/
 /dist/pyodide-snapshot/
 /dist/pyodide-wasi/
 /e2e/pyodide-node/tmp/

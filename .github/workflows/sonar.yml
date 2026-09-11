@@ -1,10 +1,6 @@
 name: SonarQube
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -23,9 +19,7 @@ jobs:
     # failed / cancelled CI run never uploads the coverage artifact, so
     # letting this job fire for it just produces noisy "artifact not
     # found" errors in the Checks UI.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch'
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       SONAR_TOKEN_SET: ${{ secrets.SONAR_TOKEN != '' }}

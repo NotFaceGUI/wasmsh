@@ -1,23 +1,7 @@
 name: Runner Dispatcher
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/runner-dispatcher.yml"
-      - "crates/wasmsh-dispatcher/**"
-      - "tools/runner-node/**"
-      - "e2e/runner-node/**"
-      - "e2e/build-contract/**"
-      - "justfile"
-  pull_request:
-    paths:
-      - ".github/workflows/runner-dispatcher.yml"
-      - "crates/wasmsh-dispatcher/**"
-      - "tools/runner-node/**"
-      - "e2e/runner-node/**"
-      - "e2e/build-contract/**"
-      - "justfile"
+  workflow_dispatch:
 
 jobs:
   runner-dispatcher:

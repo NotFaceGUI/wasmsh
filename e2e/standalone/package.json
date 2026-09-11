@@ -3,11 +3,12 @@
   "private": true,
   "scripts": {
     "build:wasm": "./build.sh",
-    "test": "npx playwright test",
-    "test:headed": "npx playwright test --headed"
+    "test": "playwright test",
+    "test:headed": "playwright test --headed"
   },
   "devDependencies": {
-    "@playwright/test": "^1.52.0",
-    "serve": "^14.2.6"
+    "@playwright/test": "1.58.2",
+    "esbuild": "0.28.2",
+    "serve": "14.2.6"
   }
 }

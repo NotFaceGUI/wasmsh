@@ -2,6 +2,7 @@ import { createRuntimeBridge } from "../runtime-bridge.mjs";
 import { createRestoredModuleFromSnapshot } from "../node-module.mjs";
 import { buildRunResult, encodeBase64, extractStream } from "../protocol.mjs";
 import { handlePipCommand, installPackages } from "../install.mjs";
+import { installFetchMembrane } from "../fetch-membrane.mjs";
 
 function loadBundledPackageNames(assetDir, moduleRef) {
   const raw = moduleRef.FS.readFile(`${assetDir}/pyodide-lock.json`, { encoding: "utf8" });
@@ -16,22 +17,32 @@ function loadBundledPackageNames(assetDir, moduleRef) {
 export async function restoreFromSnapshot({
   assetDir,
   snapshotBytes,
-  allowedHosts = [],
+  allowedHosts,
+  networkPolicy = undefined,
   stepBudget = 0,
   initialFiles = [],
   fetchHandlerSync,
   compiledWasmModule = null,
   wasmBytes = null,
 }) {
+  if (networkPolicy !== undefined && allowedHosts !== undefined) {
+    throw new Error("networkPolicy and allowedHosts cannot both be configured");
+  }
+  const effectiveAllowedHosts = allowedHosts ?? [];
+  const networkConfig = networkPolicy !== undefined
+    ? networkPolicy
+    : effectiveAllowedHosts;
+  installFetchMembrane(globalThis, networkConfig);
   let module = await createRestoredModuleFromSnapshot(assetDir, snapshotBytes, {
     fetchHandlerSync,
     compiledWasmModule,
     wasmBytes,
   });
   let runtimeBridge = createRuntimeBridge(module);
-  runtimeBridge.sendHostCommand({
-    Init: { step_budget: stepBudget, allowed_hosts: allowedHosts },
-  });
+  const init = networkPolicy === undefined
+    ? { step_budget: stepBudget, allowed_hosts: effectiveAllowedHosts }
+    : { step_budget: stepBudget, network_policy: networkPolicy };
+  runtimeBridge.sendHostCommand({ Init: init });
 
   for (const file of initialFiles) {
     runtimeBridge.sendHostCommand({
@@ -107,7 +118,8 @@ export async function restoreFromSnapshot({
       const reqs = typeof requirements === "string" ? [requirements] : requirements;
       return installPackages(reqs, activePyodide, {
         isBundled: (name) => bundled.has(name),
-        allowedHosts,
+        allowedHosts: effectiveAllowedHosts,
+        networkPolicy,
         deps: options.deps,
       });
     },

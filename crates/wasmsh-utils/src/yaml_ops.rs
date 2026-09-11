@@ -434,6 +434,7 @@ mod tests {
                 stdin: stdin.map(crate::UtilStdin::from_bytes),
                 state: None,
                 network: None,
+                clock: None,
             };
             util_yq(&mut ctx, argv)
         };

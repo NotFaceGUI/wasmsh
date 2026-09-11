@@ -10,9 +10,15 @@ use indexmap::IndexMap;
 use wasmsh_fs::BackendFs;
 use wasmsh_state::ShellState;
 
+pub mod clock;
+#[cfg(not(target_arch = "wasm32"))]
+pub use clock::SystemClock;
+pub use clock::{ClockError, ClockProvider, FixedClock, UnavailableClock, UtcDateTime};
+
 mod net_multipart;
 mod net_ops;
 pub mod net_types;
+pub use net_types::{DefaultAction, NetworkPolicy, NetworkPolicyConfig, NetworkPolicyError};
 
 mod archive_ops;
 mod awk_ops;
@@ -113,6 +119,8 @@ pub struct UtilContext<'a> {
     pub state: Option<&'a ShellState>,
     /// Optional network backend for curl/wget (None = no network access).
     pub network: Option<&'a dyn net_types::NetworkBackend>,
+    /// Shared wall-clock and monotonic-clock capability.
+    pub clock: Option<&'a dyn ClockProvider>,
 }
 
 impl std::fmt::Debug for UtilContext<'_> {
@@ -318,6 +326,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             util(&mut ctx, argv)
         };

@@ -102,11 +102,16 @@ await session.installPythonPackages([
 ]);
 ```
 
-Install from HTTP URLs or by package name (requires `allowedHosts`):
+Install from HTTP URLs or by package name with a network policy:
 
 ```js
 const session = await createNodeSession({
-  allowedHosts: ["pypi.org", "files.pythonhosted.org"],
+  networkPolicy: {
+    enabled: true,
+    default_action: "deny",
+    allow: ["pypi.org", "files.pythonhosted.org"],
+    deny: [],
+  },
 });
 
 // Install by package name (resolved from PyPI)
@@ -120,8 +125,9 @@ await session.installPythonPackages(
 
 **Security**: Installs are session-local and do not persist between sessions.
 `file:` URIs are rejected to prevent host filesystem access. Network-based
-installs (HTTP URLs, package names) require `allowedHosts` to be configured
-when creating the session.
+installs (HTTP URLs, package names) require the session `NetworkPolicy` to
+allow the target. The legacy `allowedHosts` option remains supported but cannot
+be combined with `networkPolicy`.
 
 Both Node.js and browser modes use Pyodide's micropip under the hood. Supports
 pure-Python wheels and Pyodide pre-compiled packages from the CDN
@@ -187,6 +193,7 @@ Create a session backed by a Node.js child process running the wasmsh host.
 | `stepBudget` | `number` | `0` (unlimited) | VM step budget per command |
 | `initialFiles` | `Array<{path, content}>` | `[]` | Files to seed before init |
 | `allowedHosts` | `string[]` | `[]` | Hostnames allowed for network access |
+| `networkPolicy` | `NetworkPolicy` | disabled | Structured deny/allow policy; deny always wins |
 
 ### `createBrowserWorkerSession(options): Promise<WasmshSession>`
 
@@ -201,6 +208,7 @@ Create a session backed by a browser Web Worker.
 | `stepBudget` | `number` | `0` (unlimited) | VM step budget per command |
 | `initialFiles` | `Array<{path, content}>` | `[]` | Files to seed before init |
 | `allowedHosts` | `string[]` | `[]` | Hostnames allowed for network access |
+| `networkPolicy` | `NetworkPolicy` | disabled | Structured deny/allow policy; deny always wins |
 
 ### `WasmshSession`
 

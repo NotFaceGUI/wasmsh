@@ -1565,6 +1565,7 @@ mod tests {
                 stdin: stdin.map(UtilStdin::from_bytes),
                 state: None,
                 network: None,
+                clock: None,
             };
             util_cat(&mut ctx, argv)
         };

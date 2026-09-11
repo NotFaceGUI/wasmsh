@@ -8,16 +8,23 @@
 mod common;
 
 use common::{get_exit, get_stderr, get_stdout};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
 use wasmsh_ast::WordPart;
 use wasmsh_hir::HirCommand;
 use wasmsh_protocol::{DiagnosticLevel, HostCommand, WorkerEvent, PROTOCOL_VERSION};
-use wasmsh_runtime::{ExecutionPoll, ExternalCommandResult, WorkerRuntime};
+use wasmsh_runtime::{
+    ExecutionPoll, ExternalCommandOptions, ExternalCommandResult, ExternalPathMapping,
+    ExternalProcess, ExternalProcessPoll, ExternalProcessWrite, WorkerRuntime,
+};
 
 fn new_runtime(step_budget: u32) -> WorkerRuntime {
     let mut rt = WorkerRuntime::new();
     rt.handle_command(HostCommand::Init {
         step_budget: step_budget.into(),
         allowed_hosts: vec![],
+        network_policy: None,
     });
     rt
 }
@@ -33,6 +40,270 @@ fn install_hosterr(rt: &mut WorkerRuntime) {
             status: 0,
         })
     }));
+}
+
+fn read_external_stdin(mut stdin: Option<wasmsh_runtime::ExternalCommandStdin<'_>>) -> Vec<u8> {
+    let Some(mut stdin) = stdin.take() else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match std::io::Read::read(&mut stdin, &mut buffer) {
+            Ok(0) | Err(_) => return output,
+            Ok(read) => output.extend_from_slice(&buffer[..read]),
+        }
+    }
+}
+
+#[derive(Default)]
+struct FakeStreamState {
+    polls: usize,
+    cancelled: bool,
+}
+
+struct FakeStreamProcess {
+    state: Rc<RefCell<FakeStreamState>>,
+    emitted: bool,
+    delay_once: bool,
+}
+
+impl ExternalProcess for FakeStreamProcess {
+    fn write_stdin(&mut self, data: &[u8]) -> ExternalProcessWrite {
+        ExternalProcessWrite {
+            accepted: data.len(),
+            would_block: false,
+            closed: false,
+        }
+    }
+
+    fn close_stdin(&mut self) {}
+
+    fn poll(&mut self) -> ExternalProcessPoll {
+        let mut state = self.state.borrow_mut();
+        state.polls += 1;
+        if self.delay_once && state.polls == 1 {
+            return ExternalProcessPoll {
+                stdin_writable: true,
+                ..ExternalProcessPoll::default()
+            };
+        }
+        if self.emitted {
+            return ExternalProcessPoll {
+                stdout_eof: true,
+                stderr_eof: true,
+                status: Some(0),
+                stdin_writable: true,
+                ..ExternalProcessPoll::default()
+            };
+        }
+        self.emitted = true;
+        ExternalProcessPoll {
+            stdout: b"streamed\n".to_vec(),
+            stderr: b"diagnostic\n".to_vec(),
+            stdout_eof: true,
+            stderr_eof: true,
+            status: Some(0),
+            stdin_writable: true,
+            ..ExternalProcessPoll::default()
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.state.borrow_mut().cancelled = true;
+    }
+}
+
+/// A process that never reaches EOF, to exercise the runtime deadline.
+struct StallingStreamProcess {
+    cancelled: Rc<RefCell<bool>>,
+}
+
+impl ExternalProcess for StallingStreamProcess {
+    fn write_stdin(&mut self, data: &[u8]) -> ExternalProcessWrite {
+        ExternalProcessWrite {
+            accepted: data.len(),
+            would_block: false,
+            closed: false,
+        }
+    }
+
+    fn close_stdin(&mut self) {}
+
+    fn poll(&mut self) -> ExternalProcessPoll {
+        // Force monotonic time to advance so the deadline is observable.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ExternalProcessPoll {
+            stdin_writable: true,
+            ..ExternalProcessPoll::default()
+        }
+    }
+
+    fn cancel(&mut self) {
+        *self.cancelled.borrow_mut() = true;
+    }
+}
+
+#[test]
+fn streaming_pipeline_deadline_stops_stalled_external_process() {
+    let cancelled = Rc::new(RefCell::new(false));
+    let handler_state = cancelled.clone();
+    let mut rt = new_runtime(0);
+    rt.register_external(
+        "hoststall",
+        "/trusted/hoststall",
+        ExternalCommandOptions {
+            timeout_ms: 1,
+            ..ExternalCommandOptions::default()
+        },
+    )
+    .unwrap();
+    rt.set_external_stream_handler(Box::new(move |_spec, _argv| {
+        Ok(Box::new(StallingStreamProcess {
+            cancelled: handler_state.clone(),
+        }))
+    }));
+
+    assert_eq!(
+        rt.handle_command(HostCommand::StartRun {
+            input: "hoststall".into(),
+        }),
+        vec![WorkerEvent::Yielded]
+    );
+    let events = collect_progressive_events(&mut rt, 50);
+    assert_eq!(get_exit(&events), 124);
+    assert!(get_stderr(&events).contains("timed out"));
+    assert!(*cancelled.borrow());
+}
+
+fn collect_progressive_events(rt: &mut WorkerRuntime, max_polls: usize) -> Vec<WorkerEvent> {
+    let mut events = Vec::new();
+    for _ in 0..max_polls {
+        let batch = rt.handle_command(HostCommand::PollRun);
+        let done = batch
+            .iter()
+            .any(|event| matches!(event, WorkerEvent::Exit(_)));
+        events.extend(
+            batch
+                .into_iter()
+                .filter(|event| !matches!(event, WorkerEvent::Yielded)),
+        );
+        if done {
+            return events;
+        }
+    }
+    panic!("progressive execution did not finish in {max_polls} polls");
+}
+
+#[test]
+fn progressive_external_stream_preserves_pending_output_and_cancels_on_head_close() {
+    let state = Rc::new(RefCell::new(FakeStreamState::default()));
+    let handler_state = state.clone();
+    let mut rt = new_runtime(0);
+    rt.register_external(
+        "fakeproducer",
+        "/trusted/fakeproducer",
+        ExternalCommandOptions::default(),
+    )
+    .unwrap();
+    rt.set_external_stream_handler(Box::new(move |_spec, _argv| {
+        Ok(Box::new(FakeStreamProcess {
+            state: handler_state.clone(),
+            emitted: false,
+            delay_once: true,
+        }))
+    }));
+
+    assert_eq!(
+        rt.handle_command(HostCommand::StartRun {
+            input: "fakeproducer | head -c 1".into(),
+        }),
+        vec![WorkerEvent::Yielded]
+    );
+    let first_poll = rt.handle_command(HostCommand::PollRun);
+    assert!(!first_poll
+        .iter()
+        .any(|event| matches!(event, WorkerEvent::Exit(_))));
+    assert!(first_poll
+        .iter()
+        .any(|event| matches!(event, WorkerEvent::Yielded)));
+    let events = collect_progressive_events(&mut rt, 20);
+    assert_eq!(get_stdout(&events), "s");
+    assert_eq!(get_exit(&events), 0);
+    assert!(state.borrow().cancelled);
+    assert!(state.borrow().polls >= 1);
+}
+
+#[test]
+fn registered_external_specs_are_queryable_and_unregistered_is_127() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen_handler = seen.clone();
+    let mut rt = new_runtime(0);
+    rt.register_external(
+        "hostspec",
+        "/trusted/bin/hostspec",
+        ExternalCommandOptions {
+            cwd: Some("/trusted/work".into()),
+            env: BTreeMap::from([("ONLY".into(), "yes".into())]),
+            vfs_path_mappings: vec![ExternalPathMapping {
+                vfs_prefix: "/workspace".into(),
+                host_prefix: "/trusted/workspace".into(),
+            }],
+            argv_prefix: vec!["fixed".into()],
+            ..ExternalCommandOptions::default()
+        },
+    )
+    .unwrap();
+    rt.set_external_spec_handler(Box::new(move |spec, argv, stdin| {
+        seen_handler
+            .borrow_mut()
+            .push((spec.clone(), argv.to_vec(), read_external_stdin(stdin)));
+        Some(ExternalCommandResult {
+            stdout: b"handled\n".to_vec(),
+            stderr: Vec::new(),
+            status: 0,
+        })
+    }));
+
+    assert_eq!(rt.external_command_names(), vec!["hostspec"]);
+    let events = rt.handle_command(HostCommand::Run {
+        input: "printf input | hostspec 'arg with spaces'".into(),
+    });
+    assert_eq!(get_stdout(&events), "handled\n");
+    assert_eq!(get_exit(&events), 0);
+    let (spec, argv, stdin) = &seen.borrow()[0];
+    assert_eq!(spec.executable, "/trusted/bin/hostspec");
+    assert_eq!(spec.options.cwd.as_deref(), Some("/trusted/work"));
+    assert_eq!(argv, &["hostspec", "arg with spaces"]);
+    assert_eq!(stdin, b"input");
+
+    let lookup = rt.handle_command(HostCommand::Run {
+        input: "command -v hostspec".into(),
+    });
+    assert_eq!(get_stdout(&lookup), "hostspec -> /trusted/bin/hostspec\n");
+
+    assert!(rt.unregister_external("hostspec"));
+    let missing = rt.handle_command(HostCommand::Run {
+        input: "hostspec".into(),
+    });
+    assert_eq!(get_exit(&missing), 127);
+    assert!(get_stderr(&missing).contains("command not found"));
+}
+
+#[test]
+fn registered_external_without_host_executor_is_126() {
+    let mut rt = new_runtime(0);
+    rt.register_external(
+        "native_only",
+        "/trusted/native_only",
+        ExternalCommandOptions::default(),
+    )
+    .unwrap();
+    let events = rt.handle_command(HostCommand::Run {
+        input: "native_only".into(),
+    });
+    assert_eq!(get_exit(&events), 126);
+    assert!(get_stderr(&events).contains("not supported by this host"));
 }
 
 fn collect_execution_events(rt: &mut WorkerRuntime) -> Vec<WorkerEvent> {
@@ -111,6 +382,7 @@ fn init_returns_protocol_version() {
     let events = rt.handle_command(HostCommand::Init {
         step_budget: 0,
         allowed_hosts: vec![],
+        network_policy: None,
     });
     assert_eq!(events.len(), 1);
     assert_eq!(
@@ -125,6 +397,7 @@ fn run_echo_hello() {
     rt.handle_command(HostCommand::Init {
         step_budget: 0,
         allowed_hosts: vec![],
+        network_policy: None,
     });
     let events = rt.handle_command(HostCommand::Run {
         input: "echo hello".into(),
@@ -139,6 +412,7 @@ fn simple_command_runs_with_single_step_budget() {
     rt.handle_command(HostCommand::Init {
         step_budget: 1,
         allowed_hosts: vec![],
+        network_policy: None,
     });
     let events = rt.handle_command(HostCommand::Run {
         input: "echo hello".into(),
@@ -230,6 +504,7 @@ fn write_file_then_read_file() {
     rt.handle_command(HostCommand::Init {
         step_budget: 0,
         allowed_hosts: vec![],
+        network_policy: None,
     });
 
     let write_events = rt.handle_command(HostCommand::WriteFile {
@@ -252,6 +527,7 @@ fn list_dir_shows_written_files() {
     rt.handle_command(HostCommand::Init {
         step_budget: 0,
         allowed_hosts: vec![],
+        network_policy: None,
     });
 
     rt.handle_command(HostCommand::WriteFile {
@@ -779,6 +1055,7 @@ fn single_quoted_glob_not_expanded() {
     rt.handle_command(HostCommand::Init {
         step_budget: 0,
         allowed_hosts: vec![],
+        network_policy: None,
     });
     // Create a file whose name matches [a-z]*
     rt.handle_command(HostCommand::WriteFile {
@@ -823,6 +1100,7 @@ fn external_handler_receives_pipeline_stdin() {
     rt.handle_command(HostCommand::Init {
         step_budget: 0,
         allowed_hosts: vec![],
+        network_policy: None,
     });
 
     let events = rt.handle_command(HostCommand::Run {
@@ -839,6 +1117,7 @@ fn external_handler_2dup1_then_stdout_redirect_keeps_stderr_visible() {
     rt.handle_command(HostCommand::Init {
         step_budget: 0,
         allowed_hosts: vec![],
+        network_policy: None,
     });
 
     let events = rt.handle_command(HostCommand::Run {
@@ -861,6 +1140,7 @@ fn external_handler_stdout_redirect_then_2dup1_captures_stderr_in_file() {
     rt.handle_command(HostCommand::Init {
         step_budget: 0,
         allowed_hosts: vec![],
+        network_policy: None,
     });
 
     let events = rt.handle_command(HostCommand::Run {
@@ -883,6 +1163,7 @@ fn external_handler_2dup1_into_pipeline_sends_stderr_to_stdout_pipe() {
     rt.handle_command(HostCommand::Init {
         step_budget: 0,
         allowed_hosts: vec![],
+        network_policy: None,
     });
 
     let events = rt.handle_command(HostCommand::Run {

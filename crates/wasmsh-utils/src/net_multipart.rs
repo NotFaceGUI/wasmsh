@@ -235,6 +235,7 @@ mod tests {
             stdin: None,
             state: None,
             network: None,
+            clock: None,
         }
     }
 
@@ -283,6 +284,7 @@ mod tests {
             stdin: None,
             state: None,
             network: None,
+            clock: None,
         };
         let parts = vec![
             parse_form_arg("a=1", false).unwrap(),
@@ -334,6 +336,7 @@ mod tests {
             stdin: None,
             state: None,
             network: None,
+            clock: None,
         };
         let parts = vec![parse_form_arg("x=anything", false).unwrap()];
         let (body, ct) = encode_multipart(&mut ctx, &parts).unwrap();

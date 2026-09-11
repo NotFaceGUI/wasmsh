@@ -27,11 +27,12 @@ use streaming_tr::{streaming_tr_expand_set, StreamingTrStage, TrStreamReader};
 use streaming_uniq::{StreamingUniqFlags, UniqStreamReader};
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Cursor, ErrorKind, Read};
 use std::rc::Rc;
 
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 
 use crate::dbl_bracket::dbl_bracket_eval_or;
 use crate::fd_table::{ExecIo, InputTarget, OutputTarget};
@@ -46,9 +47,17 @@ use wasmsh_hir::{
     HirAndOr, HirAndOrOp, HirCommand, HirCompleteCommand, HirPipeline, HirProgram, HirRedirection,
 };
 use wasmsh_ir::{lower_supported_and_or, IrProgram, IrRedirection, LoweringError};
-use wasmsh_protocol::{DiagnosticLevel, HostCommand, WorkerEvent, PROTOCOL_VERSION};
+use wasmsh_protocol::{
+    DiagnosticLevel, HostCommand, NetworkPolicyConfig as ProtocolNetworkPolicyConfig, WorkerEvent,
+    PROTOCOL_VERSION,
+};
 use wasmsh_state::ShellState;
-use wasmsh_utils::{UtilContext, UtilRegistry};
+use wasmsh_utils::net_types::{NetworkBackend, NetworkError, NetworkPolicy};
+#[cfg(not(target_arch = "wasm32"))]
+use wasmsh_utils::SystemClock;
+#[cfg(target_arch = "wasm32")]
+use wasmsh_utils::UnavailableClock;
+use wasmsh_utils::{ClockProvider, UtilContext, UtilRegistry};
 use wasmsh_vm::pipe::{PipeBuffer, ReadResult, WriteResult};
 use wasmsh_vm::{BudgetCategory, ExecutionLimits, ExhaustionReason, StopReason, Vm, VmExecutor};
 
@@ -92,6 +101,10 @@ pub struct BrowserConfig {
     pub allowed_hosts: Vec<String>,
     pub output_byte_limit: u64,
     pub pipe_byte_limit: u64,
+    /// Maximum bytes an external command may receive through stdin.
+    pub external_input_byte_limit: u64,
+    /// Maximum combined stdout/stderr bytes retained from one external command.
+    pub external_output_byte_limit: u64,
     pub recursion_limit: u32,
     pub vm_subset_enabled: bool,
 }
@@ -108,6 +121,8 @@ impl Default for BrowserConfig {
             // when callers opt in explicitly via set_output_byte_limit(0).
             output_byte_limit: 64 * 1024 * 1024,
             pipe_byte_limit: 64 * 1024 * 1024,
+            external_input_byte_limit: DEFAULT_EXTERNAL_INPUT_BYTES,
+            external_output_byte_limit: DEFAULT_EXTERNAL_OUTPUT_BYTES,
             recursion_limit: MAX_RECURSION_DEPTH,
             vm_subset_enabled: true,
         }
@@ -174,6 +189,8 @@ impl ExecState {
 
 const STREAMING_YES_MAX_LINES: usize = 65_536;
 const PIPEBUFFER_STREAMING_CAPACITY: usize = 1;
+/// Bounded queue capacity used by progressive external pipelines.
+const EXTERNAL_STREAM_PIPE_CAPACITY: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Default)]
 struct OutputCapture {
@@ -826,6 +843,7 @@ enum StreamingPipeProcess<'a> {
     Read(PipeReadProcess<'a>),
     Head(HeadPipeProcess),
     Tee(TeePipeProcess<'a>),
+    External(ExternalPipeProcess),
     Buffered(BufferedPipeProcess),
 }
 
@@ -835,6 +853,7 @@ impl StreamingPipeProcess<'_> {
             Self::Read(process) => process.poll(),
             Self::Head(process) => process.poll(),
             Self::Tee(process) => process.poll(),
+            Self::External(process) => process.poll(),
             Self::Buffered(process) => process.poll(runtime),
         }
     }
@@ -842,6 +861,7 @@ impl StreamingPipeProcess<'_> {
     fn close(&mut self, runtime: &mut WorkerRuntime) {
         match self {
             Self::Tee(process) => process.close(),
+            Self::External(process) => process.close(),
             Self::Buffered(process) => process.close(runtime),
             Self::Read(_) | Self::Head(_) => {}
         }
@@ -852,6 +872,7 @@ impl StreamingPipeProcess<'_> {
             Self::Read(process) => process.poll(),
             Self::Head(process) => process.poll(),
             Self::Tee(process) => process.poll(),
+            Self::External(_) => unreachable!("streaming external process requires runtime access"),
             Self::Buffered(_) => {
                 unreachable!("buffered pipeline stage requires runtime access")
             }
@@ -861,12 +882,459 @@ impl StreamingPipeProcess<'_> {
     fn close_without_runtime(&mut self) {
         match self {
             Self::Tee(process) => process.close(),
+            Self::External(_) => unreachable!("streaming external process requires runtime access"),
             Self::Read(_) | Self::Head(_) => {}
             Self::Buffered(_) => {
                 unreachable!("buffered pipeline stage requires runtime access")
             }
         }
     }
+}
+
+/// A non-blocking external process connected to the runtime pipe graph.
+#[allow(clippy::struct_excessive_bools)]
+struct ExternalPipeProcess {
+    input: Option<Rc<RefCell<PipeBuffer>>>,
+    output: Rc<RefCell<PipeBuffer>>,
+    argv: Vec<String>,
+    spec: ExternalCommandSpec,
+    pipe_stderr: bool,
+    process: Option<Box<dyn ExternalProcess>>,
+    pending_stdin: Vec<u8>,
+    stdin_offset: usize,
+    stdin_closed: bool,
+    stdin_writable: bool,
+    stdin_bytes: u64,
+    pending_stdout: Vec<u8>,
+    stdout_offset: usize,
+    pending_stderr: Vec<u8>,
+    stderr_offset: usize,
+    stdout_eof: bool,
+    stderr_eof: bool,
+    status: Option<i32>,
+    output_bytes: u64,
+    finished: bool,
+    stage_stderr: Rc<RefCell<Vec<u8>>>,
+    stage_status: Rc<RefCell<i32>>,
+}
+
+impl ExternalPipeProcess {
+    fn start(
+        runtime: &mut WorkerRuntime,
+        input: Option<Rc<RefCell<PipeBuffer>>>,
+        output: Rc<RefCell<PipeBuffer>>,
+        argv: Vec<String>,
+        spec: ExternalCommandSpec,
+        pipe_stderr: bool,
+        stage_stderr: Rc<RefCell<Vec<u8>>>,
+        stage_status: Rc<RefCell<i32>>,
+    ) -> Self {
+        let process = runtime
+            .external_stream_handler
+            .as_mut()
+            .ok_or_else(|| "streaming external executor is unavailable".to_string())
+            .and_then(|handler| handler(&spec, &argv));
+        match process {
+            Ok(process) => Self {
+                input,
+                output,
+                argv,
+                spec,
+                pipe_stderr,
+                process: Some(process),
+                pending_stdin: Vec::new(),
+                stdin_offset: 0,
+                stdin_closed: false,
+                stdin_writable: true,
+                stdin_bytes: 0,
+                pending_stdout: Vec::new(),
+                stdout_offset: 0,
+                pending_stderr: Vec::new(),
+                stderr_offset: 0,
+                stdout_eof: false,
+                stderr_eof: false,
+                status: None,
+                output_bytes: 0,
+                finished: false,
+                stage_stderr,
+                stage_status,
+            },
+            Err(error) => Self::failed(
+                input,
+                output,
+                argv,
+                spec,
+                pipe_stderr,
+                stage_stderr,
+                stage_status,
+                126,
+                &format!("external process start failed: {error}"),
+            ),
+        }
+    }
+
+    fn failed(
+        input: Option<Rc<RefCell<PipeBuffer>>>,
+        output: Rc<RefCell<PipeBuffer>>,
+        argv: Vec<String>,
+        spec: ExternalCommandSpec,
+        pipe_stderr: bool,
+        stage_stderr: Rc<RefCell<Vec<u8>>>,
+        stage_status: Rc<RefCell<i32>>,
+        status: i32,
+        message: &str,
+    ) -> Self {
+        let mut process = Self {
+            input,
+            output,
+            argv,
+            spec,
+            pipe_stderr,
+            process: None,
+            pending_stdin: Vec::new(),
+            stdin_offset: 0,
+            stdin_closed: true,
+            stdin_writable: false,
+            stdin_bytes: 0,
+            pending_stdout: Vec::new(),
+            stdout_offset: 0,
+            pending_stderr: Vec::new(),
+            stderr_offset: 0,
+            stdout_eof: true,
+            stderr_eof: true,
+            status: Some(status),
+            output_bytes: 0,
+            finished: false,
+            stage_stderr,
+            stage_status,
+        };
+        let diagnostic = format!("wasmsh: {}: {message}\n", process.argv[0]);
+        if process.pipe_stderr {
+            process.pending_stderr = diagnostic.into_bytes();
+        } else {
+            process
+                .stage_stderr
+                .borrow_mut()
+                .extend_from_slice(diagnostic.as_bytes());
+        }
+        *process.stage_status.borrow_mut() = status;
+        process
+    }
+
+    fn command_name(&self) -> &str {
+        self.argv.first().map_or("external", String::as_str)
+    }
+
+    fn close_input(&mut self) {
+        if let Some(input) = &self.input {
+            input.borrow_mut().close_read();
+        }
+    }
+
+    fn cancel_process(&mut self, status: i32) {
+        if let Some(process) = self.process.as_mut() {
+            process.cancel();
+        }
+        self.close_input();
+        self.pending_stdin.clear();
+        self.stdin_offset = 0;
+        self.stdin_closed = true;
+        self.status.get_or_insert(status);
+        *self.stage_status.borrow_mut() = self.status.unwrap_or(status);
+        self.output.borrow_mut().close_write();
+        self.process = None;
+        self.finished = true;
+    }
+
+    fn fail(&mut self, status: i32, message: &str) -> PipeProcessPoll {
+        if let Some(process) = self.process.as_mut() {
+            process.cancel();
+        }
+        self.close_input();
+        self.pending_stdin.clear();
+        self.stdin_offset = 0;
+        self.stdin_closed = true;
+        self.status = Some(status);
+        self.stdout_eof = true;
+        self.stderr_eof = true;
+        self.process = None;
+        *self.stage_status.borrow_mut() = status;
+        let diagnostic = format!("wasmsh: {}: {message}\n", self.command_name());
+        if self.pipe_stderr {
+            self.pending_stderr.extend_from_slice(diagnostic.as_bytes());
+        } else {
+            self.stage_stderr
+                .borrow_mut()
+                .extend_from_slice(diagnostic.as_bytes());
+        }
+        if self.flush_pending_output().is_some() {
+            PipeProcessPoll::PendingWrite
+        } else {
+            self.output.borrow_mut().close_write();
+            self.finished = true;
+            PipeProcessPoll::Exited
+        }
+    }
+
+    fn flush_pending_output(&mut self) -> Option<PipeProcessPoll> {
+        if self.stdout_offset < self.pending_stdout.len() {
+            let result = {
+                let mut output = self.output.borrow_mut();
+                output.write(&self.pending_stdout[self.stdout_offset..])
+            };
+            match result {
+                WriteResult::Written(written) | WriteResult::WouldBlock(written) if written > 0 => {
+                    self.stdout_offset += written;
+                    if self.stdout_offset == self.pending_stdout.len() {
+                        self.pending_stdout.clear();
+                        self.stdout_offset = 0;
+                    }
+                    if self.stdout_offset < self.pending_stdout.len() {
+                        return Some(PipeProcessPoll::PendingWrite);
+                    }
+                }
+                WriteResult::Written(_) => {}
+                WriteResult::WouldBlock(_) => return Some(PipeProcessPoll::PendingWrite),
+                WriteResult::BrokenPipe => {
+                    self.cancel_process(141);
+                    return Some(PipeProcessPoll::Exited);
+                }
+            }
+        }
+        if self.stderr_offset < self.pending_stderr.len() {
+            let result = {
+                let mut output = self.output.borrow_mut();
+                output.write(&self.pending_stderr[self.stderr_offset..])
+            };
+            match result {
+                WriteResult::Written(written) | WriteResult::WouldBlock(written) if written > 0 => {
+                    self.stderr_offset += written;
+                    if self.stderr_offset == self.pending_stderr.len() {
+                        self.pending_stderr.clear();
+                        self.stderr_offset = 0;
+                    }
+                    if self.stderr_offset < self.pending_stderr.len() {
+                        return Some(PipeProcessPoll::PendingWrite);
+                    }
+                }
+                WriteResult::Written(_) => {}
+                WriteResult::WouldBlock(_) => return Some(PipeProcessPoll::PendingWrite),
+                WriteResult::BrokenPipe => {
+                    self.cancel_process(141);
+                    return Some(PipeProcessPoll::Exited);
+                }
+            }
+        }
+        None
+    }
+
+    fn fill_stdin(&mut self) -> PipeProcessPoll {
+        if self.stdin_closed || !self.stdin_writable || !self.pending_stdin.is_empty() {
+            return PipeProcessPoll::Ready;
+        }
+        let Some(input) = &self.input else {
+            self.stdin_closed = true;
+            if let Some(process) = self.process.as_mut() {
+                process.close_stdin();
+            }
+            return PipeProcessPoll::Ready;
+        };
+        let mut buffer = vec![0u8; self.spec.options.stream_chunk_bytes as usize];
+        let read_result = {
+            let mut input = input.borrow_mut();
+            input.read(&mut buffer)
+        };
+        match read_result {
+            ReadResult::Read(read) => {
+                buffer.truncate(read);
+                self.pending_stdin = buffer;
+                self.stdin_offset = 0;
+                PipeProcessPoll::Ready
+            }
+            ReadResult::WouldBlock => PipeProcessPoll::PendingRead,
+            ReadResult::Eof => {
+                input.borrow_mut().close_read();
+                self.stdin_closed = true;
+                if let Some(process) = self.process.as_mut() {
+                    process.close_stdin();
+                }
+                PipeProcessPoll::Ready
+            }
+        }
+    }
+
+    fn write_stdin_chunk(&mut self) -> PipeProcessPoll {
+        if self.stdin_closed || self.pending_stdin.is_empty() || !self.stdin_writable {
+            return PipeProcessPoll::Ready;
+        }
+        let Some(process) = self.process.as_mut() else {
+            return PipeProcessPoll::Exited;
+        };
+        let result = process.write_stdin(&self.pending_stdin[self.stdin_offset..]);
+        if result.accepted > self.pending_stdin.len().saturating_sub(self.stdin_offset) {
+            return self.fail(126, "external host accepted more stdin than supplied");
+        }
+        self.stdin_offset += result.accepted;
+        if self.stdin_offset == self.pending_stdin.len() {
+            self.pending_stdin.clear();
+            self.stdin_offset = 0;
+        }
+        if result.closed {
+            return self.fail(141, "external stdin closed before all input was written");
+        }
+        self.stdin_bytes = self.stdin_bytes.saturating_add(result.accepted as u64);
+        let limit = self.spec.options.max_input_bytes;
+        if limit != 0 && self.stdin_bytes > limit {
+            return self.fail(
+                125,
+                &format!("external stdin limit exceeded (limit {limit} bytes)"),
+            );
+        }
+        self.stdin_writable = !result.would_block;
+        if result.would_block || result.accepted == 0 {
+            PipeProcessPoll::PendingWrite
+        } else {
+            PipeProcessPoll::Ready
+        }
+    }
+
+    fn append_poll_output(&mut self, poll: ExternalProcessPoll) -> Result<(), (i32, String)> {
+        let incoming = poll.stdout.len() as u64 + poll.stderr.len() as u64;
+        let next = self.output_bytes.saturating_add(incoming);
+        if next > self.spec.options.max_output_bytes {
+            return Err((
+                125,
+                format!(
+                    "external output limit exceeded (limit {} bytes)",
+                    self.spec.options.max_output_bytes
+                ),
+            ));
+        }
+        if poll.stdout.len() as u64 > self.spec.options.stream_chunk_bytes
+            || poll.stderr.len() as u64 > self.spec.options.stream_chunk_bytes
+        {
+            return Err((
+                126,
+                "external host returned a chunk larger than stream_chunk_bytes".into(),
+            ));
+        }
+        self.output_bytes = next;
+        self.pending_stdout.extend_from_slice(&poll.stdout);
+        if self.pipe_stderr {
+            self.pending_stderr.extend_from_slice(&poll.stderr);
+        } else {
+            self.stage_stderr
+                .borrow_mut()
+                .extend_from_slice(&poll.stderr);
+        }
+        self.stdout_eof |= poll.stdout_eof;
+        self.stderr_eof |= poll.stderr_eof;
+        if let Some(status) = poll.status {
+            self.status = Some(status);
+            *self.stage_status.borrow_mut() = status;
+        }
+        self.stdin_writable = poll.stdin_writable;
+        if let Some(error) = poll.error {
+            return Err((self.status.unwrap_or(126), error));
+        }
+        Ok(())
+    }
+
+    fn can_finish(&self) -> bool {
+        self.stdout_eof
+            && self.stderr_eof
+            && self.status.is_some()
+            && self.pending_stdout.is_empty()
+            && self.pending_stderr.is_empty()
+    }
+
+    fn poll(&mut self) -> PipeProcessPoll {
+        if self.finished {
+            return PipeProcessPoll::Exited;
+        }
+        if self.output.borrow().is_read_closed() {
+            self.cancel_process(141);
+            return PipeProcessPoll::Exited;
+        }
+        if let Some(poll) = self.flush_pending_output() {
+            return poll;
+        }
+        if self.process.is_none() {
+            self.output.borrow_mut().close_write();
+            self.finished = true;
+            return PipeProcessPoll::Exited;
+        }
+
+        let fill = self.fill_stdin();
+        let write = self.write_stdin_chunk();
+        let mut progressed =
+            matches!(fill, PipeProcessPoll::Ready) || matches!(write, PipeProcessPoll::Ready);
+        if matches!(write, PipeProcessPoll::Exited) {
+            return PipeProcessPoll::Exited;
+        }
+
+        let Some(process) = self.process.as_mut() else {
+            // `write_stdin_chunk` may have failed the process while leaving
+            // pending output to flush; treat that as a clean exit.
+            self.output.borrow_mut().close_write();
+            self.finished = true;
+            return PipeProcessPoll::Exited;
+        };
+        let poll = process.poll();
+        let has_data = !poll.stdout.is_empty() || !poll.stderr.is_empty();
+        if has_data {
+            progressed = true;
+        }
+        if let Err((status, error)) = self.append_poll_output(poll) {
+            return self.fail(status, &error);
+        }
+        if let Some(flush) = self.flush_pending_output() {
+            return flush;
+        }
+        if self.can_finish() {
+            self.output.borrow_mut().close_write();
+            self.finished = true;
+            return PipeProcessPoll::Exited;
+        }
+        if progressed {
+            PipeProcessPoll::Ready
+        } else if !self.stdin_writable {
+            PipeProcessPoll::PendingWrite
+        } else {
+            PipeProcessPoll::PendingRead
+        }
+    }
+
+    fn close(&mut self) {
+        if let Some(process) = self.process.as_mut() {
+            process.cancel();
+        }
+        self.close_input();
+        self.output.borrow_mut().close_write();
+        self.process = None;
+        self.finished = true;
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)]
+struct PendingStreamingPipeline {
+    processes: Vec<StreamingPipeProcess<'static>>,
+    finished: Vec<bool>,
+    output_pipes: Vec<Rc<RefCell<PipeBuffer>>>,
+    final_pipe: Rc<RefCell<PipeBuffer>>,
+    stage_statuses: Vec<Rc<RefCell<i32>>>,
+    stage_stderr: Vec<Rc<RefCell<Vec<u8>>>>,
+    stage_pipe_stderr: Vec<bool>,
+    stage_stderr_offsets: Vec<usize>,
+    pipefail: bool,
+    negated: bool,
+    timed: bool,
+    time_posix: bool,
+    started_ms: u64,
+    /// Wall-clock deadline (monotonic ms) for the whole pipeline, derived
+    /// from the shortest external `timeout_ms`. Zero means no runtime limit.
+    deadline_ms: u64,
+    last_arg: Option<String>,
 }
 
 struct BufferedPipeProcess {
@@ -882,6 +1350,7 @@ struct BufferedPipeProcess {
     stage_status: Rc<RefCell<i32>>,
     staging_path: Option<String>,
     staging_handle: Option<FileHandle>,
+    staged_input_bytes: u64,
 }
 
 impl BufferedPipeProcess {
@@ -906,6 +1375,7 @@ impl BufferedPipeProcess {
             stage_status,
             staging_path: None,
             staging_handle: None,
+            staged_input_bytes: 0,
         }
     }
 
@@ -980,6 +1450,41 @@ impl BufferedPipeProcess {
         self.close(runtime);
         self.finished = true;
         PipeProcessPoll::Exited
+    }
+
+    fn emit_input_limit_error(
+        &mut self,
+        runtime: &mut WorkerRuntime,
+        cmd_name: &str,
+        limit: u64,
+    ) -> PipeProcessPoll {
+        *self.stage_status.borrow_mut() = 125;
+        self.stage_stderr.borrow_mut().extend_from_slice(
+            format!("wasmsh: {cmd_name}: external stdin limit exceeded (limit {limit} bytes)\n")
+                .as_bytes(),
+        );
+        self.output.borrow_mut().close_write();
+        self.close(runtime);
+        self.finished = true;
+        PipeProcessPoll::Exited
+    }
+
+    fn input_limit(&self, runtime: &WorkerRuntime) -> Option<u64> {
+        let BufferedPipelineCommand::Argv(argv) = &self.command else {
+            return None;
+        };
+        let cmd_name = argv.first()?;
+        if let Some(spec) = runtime.external_specs.get(cmd_name) {
+            return Some(spec.options.max_input_bytes);
+        }
+        if matches!(
+            runtime.resolve_command(cmd_name, argv),
+            ResolvedCommand::External
+        ) {
+            Some(runtime.config.external_input_byte_limit)
+        } else {
+            None
+        }
     }
 
     fn run_command(&mut self, runtime: &mut WorkerRuntime) -> PipeProcessPoll {
@@ -1086,6 +1591,13 @@ impl BufferedPipeProcess {
         };
         match read_result {
             ReadResult::Read(read) => {
+                if let Some(limit) = self.input_limit(runtime) {
+                    let next_size = self.staged_input_bytes + read as u64;
+                    if next_size > limit {
+                        return self.emit_input_limit_error(runtime, &cmd_name, limit);
+                    }
+                    self.staged_input_bytes = next_size;
+                }
                 let (_, handle) = match self.ensure_staging_handle(runtime) {
                     Ok(parts) => parts,
                     Err(err) => return self.emit_error(runtime, &cmd_name, &err),
@@ -2443,6 +2955,34 @@ pub struct ExternalCommandStdin<'a> {
     reader: Box<dyn Read + 'a>,
 }
 
+struct LimitedReader {
+    reader: Box<dyn Read>,
+    remaining: u64,
+}
+
+impl Read for LimitedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            return match self.reader.read(&mut probe) {
+                Ok(0) => Ok(0),
+                Ok(_) => Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "external stdin limit exceeded",
+                )),
+                Err(error) => Err(error),
+            };
+        }
+        let read_len = buf.len().min(self.remaining as usize);
+        let read = self.reader.read(&mut buf[..read_len])?;
+        self.remaining = self.remaining.saturating_sub(read as u64);
+        Ok(read)
+    }
+}
+
 impl std::fmt::Debug for ExternalCommandStdin<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExternalCommandStdin")
@@ -2468,6 +3008,15 @@ impl<'a> ExternalCommandStdin<'a> {
         }
     }
 
+    fn from_limited_reader(reader: Box<dyn Read>, max_bytes: u64) -> Self {
+        Self {
+            reader: Box::new(LimitedReader {
+                reader,
+                remaining: max_bytes,
+            }),
+        }
+    }
+
     pub fn read_chunk(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.reader.read(buf)
     }
@@ -2486,6 +3035,100 @@ impl Read for ExternalCommandStdin<'_> {
 pub type ExternalCommandHandler = Box<
     dyn FnMut(&str, &[String], Option<ExternalCommandStdin<'_>>) -> Option<ExternalCommandResult>,
 >;
+
+impl ExternalCommandSpec {
+    fn validate_name(name: &str) -> Result<(), String> {
+        if name.is_empty() || name.chars().any(char::is_whitespace) || name.contains('\0') {
+            return Err(
+                "external command name must be non-empty and contain no whitespace or NUL".into(),
+            );
+        }
+        if name.contains('/') {
+            return Err("external command name must not contain '/'".into());
+        }
+        Ok(())
+    }
+
+    fn validate(options: &ExternalCommandOptions) -> Result<(), String> {
+        if let Some(cwd) = &options.cwd {
+            if cwd.is_empty() || cwd.contains('\0') {
+                return Err("external cwd must be non-empty and contain no NUL".into());
+            }
+        }
+        if options.max_input_bytes == 0 || options.max_input_bytes > MAX_EXTERNAL_BUFFER_BYTES {
+            return Err(format!(
+                "external max_input_bytes must be between 1 and {MAX_EXTERNAL_BUFFER_BYTES}"
+            ));
+        }
+        if options.max_output_bytes == 0 || options.max_output_bytes > MAX_EXTERNAL_BUFFER_BYTES {
+            return Err(format!(
+                "external max_output_bytes must be between 1 and {MAX_EXTERNAL_BUFFER_BYTES}"
+            ));
+        }
+        if options.timeout_ms == 0 || options.timeout_ms > MAX_EXTERNAL_TIMEOUT_MS {
+            return Err(format!(
+                "external timeout_ms must be between 1 and {MAX_EXTERNAL_TIMEOUT_MS}"
+            ));
+        }
+        if options.stream_queue_bytes == 0
+            || options.stream_queue_bytes > MAX_EXTERNAL_STREAM_QUEUE_BYTES
+        {
+            return Err(format!(
+                "external stream_queue_bytes must be between 1 and {MAX_EXTERNAL_STREAM_QUEUE_BYTES}"
+            ));
+        }
+        if options.stream_chunk_bytes == 0
+            || options.stream_chunk_bytes > MAX_EXTERNAL_STREAM_CHUNK_BYTES
+        {
+            return Err(format!(
+                "external stream_chunk_bytes must be between 1 and {MAX_EXTERNAL_STREAM_CHUNK_BYTES}"
+            ));
+        }
+        for (key, value) in &options.env {
+            if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
+                return Err("external env keys/values must not contain '=' or NUL".into());
+            }
+        }
+        for arg in &options.argv_prefix {
+            if arg.contains('\0') {
+                return Err("external argv_prefix must not contain NUL".into());
+            }
+        }
+        for mapping in &options.vfs_path_mappings {
+            if !mapping.vfs_prefix.starts_with('/')
+                || mapping.vfs_prefix != wasmsh_fs::normalize_path(&mapping.vfs_prefix)
+                || mapping.host_prefix.is_empty()
+                || mapping.host_prefix.contains('\0')
+            {
+                return Err(
+                    "external VFS mappings require a normalized absolute vfs_prefix and non-empty host_prefix"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate and construct a fixed executable registration.
+    pub fn new(
+        name: impl Into<String>,
+        executable: impl Into<String>,
+        options: ExternalCommandOptions,
+    ) -> Result<Self, String> {
+        let name = name.into();
+        let executable = executable.into();
+        Self::validate_name(&name)?;
+        if executable.is_empty() || executable.contains('\0') {
+            return Err("external executable must be non-empty and contain no NUL".into());
+        }
+        Self::validate(&options)?;
+        Ok(Self {
+            name,
+            executable,
+            options,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RuntimeCommandKind {
@@ -2560,6 +3203,7 @@ impl ActiveRun {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActiveRunStep {
     Pending,
+    Wait,
     Done,
 }
 
@@ -2848,6 +3492,189 @@ impl VmExecutor for RuntimeVmExecutor<'_> {
 }
 
 /// The worker-side runtime that processes host commands.
+struct PolicyNetworkBackend {
+    policy: Rc<RefCell<NetworkPolicy>>,
+    inner: Box<dyn NetworkBackend>,
+}
+
+/// Default maximum bytes buffered for one external command's stdin.
+pub const DEFAULT_EXTERNAL_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+/// Default maximum combined bytes buffered from one external command's output.
+pub const DEFAULT_EXTERNAL_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
+/// Hard upper bound for the finite external-command compatibility interface.
+pub const MAX_EXTERNAL_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+/// Default wall-clock timeout requested from a native host executor.
+pub const DEFAULT_EXTERNAL_TIMEOUT_MS: u64 = 30_000;
+/// Hard upper bound for a finite native external-command invocation.
+pub const MAX_EXTERNAL_TIMEOUT_MS: u64 = 300_000;
+/// Default per-stream queue limit for the polling external protocol.
+pub const DEFAULT_EXTERNAL_STREAM_QUEUE_BYTES: u64 = 64 * 1024;
+/// Default maximum chunk returned by one external stream poll.
+pub const DEFAULT_EXTERNAL_STREAM_CHUNK_BYTES: u64 = 4096;
+/// Hard upper bound for one external stream queue.
+pub const MAX_EXTERNAL_STREAM_QUEUE_BYTES: u64 = 1024 * 1024;
+/// Hard upper bound for one external stream chunk.
+pub const MAX_EXTERNAL_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
+
+fn default_external_input_bytes() -> u64 {
+    DEFAULT_EXTERNAL_INPUT_BYTES
+}
+
+fn default_external_output_bytes() -> u64 {
+    DEFAULT_EXTERNAL_OUTPUT_BYTES
+}
+
+fn default_external_timeout_ms() -> u64 {
+    DEFAULT_EXTERNAL_TIMEOUT_MS
+}
+
+fn default_external_stream_queue_bytes() -> u64 {
+    DEFAULT_EXTERNAL_STREAM_QUEUE_BYTES
+}
+
+fn default_external_stream_chunk_bytes() -> u64 {
+    DEFAULT_EXTERNAL_STREAM_CHUNK_BYTES
+}
+
+/// A virtual-to-host path prefix made available to a registered executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalPathMapping {
+    /// Absolute POSIX path prefix in the shell VFS.
+    pub vfs_prefix: String,
+    /// Host filesystem prefix used only by the external executor.
+    pub host_prefix: String,
+}
+
+/// Finite-input options for one registered external command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExternalCommandOptions {
+    /// Host filesystem cwd. This is not a VFS path and is never inferred.
+    pub cwd: Option<String>,
+    /// Exact environment exported to the child. The host environment is not inherited.
+    pub env: BTreeMap<String, String>,
+    /// Explicit VFS path mappings applied by a host executor to path arguments.
+    pub vfs_path_mappings: Vec<ExternalPathMapping>,
+    /// Fixed arguments inserted by the host adapter before shell argv[1..].
+    pub argv_prefix: Vec<String>,
+    /// Maximum bytes accepted from stdin.
+    #[serde(default = "default_external_input_bytes")]
+    pub max_input_bytes: u64,
+    /// Maximum combined stdout/stderr bytes retained from the child.
+    #[serde(default = "default_external_output_bytes")]
+    pub max_output_bytes: u64,
+    /// Native child wall-clock timeout in milliseconds.
+    #[serde(default = "default_external_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Maximum queued bytes per stdout/stderr stream in streaming mode.
+    #[serde(default = "default_external_stream_queue_bytes")]
+    pub stream_queue_bytes: u64,
+    /// Maximum bytes returned by one streaming poll per stream.
+    #[serde(default = "default_external_stream_chunk_bytes")]
+    pub stream_chunk_bytes: u64,
+}
+
+impl Default for ExternalCommandOptions {
+    fn default() -> Self {
+        Self {
+            cwd: None,
+            env: BTreeMap::new(),
+            vfs_path_mappings: Vec::new(),
+            argv_prefix: Vec::new(),
+            max_input_bytes: DEFAULT_EXTERNAL_INPUT_BYTES,
+            max_output_bytes: DEFAULT_EXTERNAL_OUTPUT_BYTES,
+            timeout_ms: DEFAULT_EXTERNAL_TIMEOUT_MS,
+            stream_queue_bytes: DEFAULT_EXTERNAL_STREAM_QUEUE_BYTES,
+            stream_chunk_bytes: DEFAULT_EXTERNAL_STREAM_CHUNK_BYTES,
+        }
+    }
+}
+
+/// Trusted executable and finite-I/O policy for one shell command name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalCommandSpec {
+    /// Name used in shell source.
+    pub name: String,
+    /// Fixed host executable selected by the trusted host.
+    pub executable: String,
+    /// Finite-I/O and host mapping options.
+    pub options: ExternalCommandOptions,
+}
+
+/// Result from a spec-aware external command handler.
+pub type ExternalCommandSpecHandler = Box<
+    dyn FnMut(
+        &ExternalCommandSpec,
+        &[String],
+        Option<ExternalCommandStdin<'_>>,
+    ) -> Option<ExternalCommandResult>,
+>;
+
+/// Result of writing one chunk to a streaming external process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalProcessWrite {
+    /// Number of bytes accepted by the host process.
+    pub accepted: usize,
+    /// The host is applying backpressure; poll before writing more.
+    pub would_block: bool,
+    /// The child stdin is closed and cannot accept more data.
+    pub closed: bool,
+}
+
+/// One non-blocking snapshot of a streaming external process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalProcessPoll {
+    /// Bytes currently available on stdout.
+    pub stdout: Vec<u8>,
+    /// Bytes currently available on stderr.
+    pub stderr: Vec<u8>,
+    /// True only after stdout has reached EOF and its queued bytes are empty.
+    pub stdout_eof: bool,
+    /// True only after stderr has reached EOF and its queued bytes are empty.
+    pub stderr_eof: bool,
+    /// Child exit status once the process has closed.
+    pub status: Option<i32>,
+    /// Whether a previously blocked stdin can accept another write.
+    pub stdin_writable: bool,
+    /// Host-side failure category/diagnostic, if any.
+    pub error: Option<String>,
+}
+
+/// Handle for one started external process.
+///
+/// Every method is non-blocking. A host implementation must retain unread
+/// bytes in bounded queues and report `WouldBlock`/non-EOF states rather than
+/// converting temporary lack of data into EOF.
+pub trait ExternalProcess {
+    /// Attempt to write a chunk to child stdin.
+    fn write_stdin(&mut self, data: &[u8]) -> ExternalProcessWrite;
+    /// Close child stdin so the process observes EOF.
+    fn close_stdin(&mut self);
+    /// Poll both output streams and process status without waiting.
+    fn poll(&mut self) -> ExternalProcessPoll;
+    /// Terminate and synchronously initiate cleanup of the managed process tree.
+    fn cancel(&mut self);
+}
+
+/// Starts registered external processes for progressive `StartRun`/`PollRun`.
+pub type ExternalStreamHandler =
+    Box<dyn FnMut(&ExternalCommandSpec, &[String]) -> Result<Box<dyn ExternalProcess>, String>>;
+
+impl NetworkBackend for PolicyNetworkBackend {
+    fn fetch(
+        &self,
+        request: &wasmsh_utils::net_types::HttpRequest,
+    ) -> Result<wasmsh_utils::net_types::HttpResponse, NetworkError> {
+        self.policy.borrow().check(&request.url)?;
+        self.inner.fetch(request)
+    }
+
+    fn check_url(&self, url: &str) -> Result<(), NetworkError> {
+        self.policy.borrow().check(url)
+    }
+}
+
 #[allow(missing_debug_implementations)]
 pub struct WorkerRuntime {
     config: BrowserConfig,
@@ -2870,10 +3697,32 @@ pub struct WorkerRuntime {
     aliases: IndexMap<String, String>,
     /// Optional handler for external commands (e.g. python3 in Pyodide).
     external_handler: Option<ExternalCommandHandler>,
+    /// Registered fixed executable specifications for standalone hosts.
+    external_specs: IndexMap<String, ExternalCommandSpec>,
+    /// Handler that receives a registered executable specification.
+    external_spec_handler: Option<ExternalCommandSpecHandler>,
+    /// Non-blocking process starter used only by progressive runs.
+    external_stream_handler: Option<ExternalStreamHandler>,
+    /// Whether the active run may use the non-blocking process protocol.
+    allow_external_streaming: bool,
     /// Optional network backend for curl/wget utilities.
-    network: Option<Box<dyn wasmsh_utils::net_types::NetworkBackend>>,
+    network: Option<Box<dyn NetworkBackend>>,
+    /// Validated policy selected by the most recent initialization.
+    network_policy: Option<NetworkPolicy>,
+    /// Shared policy state for the installed wrapper. Keeping this separate
+    /// from the transport lets repeated Init calls replace policy atomically
+    /// without stacking wrappers around an older policy.
+    network_policy_state: Option<Rc<RefCell<NetworkPolicy>>>,
+    /// Whether `network` currently contains the policy wrapper.
+    network_is_policy_wrapped: bool,
+    /// Session clock capability. Wall and monotonic reads share this object.
+    clock: Rc<dyn ClockProvider>,
+    /// Monotonic origin for the current initialized session.
+    monotonic_origin_ms: Option<u64>,
     /// Active top-level execution, if a run has been started and not yet completed.
     active_run: Option<ActiveRun>,
+    /// Pipeline suspended at a non-blocking external process poll boundary.
+    pending_streaming_pipeline: Option<PendingStreamingPipeline>,
     /// Signals queued for the next progressive poll.
     pending_signals: VecDeque<&'static RuntimeSignalSpec>,
 }
@@ -2889,6 +3738,7 @@ enum StreamingPipelineStage {
     Literal(Vec<u8>),
     File(String),
     Yes { line: Vec<u8> },
+    External(Vec<String>),
     BufferedCommand(BufferedPipelineCommand),
     Cat,
     Head(StreamingHeadMode),
@@ -2969,6 +3819,8 @@ enum CommandLookupKind {
     Alias,
     Function,
     Builtin,
+    Utility,
+    External,
     File,
 }
 
@@ -2982,7 +3834,10 @@ struct CommandLookup {
 fn format_command_verbose(lookup: &CommandLookup) -> String {
     match lookup.kind {
         CommandLookupKind::Alias => format!("alias {}='{}'", lookup.name, lookup.detail),
-        CommandLookupKind::Function | CommandLookupKind::Builtin => lookup.name.clone(),
+        CommandLookupKind::Function | CommandLookupKind::Builtin | CommandLookupKind::Utility => {
+            lookup.name.clone()
+        }
+        CommandLookupKind::External => format!("{} -> {}", lookup.name, lookup.detail),
         CommandLookupKind::File => lookup.detail.clone(),
     }
 }
@@ -2993,6 +3848,8 @@ fn format_type_lookup(lookup: &CommandLookup, type_only: bool, path_only: bool) 
             CommandLookupKind::Alias => "alias".to_string(),
             CommandLookupKind::Function => "function".to_string(),
             CommandLookupKind::Builtin => "builtin".to_string(),
+            CommandLookupKind::Utility => "utility".to_string(),
+            CommandLookupKind::External => "external".to_string(),
             CommandLookupKind::File => "file".to_string(),
         };
     }
@@ -3005,6 +3862,10 @@ fn format_type_lookup(lookup: &CommandLookup, type_only: bool, path_only: bool) 
         }
         CommandLookupKind::Function => format!("{} is a function", lookup.name),
         CommandLookupKind::Builtin => format!("{} is a shell builtin", lookup.name),
+        CommandLookupKind::Utility => format!("{} is a shell utility", lookup.name),
+        CommandLookupKind::External => {
+            format!("{} is an external command ({})", lookup.name, lookup.detail)
+        }
         CommandLookupKind::File => format!("{} is {}", lookup.name, lookup.detail),
     }
 }
@@ -3081,8 +3942,18 @@ impl WorkerRuntime {
             exec: ExecState::new(),
             aliases: IndexMap::new(),
             external_handler: None,
+            external_specs: IndexMap::new(),
+            external_spec_handler: None,
+            external_stream_handler: None,
+            allow_external_streaming: false,
             network: None,
+            network_policy: None,
+            network_policy_state: None,
+            network_is_policy_wrapped: false,
+            clock: default_clock_provider(),
+            monotonic_origin_ms: None,
             active_run: None,
+            pending_streaming_pipeline: None,
             pending_signals: VecDeque::new(),
         }
     }
@@ -3092,12 +3963,104 @@ impl WorkerRuntime {
         self.external_handler = Some(handler);
     }
 
-    /// Register a network backend for `curl`/`wget` utilities.
-    pub fn set_network_backend(
+    /// Register the host callback used for fixed executable registrations.
+    pub fn set_external_spec_handler(&mut self, handler: ExternalCommandSpecHandler) {
+        self.external_spec_handler = Some(handler);
+    }
+
+    /// Register a non-blocking external process starter for progressive runs.
+    pub fn set_external_stream_handler(&mut self, handler: ExternalStreamHandler) {
+        self.external_stream_handler = Some(handler);
+    }
+
+    /// Register or replace one fixed executable external command.
+    pub fn register_external(
         &mut self,
-        backend: Box<dyn wasmsh_utils::net_types::NetworkBackend>,
-    ) {
+        name: impl Into<String>,
+        executable: impl Into<String>,
+        options: ExternalCommandOptions,
+    ) -> Result<(), String> {
+        let spec = ExternalCommandSpec::new(name, executable, options)?;
+        self.external_specs.insert(spec.name.clone(), spec);
+        Ok(())
+    }
+
+    /// Remove one registered external command. Returns whether it existed.
+    pub fn unregister_external(&mut self, name: &str) -> bool {
+        self.external_specs.shift_remove(name).is_some()
+    }
+
+    /// Return registered external command names in registration order.
+    #[must_use]
+    pub fn external_command_names(&self) -> Vec<String> {
+        self.external_specs.keys().cloned().collect()
+    }
+
+    /// Return registered external command specifications in registration order.
+    #[must_use]
+    pub fn external_command_specs(&self) -> Vec<ExternalCommandSpec> {
+        self.external_specs.values().cloned().collect()
+    }
+
+    /// Register a network backend for `curl`/`wget` utilities.
+    pub fn set_network_backend(&mut self, backend: Box<dyn NetworkBackend>) {
         self.network = Some(backend);
+        self.network_is_policy_wrapped = false;
+        self.apply_network_policy();
+    }
+
+    /// Install a validated policy before initialization. The next `Init`
+    /// command remains authoritative and may replace it.
+    pub fn set_network_policy(&mut self, policy: NetworkPolicy) {
+        self.network_policy = Some(policy.clone());
+        let state = self
+            .network_policy_state
+            .get_or_insert_with(|| Rc::new(RefCell::new(policy.clone())))
+            .clone();
+        *state.borrow_mut() = policy;
+        self.apply_network_policy();
+    }
+
+    fn apply_network_policy(&mut self) {
+        let Some(policy) = self.network_policy.clone() else {
+            return;
+        };
+        let state = self
+            .network_policy_state
+            .get_or_insert_with(|| Rc::new(RefCell::new(policy.clone())))
+            .clone();
+        *state.borrow_mut() = policy;
+        if self.network_is_policy_wrapped {
+            return;
+        }
+        if let Some(inner) = self.network.take() {
+            self.network = Some(Box::new(PolicyNetworkBackend {
+                policy: state,
+                inner,
+            }));
+            self.network_is_policy_wrapped = true;
+        }
+    }
+
+    /// Register the session clock used by `date`, `SigV4`, `$SECONDS`, and
+    /// `time`. The provider is retained until replaced or the runtime drops.
+    pub fn set_clock_provider(&mut self, provider: Box<dyn ClockProvider>) {
+        self.clock = Rc::from(provider);
+        self.monotonic_origin_ms = None;
+    }
+
+    fn refresh_monotonic_state(&mut self) {
+        let Some(now) = self.clock.monotonic_now_ms().ok() else {
+            return;
+        };
+        let origin = *self.monotonic_origin_ms.get_or_insert(now);
+        self.vm
+            .state
+            .set_monotonic_elapsed_ms(now.saturating_sub(origin));
+    }
+
+    fn monotonic_now_ms(&self) -> u64 {
+        self.clock.monotonic_now_ms().unwrap_or(0)
     }
 
     /// Process a host command and return a list of events to send back.
@@ -3106,7 +4069,8 @@ impl WorkerRuntime {
             HostCommand::Init {
                 step_budget,
                 allowed_hosts,
-            } => self.handle_init_command(step_budget, allowed_hosts),
+                network_policy,
+            } => self.handle_init_command(step_budget, allowed_hosts, network_policy),
             HostCommand::Run { input } => self.handle_run_command(input, true),
             HostCommand::StartRun { input } => self.handle_run_command(input, false),
             HostCommand::PollRun => self.handle_poll_run_command(),
@@ -3138,9 +4102,35 @@ impl WorkerRuntime {
         &mut self,
         step_budget: u64,
         allowed_hosts: Vec<String>,
+        network_policy: Option<ProtocolNetworkPolicyConfig>,
     ) -> Vec<WorkerEvent> {
+        if network_policy.is_some() && !allowed_hosts.is_empty() {
+            return vec![WorkerEvent::Diagnostic(
+                DiagnosticLevel::Error,
+                "network_policy and allowed_hosts cannot both be configured".into(),
+            )];
+        }
+        let policy_config = network_policy.unwrap_or_else(|| ProtocolNetworkPolicyConfig {
+            enabled: !allowed_hosts.is_empty(),
+            default_action: wasmsh_protocol::NetworkDefaultAction::Deny,
+            allow: allowed_hosts.clone(),
+            deny: Vec::new(),
+        });
+        let policy = match NetworkPolicy::try_from_config(policy_config) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return vec![WorkerEvent::Diagnostic(
+                    DiagnosticLevel::Error,
+                    format!("invalid network policy: {error}"),
+                )];
+            }
+        };
+        self.network_policy = Some(policy);
+        self.apply_network_policy();
         self.config.step_budget = step_budget;
         self.config.allowed_hosts = allowed_hosts;
+        self.cancel_pending_streaming_pipeline();
+        self.allow_external_streaming = false;
         self.vm = Vm::with_limits(
             ShellState::new(),
             ExecutionLimits {
@@ -3159,6 +4149,8 @@ impl WorkerRuntime {
         self.aliases = IndexMap::new();
         self.active_run = None;
         self.pending_signals.clear();
+        self.monotonic_origin_ms = self.clock.monotonic_now_ms().ok();
+        self.refresh_monotonic_state();
         self.initialized = true;
         // Set default shopt options (bash defaults)
         self.vm.state.set_var("SHOPT_extglob".into(), "1".into());
@@ -3166,7 +4158,27 @@ impl WorkerRuntime {
             .state
             .set_var("SHOPT_expand_aliases".into(), "1".into());
         self.vm.state.set_var("SHOPT_sourcepath".into(), "1".into());
+        self.seed_default_environment();
         vec![WorkerEvent::Version(PROTOCOL_VERSION.to_string())]
+    }
+
+    /// Seed the fixed virtual environment so common AI scripts work without
+    /// inheriting anything from the host. Non-exported to keep `env` output
+    /// limited to what the script explicitly exports.
+    fn seed_default_environment(&mut self) {
+        let defaults = [
+            ("HOME", "/home/user"),
+            ("PWD", "/"),
+            ("PATH", "/usr/bin:/bin"),
+        ];
+        for (name, value) in defaults {
+            if self.vm.state.get_var(name).is_none() {
+                self.vm.state.set_var(name.into(), value.into());
+            }
+        }
+        if self.vm.state.cwd.is_empty() {
+            self.vm.state.cwd = "/".into();
+        }
     }
 
     fn handle_run_command(&mut self, input: String, run_to_completion: bool) -> Vec<WorkerEvent> {
@@ -3176,7 +4188,8 @@ impl WorkerRuntime {
                 "runtime not initialized".into(),
             )];
         }
-        match self.start_execution(input) {
+        self.refresh_monotonic_state();
+        match self.start_execution_with_streaming(input, !run_to_completion) {
             Ok(()) => {
                 if run_to_completion {
                     self.poll_active_run_to_completion()
@@ -3189,6 +4202,7 @@ impl WorkerRuntime {
     }
 
     fn handle_poll_run_command(&mut self) -> Vec<WorkerEvent> {
+        self.refresh_monotonic_state();
         match self.poll_active_run() {
             Some(ExecutionPoll::Yield(mut events)) => {
                 events.push(WorkerEvent::Yielded);
@@ -3260,6 +4274,14 @@ impl WorkerRuntime {
     }
 
     pub fn start_execution(&mut self, input: String) -> Result<(), Vec<WorkerEvent>> {
+        self.start_execution_with_streaming(input, false)
+    }
+
+    fn start_execution_with_streaming(
+        &mut self,
+        input: String,
+        allow_external_streaming: bool,
+    ) -> Result<(), Vec<WorkerEvent>> {
         if !self.initialized {
             return Err(vec![WorkerEvent::Diagnostic(
                 DiagnosticLevel::Error,
@@ -3296,6 +4318,8 @@ impl WorkerRuntime {
         self.vm.budget.clear_stop_reason();
         self.vm.cancellation_token().reset();
         self.pending_signals.clear();
+        self.cancel_pending_streaming_pipeline();
+        self.allow_external_streaming = allow_external_streaming;
         self.active_run = Some(ActiveRun::new(input, hir));
         Ok(())
     }
@@ -3343,11 +4367,15 @@ impl WorkerRuntime {
             let step_outcome = self.poll_active_run_step(&mut run);
             remaining -= 1;
             finished = matches!(step_outcome, ActiveRunStep::Done);
+            if matches!(step_outcome, ActiveRunStep::Wait) {
+                break;
+            }
         }
 
         self.vm.limits.step_limit = previous_step_limit;
 
         if finished || self.exec.exit_requested.is_some() || self.exec.resource_exhausted {
+            self.cancel_pending_streaming_pipeline();
             self.ensure_stop_reason();
             let mut events = pending_signal_events;
             self.run_exit_trap_if_needed(&mut events);
@@ -3356,6 +4384,7 @@ impl WorkerRuntime {
             let exit_status = self.current_run_exit_status();
             events.push(WorkerEvent::Exit(exit_status));
             self.active_run = None;
+            self.allow_external_streaming = false;
             Some(ExecutionPoll::Done(events))
         } else {
             let mut events = pending_signal_events;
@@ -3366,6 +4395,7 @@ impl WorkerRuntime {
     }
 
     pub fn cancel_active_execution(&mut self) {
+        self.cancel_pending_streaming_pipeline();
         self.vm.cancellation_token().cancel();
     }
 
@@ -3527,6 +4557,24 @@ impl WorkerRuntime {
             return ActiveRunStep::Done;
         }
 
+        if self.pending_streaming_pipeline.is_some() {
+            if self.poll_pending_streaming_pipeline() {
+                self.finish_pending_streaming_pipeline();
+                let and_or = run.hir.items[run.complete_index].list[run.and_or_index].clone();
+                self.handle_post_and_or(&and_or);
+                Self::advance_active_run_after_and_or(run);
+                return if run.is_done()
+                    || self.exec.exit_requested.is_some()
+                    || self.exec.resource_exhausted
+                {
+                    ActiveRunStep::Done
+                } else {
+                    ActiveRunStep::Pending
+                };
+            }
+            return ActiveRunStep::Wait;
+        }
+
         let cc = &run.hir.items[run.complete_index];
         if run.and_or_index == 0 {
             self.vm.state.lineno = Self::line_number_for_offset(&run.input, cc.span.start as usize);
@@ -3544,20 +4592,303 @@ impl WorkerRuntime {
                 ActiveRunStep::Pending
             };
         }
-        let and_or = &cc.list[run.and_or_index];
-        self.execute_and_or(and_or);
-        self.handle_post_and_or(and_or);
-
-        run.and_or_index += 1;
-        if run.and_or_index >= cc.list.len() {
-            run.complete_index += 1;
-            run.and_or_index = 0;
+        let and_or = cc.list[run.and_or_index].clone();
+        if self.try_start_pending_streaming_pipeline(&and_or) {
+            if self.poll_pending_streaming_pipeline() {
+                self.finish_pending_streaming_pipeline();
+                self.handle_post_and_or(&and_or);
+                Self::advance_active_run_after_and_or(run);
+            } else {
+                return ActiveRunStep::Wait;
+            }
+        } else {
+            self.execute_and_or(&and_or);
+            self.handle_post_and_or(&and_or);
+            Self::advance_active_run_after_and_or(run);
         }
 
         if run.is_done() || self.exec.exit_requested.is_some() || self.exec.resource_exhausted {
             ActiveRunStep::Done
         } else {
             ActiveRunStep::Pending
+        }
+    }
+
+    fn advance_active_run_after_and_or(run: &mut ActiveRun) {
+        run.and_or_index += 1;
+        if run.and_or_index >= run.hir.items[run.complete_index].list.len() {
+            run.complete_index += 1;
+            run.and_or_index = 0;
+        }
+    }
+
+    fn try_start_pending_streaming_pipeline(&mut self, and_or: &HirAndOr) -> bool {
+        if !self.allow_external_streaming || self.external_stream_handler.is_none() {
+            return false;
+        }
+        let pipeline = &and_or.first;
+        let (stages, stage_last_args) = self.compile_pipeline_stages(&pipeline.commands, true);
+        if !stages
+            .iter()
+            .any(|stage| matches!(stage, StreamingPipelineStage::External(_)))
+        {
+            return false;
+        }
+        let stage_statuses = Self::seed_stage_statuses(&stages);
+        let stage_stderr: Vec<Rc<RefCell<Vec<u8>>>> = stages
+            .iter()
+            .map(|_| Rc::new(RefCell::new(Vec::new())))
+            .collect();
+        let stage_pipe_stderr: Vec<bool> = (0..stages.len())
+            .map(|idx| pipeline.pipe_stderr.get(idx).copied().unwrap_or(false))
+            .collect();
+        let last_arg = stage_last_args.iter().rev().flatten().next().cloned();
+        let Some(mut pending) = self.build_pending_streaming_pipeline(
+            None,
+            &stages,
+            stage_pipe_stderr,
+            stage_statuses,
+            stage_stderr,
+        ) else {
+            return false;
+        };
+        pending.pipefail = self.vm.state.get_var("SHOPT_o_pipefail").as_deref() == Some("1");
+        pending.negated = pipeline.negated;
+        pending.timed = pipeline.timed;
+        pending.time_posix = pipeline.time_posix;
+        pending.started_ms = self.monotonic_now_ms();
+        pending.deadline_ms = self.streaming_pipeline_deadline(&stages, pending.started_ms);
+        pending.last_arg = last_arg;
+        self.pending_streaming_pipeline = Some(pending);
+        true
+    }
+
+    fn build_pending_streaming_pipeline(
+        &mut self,
+        source_reader: Option<Box<dyn Read>>,
+        stages: &[StreamingPipelineStage],
+        stage_pipe_stderr: Vec<bool>,
+        stage_statuses: Vec<Rc<RefCell<i32>>>,
+        stage_stderr: Vec<Rc<RefCell<Vec<u8>>>>,
+    ) -> Option<PendingStreamingPipeline> {
+        let output_pipes: Vec<Rc<RefCell<PipeBuffer>>> = (0..stages.len())
+            .map(|_| Rc::new(RefCell::new(PipeBuffer::new(EXTERNAL_STREAM_PIPE_CAPACITY))))
+            .collect();
+        let ctx = StreamingStageCtx {
+            stages,
+            stage_pipe_stderr: &stage_pipe_stderr,
+            stage_statuses: &stage_statuses,
+            stage_stderr: &stage_stderr,
+            output_pipes: &output_pipes,
+        };
+        let mut processes = Vec::new();
+        if self
+            .setup_first_streaming_process(source_reader, &ctx, &mut processes)
+            .is_some()
+        {
+            Self::close_streaming_processes(&mut processes, self);
+            return None;
+        }
+        for idx in 1..stages.len() {
+            if !self.setup_later_streaming_stage(idx, &ctx, &mut processes) {
+                Self::close_streaming_processes(&mut processes, self);
+                return None;
+            }
+        }
+        let final_pipe = output_pipes.last().cloned()?;
+        let process_count = processes.len();
+        Some(PendingStreamingPipeline {
+            processes,
+            finished: vec![false; process_count],
+            output_pipes,
+            final_pipe,
+            stage_statuses,
+            stage_stderr_offsets: vec![0; stage_stderr.len()],
+            stage_stderr,
+            stage_pipe_stderr,
+            pipefail: false,
+            negated: false,
+            timed: false,
+            time_posix: false,
+            started_ms: 0,
+            deadline_ms: 0,
+            last_arg: None,
+        })
+    }
+
+    /// Derive the pipeline-wide wall-clock deadline from the registered
+    /// external specs. A custom host may ignore the per-command `timeout_ms`,
+    /// so the runtime enforces its own bound to guarantee forward progress.
+    fn streaming_pipeline_deadline(&self, stages: &[StreamingPipelineStage], now_ms: u64) -> u64 {
+        let mut limit: Option<u64> = None;
+        for stage in stages {
+            let StreamingPipelineStage::External(argv) = stage else {
+                continue;
+            };
+            let Some(spec) = argv.first().and_then(|name| self.external_specs.get(name)) else {
+                continue;
+            };
+            let timeout = spec.options.timeout_ms;
+            if timeout == 0 {
+                continue;
+            }
+            limit = Some(limit.map_or(timeout, |current| current.min(timeout)));
+        }
+        limit.map_or(0, |timeout| now_ms.saturating_add(timeout))
+    }
+
+    /// Close every process in a partially built pipeline so an aborted
+    /// construction cannot leak host children.
+    fn close_streaming_processes(
+        processes: &mut [StreamingPipeProcess<'static>],
+        runtime: &mut WorkerRuntime,
+    ) {
+        for process in processes.iter_mut() {
+            process.close(runtime);
+        }
+    }
+
+    fn poll_pending_streaming_pipeline(&mut self) -> bool {
+        let Some(mut pending) = self.pending_streaming_pipeline.take() else {
+            return true;
+        };
+        if pending.deadline_ms != 0 && self.monotonic_now_ms() >= pending.deadline_ms {
+            self.apply_streaming_deadline(&mut pending);
+            self.pending_streaming_pipeline = Some(pending);
+            return true;
+        }
+        let mut progressed = false;
+        for idx in (0..pending.processes.len()).rev() {
+            if pending.finished[idx] {
+                continue;
+            }
+            match pending.processes[idx].poll(self) {
+                PipeProcessPoll::Ready => progressed = true,
+                PipeProcessPoll::PendingRead | PipeProcessPoll::PendingWrite => {}
+                PipeProcessPoll::Exited => {
+                    pending.finished[idx] = true;
+                    progressed = true;
+                }
+            }
+        }
+        let buffered_pipe_bytes = pending
+            .output_pipes
+            .iter()
+            .map(|pipe| pipe.borrow().len() as u64)
+            .sum();
+        self.sync_pipe_budget(buffered_pipe_bytes);
+        if !self.exec.resource_exhausted {
+            self.drain_final_pipe_to_stdout(&pending.final_pipe, &mut progressed);
+            self.drain_pending_streaming_stderr(&mut pending);
+        }
+        let finished = pending.finished.iter().all(|done| *done);
+        if self.exec.resource_exhausted || finished {
+            for (idx, process) in pending.processes.iter_mut().enumerate() {
+                if !pending.finished[idx] {
+                    process.close(self);
+                    pending.finished[idx] = true;
+                }
+            }
+            self.pending_streaming_pipeline = Some(pending);
+            true
+        } else {
+            self.pending_streaming_pipeline = Some(pending);
+            let _ = progressed;
+            false
+        }
+    }
+
+    /// Stop every remaining process with status 124 (timeout) and record the
+    /// failure on the external stages so `$?`/PIPESTATUS observe it.
+    fn apply_streaming_deadline(&mut self, pending: &mut PendingStreamingPipeline) {
+        for (idx, process) in pending.processes.iter_mut().enumerate() {
+            if pending.finished[idx] {
+                continue;
+            }
+            if let StreamingPipeProcess::External(external) = process {
+                if external.process.is_some() {
+                    *external.stage_status.borrow_mut() = 124;
+                    let diagnostic = format!(
+                        "wasmsh: {}: external command timed out\n",
+                        external.command_name()
+                    );
+                    // Surface the diagnostic on the stage's stderr channel;
+                    // the process is being torn down, so a merged pipe could
+                    // never be flushed anyway.
+                    external
+                        .stage_stderr
+                        .borrow_mut()
+                        .extend_from_slice(diagnostic.as_bytes());
+                }
+            }
+            process.close(self);
+            pending.finished[idx] = true;
+        }
+    }
+
+    fn drain_pending_streaming_stderr(&mut self, pending: &mut PendingStreamingPipeline) {
+        for idx in 0..pending.stage_stderr.len() {
+            if pending.stage_pipe_stderr[idx] {
+                continue;
+            }
+            let start = pending.stage_stderr_offsets[idx];
+            let data = {
+                let stderr = pending.stage_stderr[idx].borrow();
+                if start >= stderr.len() {
+                    Vec::new()
+                } else {
+                    stderr[start..].to_vec()
+                }
+            };
+            if !data.is_empty() {
+                pending.stage_stderr_offsets[idx] += data.len();
+                self.write_stderr(&data);
+            }
+        }
+    }
+
+    fn finish_pending_streaming_pipeline(&mut self) {
+        let Some(mut pending) = self.pending_streaming_pipeline.take() else {
+            return;
+        };
+        for process in &mut pending.processes {
+            process.close(self);
+        }
+        self.drain_pending_streaming_stderr(&mut pending);
+        let statuses: Vec<i32> = pending
+            .stage_statuses
+            .iter()
+            .map(|status| *status.borrow())
+            .collect();
+        if let Some(last_arg) = pending.last_arg {
+            self.vm.state.set_last_argument(last_arg);
+        }
+        self.set_pipestatus(&statuses);
+        if !self.exec.resource_exhausted {
+            self.vm.state.last_status =
+                Self::resolve_pipeline_exit_status(&statuses, pending.pipefail);
+            if pending.negated {
+                self.vm.state.last_status = i32::from(self.vm.state.last_status == 0);
+            }
+            if pending.timed {
+                let elapsed_seconds =
+                    self.monotonic_now_ms().saturating_sub(pending.started_ms) as f64 / 1000.0;
+                self.emit_pipeline_timing(pending.time_posix, elapsed_seconds);
+            }
+        }
+    }
+
+    fn cancel_pending_streaming_pipeline(&mut self) {
+        let Some(mut pending) = self.pending_streaming_pipeline.take() else {
+            return;
+        };
+        for process in &mut pending.processes {
+            process.close(self);
+        }
+        for pipe in pending.output_pipes {
+            let mut pipe = pipe.borrow_mut();
+            pipe.close_read();
+            pipe.close_write();
         }
     }
 
@@ -3635,6 +4966,16 @@ impl WorkerRuntime {
     pub fn set_pipe_byte_limit(&mut self, limit: u64) {
         self.config.pipe_byte_limit = limit;
         self.vm.limits.pipe_byte_limit = limit;
+    }
+
+    /// Set the finite stdin limit for legacy external handlers.
+    pub fn set_external_input_byte_limit(&mut self, limit: u64) {
+        self.config.external_input_byte_limit = limit.clamp(1, MAX_EXTERNAL_BUFFER_BYTES);
+    }
+
+    /// Set the finite combined stdout/stderr limit for legacy external handlers.
+    pub fn set_external_output_byte_limit(&mut self, limit: u64) {
+        self.config.external_output_byte_limit = limit.clamp(1, MAX_EXTERNAL_BUFFER_BYTES);
     }
 
     pub fn set_recursion_limit(&mut self, limit: u32) {
@@ -4310,16 +5651,16 @@ impl WorkerRuntime {
         }
     }
 
-    #[allow(clippy::let_unit_value)]
     fn execute_pipeline(&mut self, pipeline: &HirPipeline) {
-        let started = pipeline_started_at();
+        let started = self.monotonic_now_ms();
         let cmds = &pipeline.commands;
         self.execute_scheduled_pipeline(cmds, pipeline);
         if pipeline.negated {
             self.vm.state.last_status = i32::from(self.vm.state.last_status == 0);
         }
         if pipeline.timed {
-            self.emit_pipeline_timing(pipeline.time_posix, started_elapsed_seconds(started));
+            let elapsed_seconds = self.monotonic_now_ms().saturating_sub(started) as f64 / 1000.0;
+            self.emit_pipeline_timing(pipeline.time_posix, elapsed_seconds);
         }
     }
 
@@ -4647,6 +5988,26 @@ impl WorkerRuntime {
                 )));
                 None
             }
+            StreamingPipelineStage::External(argv) => {
+                let Some(spec) = argv
+                    .first()
+                    .and_then(|name| self.external_specs.get(name))
+                    .cloned()
+                else {
+                    return Some(false);
+                };
+                processes.push(StreamingPipeProcess::External(ExternalPipeProcess::start(
+                    self,
+                    Some(source_pipe),
+                    ctx.output_pipes[0].clone(),
+                    argv.clone(),
+                    spec,
+                    ctx.stage_pipe_stderr[0],
+                    ctx.stage_stderr[0].clone(),
+                    ctx.stage_statuses[0].clone(),
+                )));
+                None
+            }
             StreamingPipelineStage::BufferedCommand(argv) => {
                 processes.push(StreamingPipeProcess::Buffered(BufferedPipeProcess::new(
                     Some(source_pipe),
@@ -4728,6 +6089,25 @@ impl WorkerRuntime {
                 )));
                 None
             }
+            StreamingPipelineStage::External(argv) => {
+                let Some(cmd_name) = argv.first() else {
+                    return Some(false);
+                };
+                let Some(spec) = self.external_specs.get(cmd_name).cloned() else {
+                    return Some(false);
+                };
+                processes.push(StreamingPipeProcess::External(ExternalPipeProcess::start(
+                    self,
+                    None,
+                    ctx.output_pipes[0].clone(),
+                    argv.clone(),
+                    spec,
+                    ctx.stage_pipe_stderr[0],
+                    ctx.stage_stderr[0].clone(),
+                    ctx.stage_statuses[0].clone(),
+                )));
+                None
+            }
             StreamingPipelineStage::BufferedCommand(argv) => {
                 processes.push(StreamingPipeProcess::Buffered(BufferedPipeProcess::new(
                     None,
@@ -4769,6 +6149,24 @@ impl WorkerRuntime {
                     ctx.stage_stderr[idx].clone(),
                     ctx.stage_statuses[idx].clone(),
                     ctx.stage_pipe_stderr[idx],
+                )));
+            }
+            StreamingPipelineStage::External(argv) => {
+                let Some(cmd_name) = argv.first() else {
+                    return false;
+                };
+                let Some(spec) = self.external_specs.get(cmd_name).cloned() else {
+                    return false;
+                };
+                processes.push(StreamingPipeProcess::External(ExternalPipeProcess::start(
+                    self,
+                    Some(ctx.output_pipes[idx - 1].clone()),
+                    ctx.output_pipes[idx].clone(),
+                    argv.clone(),
+                    spec,
+                    ctx.stage_pipe_stderr[idx],
+                    ctx.stage_stderr[idx].clone(),
+                    ctx.stage_statuses[idx].clone(),
                 )));
             }
             StreamingPipelineStage::BufferedCommand(argv) => {
@@ -4963,6 +6361,7 @@ impl WorkerRuntime {
             | StreamingPipelineStage::Literal(_)
             | StreamingPipelineStage::File(_)
             | StreamingPipelineStage::Yes { .. }
+            | StreamingPipelineStage::External(_)
             | StreamingPipelineStage::BufferedCommand(_) => None,
         }
     }
@@ -5012,6 +6411,12 @@ impl WorkerRuntime {
         }
         if let Some(stage) = Self::parse_streaming_internal_stage(cmd_name, argv, is_first) {
             return Some(stage);
+        }
+        if self.allow_external_streaming
+            && self.external_stream_handler.is_some()
+            && self.external_specs.contains_key(cmd_name)
+        {
+            return Some(StreamingPipelineStage::External(argv.to_vec()));
         }
         if self.is_buffered_stage_candidate(cmd_name) {
             return Some(StreamingPipelineStage::BufferedCommand(
@@ -5084,6 +6489,8 @@ impl WorkerRuntime {
             || self.builtins.is_builtin(cmd_name)
             || self.utils.is_utility(cmd_name)
             || self.external_handler.is_some()
+            || self.external_spec_handler.is_some()
+            || self.external_specs.contains_key(cmd_name)
     }
 
     fn streaming_echo_bytes(args: &[String]) -> Vec<u8> {
@@ -6438,13 +7845,17 @@ impl WorkerRuntime {
     fn take_external_stdin(
         &mut self,
         cmd_name: &str,
+        max_bytes: u64,
     ) -> Result<Option<ExternalCommandStdin<'static>>, ()> {
         let reader = self.take_pending_input_reader(cmd_name)?;
-        Ok(reader.map(ExternalCommandStdin::from_reader))
+        Ok(reader.map(|reader| ExternalCommandStdin::from_limited_reader(reader, max_bytes)))
     }
 
     fn can_use_isolated_process_subst_runtime(&self) -> bool {
-        self.external_handler.is_none() && self.network.is_none()
+        self.external_handler.is_none()
+            && self.external_spec_handler.is_none()
+            && self.external_specs.is_empty()
+            && self.network.is_none()
     }
 
     fn clone_for_isolated_process_subst(&self) -> Option<Self> {
@@ -6467,8 +7878,18 @@ impl WorkerRuntime {
             exec,
             aliases: self.aliases.clone(),
             external_handler: None,
+            external_specs: IndexMap::new(),
+            external_spec_handler: None,
+            external_stream_handler: None,
+            allow_external_streaming: false,
             network: None,
+            network_policy: None,
+            network_policy_state: None,
+            network_is_policy_wrapped: false,
+            clock: self.clock.clone(),
+            monotonic_origin_ms: self.monotonic_origin_ms,
             active_run: None,
+            pending_streaming_pipeline: None,
             pending_signals: VecDeque::new(),
         })
     }
@@ -7332,6 +8753,15 @@ impl WorkerRuntime {
                     detail: name.to_string(),
                 });
             }
+            // Utilities ship with the sandbox but are not VFS files, so an AI
+            // adapter can only discover them through `command -v`/`type`.
+            if self.utils.is_utility(name) {
+                lookups.push(CommandLookup {
+                    kind: CommandLookupKind::Utility,
+                    name: name.to_string(),
+                    detail: name.to_string(),
+                });
+            }
         }
 
         if let Some(path) = self.find_command_path(name) {
@@ -7339,6 +8769,14 @@ impl WorkerRuntime {
                 kind: CommandLookupKind::File,
                 name: name.to_string(),
                 detail: path,
+            });
+        }
+
+        if let Some(spec) = self.external_specs.get(name) {
+            lookups.push(CommandLookup {
+                kind: CommandLookupKind::External,
+                name: name.to_string(),
+                detail: spec.executable.clone(),
             });
         }
 
@@ -7670,23 +9108,79 @@ impl WorkerRuntime {
 
     fn call_external(&mut self, argv: &[String]) {
         let cmd_name = &argv[0];
-        let Ok(stdin) = self.take_external_stdin(cmd_name) else {
+        let spec = self.external_specs.get(cmd_name).cloned();
+        let max_input_bytes = spec
+            .as_ref()
+            .map_or(self.config.external_input_byte_limit, |spec| {
+                spec.options.max_input_bytes
+            });
+        let Ok(stdin) = self.take_external_stdin(cmd_name, max_input_bytes) else {
             return;
         };
-        if let Some(ref mut handler) = self.external_handler {
-            if let Some(result) = handler(cmd_name, argv, stdin) {
-                self.write_streams(&result.stdout, &result.stderr);
-                self.vm.state.last_status = result.status;
+        if let Some(spec) = spec {
+            if let Some(handler) = self.external_spec_handler.as_mut() {
+                if let Some(result) = handler(&spec, argv, stdin) {
+                    self.apply_external_result(cmd_name, result, spec.options.max_output_bytes);
+                } else {
+                    self.external_host_failure(
+                        cmd_name,
+                        126,
+                        "registered external command was not handled by the host",
+                    );
+                }
             } else {
-                let msg = format!("wasmsh: {cmd_name}: command not found\n");
-                self.write_stderr(msg.as_bytes());
-                self.vm.state.last_status = 127;
+                self.external_host_failure(
+                    cmd_name,
+                    126,
+                    "native external processes are not supported by this host",
+                );
+            }
+        } else if let Some(ref mut handler) = self.external_handler {
+            if let Some(result) = handler(cmd_name, argv, stdin) {
+                self.apply_external_result(
+                    cmd_name,
+                    result,
+                    self.config.external_output_byte_limit,
+                );
+            } else {
+                self.external_host_failure(cmd_name, 127, "command not found");
             }
         } else {
-            let msg = format!("wasmsh: {cmd_name}: command not found\n");
-            self.write_stderr(msg.as_bytes());
-            self.vm.state.last_status = 127;
+            self.external_host_failure(cmd_name, 127, "command not found");
         }
+    }
+
+    fn external_host_failure(&mut self, cmd_name: &str, status: i32, reason: &str) {
+        self.write_stderr(format!("wasmsh: {cmd_name}: {reason}\n").as_bytes());
+        self.vm.state.last_status = status;
+    }
+
+    fn apply_external_result(
+        &mut self,
+        cmd_name: &str,
+        mut result: ExternalCommandResult,
+        max_output_bytes: u64,
+    ) {
+        let total = result.stdout.len() as u64 + result.stderr.len() as u64;
+        if total > max_output_bytes {
+            let allowed = max_output_bytes as usize;
+            if result.stdout.len() > allowed {
+                result.stdout.truncate(allowed);
+                result.stderr.clear();
+            } else {
+                result.stderr.truncate(allowed - result.stdout.len());
+            }
+            result.status = 125;
+            self.vm.emit_diagnostic(
+                wasmsh_vm::DiagLevel::Error,
+                wasmsh_vm::DiagCategory::Budget,
+                format!(
+                    "external output limit exceeded for {cmd_name}: {total} bytes (limit {max_output_bytes})"
+                ),
+            );
+        }
+        self.write_streams(&result.stdout, &result.stderr);
+        self.vm.state.last_status = result.status;
     }
 
     /// Invoke a shell function.
@@ -7913,6 +9407,7 @@ impl WorkerRuntime {
                 stdin,
                 state: Some(&self.vm.state),
                 network: self.network.as_deref(),
+                clock: Some(self.clock.as_ref()),
             };
             util_fn(&mut ctx, &argv_refs)
         };
@@ -10082,27 +11577,15 @@ impl WorkerRuntime {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-type PipelineStartedAt = std::time::Instant;
-#[cfg(target_arch = "wasm32")]
-type PipelineStartedAt = ();
-
-#[cfg(not(target_arch = "wasm32"))]
-fn pipeline_started_at() -> PipelineStartedAt {
-    std::time::Instant::now()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn pipeline_started_at() -> PipelineStartedAt {}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn started_elapsed_seconds(started: PipelineStartedAt) -> f64 {
-    started.elapsed().as_secs_f64()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn started_elapsed_seconds(_: PipelineStartedAt) -> f64 {
-    0.0
+fn default_clock_provider() -> Rc<dyn ClockProvider> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Rc::from(Box::new(SystemClock::new()) as Box<dyn ClockProvider>)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Rc::from(Box::new(UnavailableClock) as Box<dyn ClockProvider>)
+    }
 }
 
 /// Convert a protocol diagnostic level to a VM diagnostic level.
@@ -10124,6 +11607,48 @@ impl Default for WorkerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use wasmsh_utils::{ClockError, FixedClock, UtcDateTime};
+
+    struct RecordingNetworkBackend {
+        requests: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl NetworkBackend for RecordingNetworkBackend {
+        fn fetch(
+            &self,
+            request: &wasmsh_utils::net_types::HttpRequest,
+        ) -> Result<wasmsh_utils::net_types::HttpResponse, NetworkError> {
+            self.requests.borrow_mut().push(request.url.clone());
+            Ok(wasmsh_utils::net_types::HttpResponse {
+                status: 200,
+                ..Default::default()
+            })
+        }
+    }
+
+    struct SequenceClock {
+        values: RefCell<Vec<i64>>,
+    }
+
+    impl SequenceClock {
+        fn new(values: Vec<i64>) -> Self {
+            Self {
+                values: RefCell::new(values),
+            }
+        }
+    }
+
+    impl ClockProvider for SequenceClock {
+        fn now_unix_ms(&self) -> Result<i64, ClockError> {
+            let mut values = self.values.borrow_mut();
+            Ok(values.pop().unwrap_or(0))
+        }
+
+        fn monotonic_now_ms(&self) -> Result<u64, ClockError> {
+            Ok(0)
+        }
+    }
 
     fn first_and_or(source: &str) -> HirAndOr {
         let ast = wasmsh_parse::parse(source).unwrap();
@@ -10171,11 +11696,153 @@ mod tests {
     }
 
     #[test]
+    fn repeated_init_replaces_network_policy_without_stacking_old_policy() {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = WorkerRuntime::new();
+        runtime.set_network_backend(Box::new(RecordingNetworkBackend {
+            requests: requests.clone(),
+        }));
+
+        let first_init = runtime.handle_command(HostCommand::Init {
+            step_budget: 0,
+            allowed_hosts: vec![],
+            network_policy: Some(ProtocolNetworkPolicyConfig {
+                enabled: true,
+                default_action: wasmsh_protocol::NetworkDefaultAction::Deny,
+                allow: vec!["first.example".into()],
+                deny: vec![],
+            }),
+        });
+        assert!(matches!(first_init.as_slice(), [WorkerEvent::Version(_)]));
+        assert_eq!(
+            get_exit(&runtime.handle_command(HostCommand::Run {
+                input: "curl http://first.example/".into(),
+            })),
+            0
+        );
+
+        let second_init = runtime.handle_command(HostCommand::Init {
+            step_budget: 0,
+            allowed_hosts: vec![],
+            network_policy: Some(ProtocolNetworkPolicyConfig {
+                enabled: true,
+                default_action: wasmsh_protocol::NetworkDefaultAction::Deny,
+                allow: vec!["second.example".into()],
+                deny: vec![],
+            }),
+        });
+        assert!(matches!(second_init.as_slice(), [WorkerEvent::Version(_)]));
+        assert_ne!(
+            get_exit(&runtime.handle_command(HostCommand::Run {
+                input: "curl http://first.example/".into(),
+            })),
+            0
+        );
+        assert_eq!(
+            get_exit(&runtime.handle_command(HostCommand::Run {
+                input: "curl http://second.example/".into(),
+            })),
+            0
+        );
+        assert_eq!(
+            requests.borrow().as_slice(),
+            ["http://first.example/", "http://second.example/"]
+        );
+    }
+
+    #[test]
+    fn date_samples_each_command_without_reinitializing_the_session() {
+        let first = UtcDateTime::from_calendar(2025, 12, 31, 23, 59, 59, 0)
+            .unwrap()
+            .epoch_ms();
+        let second = UtcDateTime::from_calendar(2026, 1, 1, 0, 0, 0, 0)
+            .unwrap()
+            .epoch_ms();
+        let clock = SequenceClock::new(vec![second, first]);
+        let mut runtime = WorkerRuntime::new();
+        runtime.set_clock_provider(Box::new(clock));
+        runtime.handle_command(HostCommand::Init {
+            step_budget: 0,
+            allowed_hosts: vec![],
+            network_policy: None,
+        });
+
+        let same_run = runtime.handle_command(HostCommand::Run {
+            input: "date '+%s'; date '+%s'".into(),
+        });
+        assert_eq!(get_stdout(&same_run), "1767225599\n1767225600\n");
+        assert_eq!(get_exit(&same_run), 0);
+    }
+
+    #[test]
+    fn fixed_clock_advances_between_runs_and_monotonic_seconds_are_separate() {
+        let start = UtcDateTime::from_calendar(2026, 1, 1, 0, 0, 0, 0)
+            .unwrap()
+            .epoch_ms();
+        let clock = FixedClock::new(start).unwrap();
+        let mut runtime = WorkerRuntime::new();
+        runtime.set_clock_provider(Box::new(clock.clone()));
+        runtime.handle_command(HostCommand::Init {
+            step_budget: 0,
+            allowed_hosts: vec![],
+            network_policy: None,
+        });
+        let first = runtime.handle_command(HostCommand::Run {
+            input: "date '+%F'; echo $SECONDS".into(),
+        });
+        clock.advance_ms(86_400_000).unwrap();
+        let second = runtime.handle_command(HostCommand::Run {
+            input: "date '+%F'; echo $SECONDS".into(),
+        });
+        assert_eq!(get_stdout(&first), "2026-01-01\n0\n");
+        assert_eq!(get_stdout(&second), "2026-01-02\n86400\n");
+        assert_eq!(get_exit(&second), 0);
+    }
+
+    #[test]
+    fn command_v_discovers_bundled_utilities() {
+        let mut runtime = WorkerRuntime::new();
+        runtime.handle_command(HostCommand::Init {
+            step_budget: 0,
+            allowed_hosts: vec![],
+            network_policy: None,
+        });
+        let events = runtime.handle_command(HostCommand::Run {
+            input: "command -v curl; command -v jq; type -t curl".into(),
+        });
+        // An AI adapter must be able to enumerate bundled utilities even
+        // though they are not VFS files.
+        assert_eq!(get_stdout(&events), "curl\njq\nutility\n");
+        assert_eq!(get_exit(&events), 0);
+    }
+
+    #[test]
+    fn init_seeds_deterministic_home_pwd_and_path() {
+        let mut runtime = WorkerRuntime::new();
+        runtime.handle_command(HostCommand::Init {
+            step_budget: 0,
+            allowed_hosts: vec![],
+            network_policy: None,
+        });
+        // `cd` with no args, `~` expansion, and `$PWD` must work without any
+        // host environment, which is the AI-facing environment contract.
+        let events = runtime.handle_command(HostCommand::Run {
+            input: "echo $HOME; echo $PWD; cd; echo $PWD; echo ~".into(),
+        });
+        assert_eq!(
+            get_stdout(&events),
+            "/home/user\n/\n/home/user\n/home/user\n"
+        );
+        assert_eq!(get_exit(&events), 0);
+    }
+
+    #[test]
     fn output_limit_exposes_structured_exhaustion_reason() {
         let mut runtime = WorkerRuntime::new();
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.set_output_byte_limit(3);
 
@@ -10201,6 +11868,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.set_recursion_limit(2);
 
@@ -10226,6 +11894,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.set_pipe_byte_limit(1);
 
@@ -10292,6 +11961,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 10;
 
@@ -10309,6 +11979,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 10;
 
@@ -10326,6 +11997,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 8;
 
@@ -10343,6 +12015,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.handle_command(HostCommand::WriteFile {
             path: "/big.txt".into(),
@@ -10364,6 +12037,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 10;
 
@@ -10381,6 +12055,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 10;
 
@@ -10398,6 +12073,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 10;
 
@@ -10420,6 +12096,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -10439,6 +12116,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 10;
 
@@ -10456,6 +12134,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 6;
 
@@ -10473,6 +12152,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 3;
 
@@ -10490,6 +12170,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         let expected = "    1   │ y\n    2   │ y\n";
         runtime.vm.limits.output_byte_limit = expected.len() as u64;
@@ -10508,6 +12189,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 10;
 
@@ -10525,6 +12207,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 6;
 
@@ -10542,6 +12225,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 4;
 
@@ -10559,6 +12243,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 6;
 
@@ -10576,6 +12261,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 2;
 
@@ -10593,6 +12279,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -10609,6 +12296,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 8;
 
@@ -10626,6 +12314,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -10643,6 +12332,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -10662,6 +12352,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -10680,6 +12371,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         runtime.vm.limits.output_byte_limit = 2;
 
@@ -10697,6 +12389,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -10717,6 +12410,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -10739,6 +12433,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -10755,6 +12450,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -10770,6 +12466,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -10787,6 +12484,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -10804,6 +12502,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         runtime.proc_subst_out_scopes.push(Vec::new());
@@ -10833,6 +12532,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         runtime.proc_subst_out_scopes.push(Vec::new());
@@ -10864,6 +12564,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         runtime.proc_subst_in_scopes.push(Vec::new());
@@ -10887,6 +12588,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         runtime.proc_subst_in_scopes.push(Vec::new());
@@ -10910,6 +12612,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         runtime.proc_subst_in_scopes.push(Vec::new());
@@ -10933,6 +12636,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         runtime.proc_subst_out_scopes.push(Vec::new());
@@ -10964,6 +12668,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         runtime.proc_subst_out_scopes.push(Vec::new());
@@ -11005,6 +12710,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -11031,6 +12737,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -11047,6 +12754,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = runtime.handle_command(HostCommand::Run {
@@ -11084,6 +12792,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let first = runtime.handle_command(HostCommand::Run {
@@ -11106,6 +12815,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let setup = runtime.handle_command(HostCommand::WriteFile {
@@ -11129,6 +12839,7 @@ mod tests {
         runtime.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let setup = runtime.handle_command(HostCommand::WriteFile {

@@ -3315,6 +3315,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             f(&mut ctx, argv)
         };
@@ -3340,6 +3341,7 @@ mod tests {
                 stdin: Some(crate::UtilStdin::from_bytes(stdin)),
                 state: None,
                 network: None,
+                clock: None,
             };
             f(&mut ctx, argv)
         };
@@ -3365,6 +3367,7 @@ mod tests {
                 stdin: Some(crate::UtilStdin::from_reader(stdin)),
                 state: None,
                 network: None,
+                clock: None,
             };
             f(&mut ctx, argv)
         };

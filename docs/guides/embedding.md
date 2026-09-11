@@ -1,12 +1,12 @@
 # Embedding wasmsh in Your Application
 
-How to integrate the wasmsh runtime into a host application. There are
-three supported embedding paths, depending on your stack:
+How to integrate the wasmsh runtime into a host application. This fork has
+two primary embedding paths; Pyodide remains a separate legacy profile:
 
 | If your host is … | Use |
 |-------------------|-----|
 | Rust              | This page (`wasmsh-runtime` crate) |
-| Node.js, browser, TypeScript | [Pyodide integration](pyodide-integration.md) (npm package) |
+| Node.js, browser, TypeScript | [Standalone WASM embedding](standalone-embedding.md) |
 | Python            | [Python quickstart](../tutorials/python-quickstart.md) (`wasmsh-pyodide-runtime` package) |
 
 The rest of this page covers the Rust embedding path.
@@ -36,6 +36,7 @@ let mut rt = WorkerRuntime::new();
 rt.handle_command(HostCommand::Init {
     step_budget: 100_000,
     allowed_hosts: vec![],
+    network_policy: None,
 });
 ```
 
@@ -134,6 +135,7 @@ let mut rt = WorkerRuntime::new();
 rt.handle_command(HostCommand::Init {
     step_budget: 100_000,
     allowed_hosts: vec![],
+    network_policy: None,
 });
 
 rt.set_external_handler(Box::new(|name, argv, stdin| {
@@ -226,6 +228,11 @@ guidance:
 - **Cap the wasm module memory** at the host level. The runtime cannot
   prevent a script from allocating large strings inside the wasm heap.
 
+For the Node/browser API, fixed external registrations, progressive external
+process bridge, live clock callback, and structured network policy, see
+[Standalone WASM embedding](standalone-embedding.md). A runnable Node
+example is in [`examples/standalone/`](../../examples/standalone/).
+
 For the full enforcement story, see
 [Sandbox and capabilities](../reference/sandbox-and-capabilities.md).
 
@@ -237,5 +244,5 @@ For the full enforcement story, see
   what the sandbox enforces and what it does not.
 - [Adding a command](adding-commands.md) — when to add a builtin /
   utility / runtime intercept instead of an `ExternalCommandHandler`.
-- [Pyodide integration](pyodide-integration.md) — for the JS / Python
-  embedding paths.
+- [Pyodide integration](pyodide-integration.md) — for the separate legacy
+  JS / Python profile.

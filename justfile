@@ -130,7 +130,7 @@ build-standalone:
 
 # Run standalone browser E2E tests (Playwright)
 test-e2e-standalone:
-    cd e2e/standalone && npm install --silent && npx playwright test
+    cd e2e/standalone && npm ci --silent && npx playwright test
 
 # ── Pyodide Build + E2E ─────────────────────────────────────
 

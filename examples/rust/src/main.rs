@@ -23,6 +23,7 @@ fn main() {
     let _init_events = runtime.handle_command(HostCommand::Init {
         step_budget: 100_000,
         allowed_hosts: vec![],
+        network_policy: None,
     });
 
     // A small demonstration script exercising bash features that most

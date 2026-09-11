@@ -52,6 +52,7 @@ mod tests {
                 stdin: stdin.map(crate::UtilStdin::from_bytes),
                 state: None,
                 network: None,
+                clock: None,
             };
             func(&mut ctx, argv)
         };

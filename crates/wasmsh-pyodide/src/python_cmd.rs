@@ -171,7 +171,11 @@ fn read_stdin_code(stdin: Option<ExternalCommandStdin<'_>>) -> Option<String> {
         }
         data.extend_from_slice(&buffer[..read]);
     }
-    if data.is_empty() { None } else { Some(String::from_utf8_lossy(&data).into_owned()) }
+    if data.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&data).into_owned())
+    }
 }
 
 /// Read a script file from the Emscripten filesystem via libc.
@@ -252,7 +256,11 @@ mod tests {
 
     #[test]
     fn extract_code_prefers_c_flag() {
-        let argv = vec!["python3".to_string(), "-c".to_string(), "print(1)".to_string()];
+        let argv = vec![
+            "python3".to_string(),
+            "-c".to_string(),
+            "print(1)".to_string(),
+        ];
         assert_eq!(extract_code(&argv, None), Some("print(1)".to_string()));
     }
 

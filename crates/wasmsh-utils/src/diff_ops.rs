@@ -1350,6 +1350,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             util_diff(&mut ctx, argv)
         };
@@ -1370,6 +1371,7 @@ mod tests {
                 stdin: stdin.map(crate::UtilStdin::from_bytes),
                 state: None,
                 network: None,
+                clock: None,
             };
             util_patch(&mut ctx, argv)
         };

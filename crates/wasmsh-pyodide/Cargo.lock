@@ -1064,10 +1064,12 @@ dependencies = [
  "miniz_oxide",
  "posix-regex",
  "saphyr",
+ "serde",
  "sha1",
  "sha2",
  "url",
  "wasmsh-fs",
+ "wasmsh-protocol",
  "wasmsh-state",
  "zip",
 ]

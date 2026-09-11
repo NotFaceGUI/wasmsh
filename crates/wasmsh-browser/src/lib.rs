@@ -19,6 +19,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         let events = rt.handle_command(HostCommand::Run {
             input: input.into(),
@@ -62,6 +63,7 @@ mod tests {
         let events = rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         assert!(matches!(&events[0], WorkerEvent::Version(v) if v == PROTOCOL_VERSION));
     }
@@ -154,6 +156,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         let events = rt.handle_command(HostCommand::Cancel);
         assert!(matches!(
@@ -170,6 +173,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         // touch creates a file, then we write via protocol and cat it
         rt.handle_command(HostCommand::Run {
@@ -191,6 +195,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "mkdir /mydir".into(),
@@ -230,6 +235,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         let write_events = rt.handle_command(HostCommand::WriteFile {
             path: "/test.txt".into(),
@@ -251,6 +257,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::WriteFile {
             path: "/a.txt".into(),
@@ -274,6 +281,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         // echo hello > /out.txt should write to file, not stdout
         let events = rt.handle_command(HostCommand::Run {
@@ -294,6 +302,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "echo line1 > /log.txt".into(),
@@ -313,6 +322,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "> /empty.txt".into(),
@@ -331,6 +341,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         // Running an unknown command triggers a diagnostic in the VM
         let events = rt.handle_command(HostCommand::Run {
@@ -351,6 +362,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "X=hello".into(),
@@ -371,6 +383,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "readonly X=locked".into(),
@@ -425,6 +438,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         let events = rt.handle_command(HostCommand::Run {
             input: "> /created.txt".into(),
@@ -491,6 +505,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::WriteFile {
             path: "/big.txt".into(),
@@ -533,6 +548,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         let events = rt.handle_command(HostCommand::Run {
             input: "yes | tee /tee.txt | head -n 5".into(),
@@ -562,6 +578,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         let events = rt.handle_command(HostCommand::Run {
             input: "printf 'b\\na\\n' | sort | tee /sorted.txt | cat".into(),
@@ -704,6 +721,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 10000,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         // Simple loop that echoes 3 times using a counter variable
         let events = rt.handle_command(HostCommand::Run {
@@ -718,6 +736,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         let events = rt.handle_command(HostCommand::Run {
             input: "cat <<EOF\nhello world\nEOF\n".into(),
@@ -747,6 +766,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "greet() { echo hello $1; }".into(),
@@ -764,6 +784,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "X=outer".into(),
@@ -785,6 +806,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "X=outer".into(),
@@ -830,6 +852,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "X=outer".into(),
@@ -859,6 +882,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "touch /a.txt".into(),
@@ -890,6 +914,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "touch /ab".into(),
@@ -976,6 +1001,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         // Running a command that doesn't exist produces stderr
         let _events = rt.handle_command(HostCommand::Run {
@@ -995,6 +1021,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         // Redirections are applied left-to-right: stderr duplicates the original
         // stdout, then stdout is redirected to the file. The error stays visible.
@@ -1016,6 +1043,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         let _events = rt.handle_command(HostCommand::Run {
             input: "nonexistent_cmd &> /all.txt".into(),
@@ -1138,6 +1166,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         // Create a file
         rt.handle_command(HostCommand::Run {
@@ -1214,6 +1243,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "mkdir /testdir".into(),
@@ -1580,6 +1610,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         // Create a file that would match *.txt
         rt.handle_command(HostCommand::Run {
@@ -1599,6 +1630,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "touch /abc.txt".into(),
@@ -1691,6 +1723,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         let first = rt.handle_command(HostCommand::Run {
             input: "set -n".into(),
@@ -1730,6 +1763,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         let first = rt.handle_command(HostCommand::Run {
             input: "set -v".into(),
@@ -1826,6 +1860,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "mkdir -p /lib".into(),
@@ -1857,6 +1892,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "mkdir -p /lib".into(),
@@ -1963,6 +1999,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::WriteFile {
             path: "/test.sh".into(),
@@ -2184,6 +2221,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         // Create /bin directory and a script in it
         rt.handle_command(HostCommand::Run {
@@ -2381,6 +2419,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "mkdir /tmp2".into(),
@@ -2458,6 +2497,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::WriteFile {
             path: "/tmp3/file.jpg".into(),
@@ -2487,6 +2527,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::WriteFile {
             path: "/tmp4/a.txt".into(),
@@ -2515,6 +2556,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::WriteFile {
             path: "/tmp5/color".into(),
@@ -2540,6 +2582,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::WriteFile {
             path: "/project/a.txt".into(),
@@ -2569,6 +2612,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = rt.handle_command(HostCommand::Run {
@@ -2595,6 +2639,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = rt.handle_command(HostCommand::Run {
@@ -2611,6 +2656,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = rt.handle_command(HostCommand::Run {
@@ -2627,6 +2673,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = rt.handle_command(HostCommand::Run {
@@ -2643,6 +2690,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = rt.handle_command(HostCommand::Run {
@@ -2659,6 +2707,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = rt.handle_command(HostCommand::Run {
@@ -2680,6 +2729,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
 
         let events = rt.handle_command(HostCommand::Run {
@@ -2808,6 +2858,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "trap 'echo caught' TERM".into(),
@@ -2824,6 +2875,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "trap 'echo got15' TERM".into(),
@@ -2840,6 +2892,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "trap 'echo ok' TERM".into(),
@@ -2856,6 +2909,7 @@ mod tests {
         rt.handle_command(HostCommand::Init {
             step_budget: 0,
             allowed_hosts: vec![],
+            network_policy: None,
         });
         rt.handle_command(HostCommand::Run {
             input: "trap '' TERM".into(),
@@ -2872,13 +2926,454 @@ mod tests {
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_bindings {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
     use wasm_bindgen::prelude::*;
-    use wasmsh_protocol::HostCommand;
-    use wasmsh_utils::net_types::{
-        HostAllowlist, HttpRequest, HttpResponse, NetworkBackend, NetworkError,
+    use wasmsh_protocol::{
+        HostCommand, NetworkDefaultAction, NetworkPolicyConfig as ProtocolNetworkPolicyConfig,
     };
+    use wasmsh_runtime::{
+        ExternalCommandOptions, ExternalCommandResult, ExternalCommandSpec,
+        ExternalCommandSpecHandler, ExternalProcess, ExternalProcessPoll, ExternalProcessWrite,
+        ExternalStreamHandler,
+    };
+    use wasmsh_utils::net_types::{
+        validate_http_url, HttpRequest, HttpResponse, NetworkBackend, NetworkError,
+    };
+    use wasmsh_utils::{ClockError, ClockProvider, FixedClock, UnavailableClock, UtcDateTime};
 
     use crate::WorkerRuntime;
+
+    fn external_failure(status: i32, message: impl Into<String>) -> ExternalCommandResult {
+        ExternalCommandResult {
+            stdout: Vec::new(),
+            stderr: format!("wasmsh: {}\n", message.into()).into_bytes(),
+            status,
+        }
+    }
+
+    fn js_bytes(value: JsValue, field: &str) -> Result<Vec<u8>, String> {
+        if value.is_undefined() || value.is_null() {
+            return Ok(Vec::new());
+        }
+        if value.is_instance_of::<js_sys::Uint8Array>() {
+            return Ok(js_sys::Uint8Array::from(value).to_vec());
+        }
+        if value.is_instance_of::<js_sys::Array>() {
+            let array = js_sys::Array::from(&value);
+            let mut bytes = Vec::with_capacity(array.length() as usize);
+            for item in array.iter() {
+                let number = item
+                    .as_f64()
+                    .ok_or_else(|| format!("external {field} must contain byte numbers"))?;
+                if !number.is_finite() || number.fract() != 0.0 || !(0.0..=255.0).contains(&number)
+                {
+                    return Err(format!("external {field} contains an invalid byte"));
+                }
+                bytes.push(number as u8);
+            }
+            return Ok(bytes);
+        }
+        Err(format!("external {field} must be a Uint8Array"))
+    }
+
+    fn read_stdin(
+        mut stdin: Option<wasmsh_runtime::ExternalCommandStdin<'_>>,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let Some(mut stdin) = stdin.take() else {
+            return Ok(Vec::new());
+        };
+        let mut data = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            let read = stdin
+                .read_chunk(&mut buffer)
+                .map_err(|error| format!("external stdin read failed: {error}"))?;
+            if read == 0 {
+                return Ok(data);
+            }
+            if data.len() as u64 + read as u64 > max_bytes {
+                return Err(format!(
+                    "external stdin limit exceeded (limit {max_bytes} bytes)"
+                ));
+            }
+            data.extend_from_slice(&buffer[..read]);
+        }
+    }
+
+    fn js_external_handler(
+        executor: &Rc<RefCell<Option<js_sys::Function>>>,
+        spec: &ExternalCommandSpec,
+        argv: &[String],
+        stdin: Option<wasmsh_runtime::ExternalCommandStdin<'_>>,
+    ) -> ExternalCommandResult {
+        let Some(callback) = executor.borrow().clone() else {
+            return external_failure(
+                126,
+                "native external processes are not supported by this host",
+            );
+        };
+        let input = match read_stdin(stdin, spec.options.max_input_bytes) {
+            Ok(input) => input,
+            Err(error) => return external_failure(125, error),
+        };
+        let argv_js = js_sys::Array::new();
+        for arg in argv {
+            argv_js.push(&JsValue::from_str(arg));
+        }
+        let options_json = match serde_json::to_string(&spec.options) {
+            Ok(json) => json,
+            Err(error) => {
+                return external_failure(126, format!("invalid external options: {error}"))
+            }
+        };
+        let input_js = js_sys::Uint8Array::from(input.as_slice());
+        let result = match callback.call5(
+            &JsValue::UNDEFINED,
+            &JsValue::from_str(&spec.name),
+            &JsValue::from_str(&spec.executable),
+            argv_js.as_ref(),
+            input_js.as_ref(),
+            &JsValue::from_str(&options_json),
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let message = error
+                    .as_string()
+                    .unwrap_or_else(|| "JavaScript external executor threw".into());
+                return external_failure(126, format!("external host error: {message}"));
+            }
+        };
+        if !result.is_object() {
+            return external_failure(126, "external executor must return an object");
+        }
+        let status = match js_sys::Reflect::get(&result, &JsValue::from_str("status"))
+            .ok()
+            .and_then(|value| value.as_f64())
+        {
+            Some(value) if value.is_finite() && value.fract() == 0.0 => {
+                if value < i32::MIN as f64 || value > i32::MAX as f64 {
+                    return external_failure(126, "external status is outside the i32 range");
+                }
+                value as i32
+            }
+            _ => return external_failure(126, "external executor returned an invalid status"),
+        };
+        let stdout = match js_sys::Reflect::get(&result, &JsValue::from_str("stdout"))
+            .map_err(|_| "external executor result has no readable stdout".to_string())
+            .and_then(|value| js_bytes(value, "stdout"))
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return external_failure(126, error),
+        };
+        let stderr = match js_sys::Reflect::get(&result, &JsValue::from_str("stderr"))
+            .map_err(|_| "external executor result has no readable stderr".to_string())
+            .and_then(|value| js_bytes(value, "stderr"))
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return external_failure(126, error),
+        };
+        ExternalCommandResult {
+            stdout,
+            stderr,
+            status,
+        }
+    }
+
+    fn stream_request(
+        operation: &str,
+        process_id: &str,
+        spec: Option<&ExternalCommandSpec>,
+        argv: &[String],
+        data: &[u8],
+    ) -> Result<JsValue, String> {
+        let request = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &request,
+            &JsValue::from_str("operation"),
+            &JsValue::from_str(operation),
+        )
+        .map_err(|_| "could not build external stream request".to_string())?;
+        js_sys::Reflect::set(
+            &request,
+            &JsValue::from_str("process_id"),
+            &JsValue::from_str(process_id),
+        )
+        .map_err(|_| "could not build external stream request".to_string())?;
+        let command_name = spec.map_or("", |spec| spec.name.as_str());
+        let executable = spec.map_or("", |spec| spec.executable.as_str());
+        let options_json = spec
+            .map(|spec| serde_json::to_string(&spec.options))
+            .transpose()
+            .map_err(|error| format!("invalid external options: {error}"))?
+            .unwrap_or_else(|| "{}".into());
+        js_sys::Reflect::set(
+            &request,
+            &JsValue::from_str("command_name"),
+            &JsValue::from_str(command_name),
+        )
+        .map_err(|_| "could not build external stream request".to_string())?;
+        js_sys::Reflect::set(
+            &request,
+            &JsValue::from_str("executable"),
+            &JsValue::from_str(executable),
+        )
+        .map_err(|_| "could not build external stream request".to_string())?;
+        let argv_js = js_sys::Array::new();
+        for arg in argv {
+            argv_js.push(&JsValue::from_str(arg));
+        }
+        js_sys::Reflect::set(&request, &JsValue::from_str("argv"), argv_js.as_ref())
+            .map_err(|_| "could not build external stream request".to_string())?;
+        let data_js = js_sys::Uint8Array::from(data);
+        js_sys::Reflect::set(&request, &JsValue::from_str("data"), data_js.as_ref())
+            .map_err(|_| "could not build external stream request".to_string())?;
+        js_sys::Reflect::set(
+            &request,
+            &JsValue::from_str("options_json"),
+            &JsValue::from_str(&options_json),
+        )
+        .map_err(|_| "could not build external stream request".to_string())?;
+        Ok(request.into())
+    }
+
+    struct JsExternalProcess {
+        executor: Rc<RefCell<Option<js_sys::Function>>>,
+        process_id: String,
+    }
+
+    impl JsExternalProcess {
+        fn callback(&self) -> Result<js_sys::Function, String> {
+            self.executor
+                .borrow()
+                .clone()
+                .ok_or_else(|| "streaming external executor was cleared".into())
+        }
+
+        fn call(&self, operation: &str, data: &[u8]) -> Result<JsValue, String> {
+            let callback = self.callback()?;
+            let request = stream_request(operation, &self.process_id, None, &[], data)?;
+            callback
+                .call1(&JsValue::UNDEFINED, &request)
+                .map_err(|error| {
+                    error
+                        .as_string()
+                        .unwrap_or_else(|| "JavaScript streaming executor threw".into())
+                })
+        }
+
+        fn parse_number(value: JsValue, field: &str) -> Result<f64, String> {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite() && value.fract() == 0.0)
+                .ok_or_else(|| format!("external stream {field} must be an integer"))
+        }
+
+        fn start(
+            executor: &Rc<RefCell<Option<js_sys::Function>>>,
+            spec: &ExternalCommandSpec,
+            argv: &[String],
+        ) -> Result<Box<dyn ExternalProcess>, String> {
+            let callback = executor
+                .borrow()
+                .clone()
+                .ok_or_else(|| "streaming external executor is unavailable".to_string())?;
+            let request = stream_request("start", "", Some(spec), argv, &[])?;
+            let response = callback
+                .call1(&JsValue::UNDEFINED, &request)
+                .map_err(|error| {
+                    error
+                        .as_string()
+                        .unwrap_or_else(|| "JavaScript streaming executor threw".into())
+                })?;
+            let process_id = js_sys::Reflect::get(&response, &JsValue::from_str("process_id"))
+                .ok()
+                .and_then(|value| value.as_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "streaming external executor must synchronously return process_id".to_string()
+                })?;
+            Ok(Box::new(Self {
+                executor: executor.clone(),
+                process_id,
+            }))
+        }
+    }
+
+    impl ExternalProcess for JsExternalProcess {
+        fn write_stdin(&mut self, data: &[u8]) -> ExternalProcessWrite {
+            let response = match self.call("write_stdin", data) {
+                Ok(response) => response,
+                Err(_) => {
+                    return ExternalProcessWrite {
+                        accepted: 0,
+                        would_block: false,
+                        closed: true,
+                    }
+                }
+            };
+            let accepted = js_sys::Reflect::get(&response, &JsValue::from_str("accepted"))
+                .ok()
+                .and_then(|value| Self::parse_number(value, "accepted").ok())
+                .map(|value| value.max(0.0) as usize)
+                .unwrap_or(0);
+            let would_block = js_sys::Reflect::get(&response, &JsValue::from_str("would_block"))
+                .ok()
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let closed = js_sys::Reflect::get(&response, &JsValue::from_str("closed"))
+                .ok()
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            ExternalProcessWrite {
+                accepted,
+                would_block,
+                closed,
+            }
+        }
+
+        fn close_stdin(&mut self) {
+            let _ = self.call("close_stdin", &[]);
+        }
+
+        fn poll(&mut self) -> ExternalProcessPoll {
+            let response = match self.call("poll", &[]) {
+                Ok(response) => response,
+                Err(error) => {
+                    return ExternalProcessPoll {
+                        error: Some(error),
+                        ..ExternalProcessPoll::default()
+                    }
+                }
+            };
+            let stdout = js_sys::Reflect::get(&response, &JsValue::from_str("stdout"))
+                .ok()
+                .and_then(|value| js_bytes(value, "stdout").ok())
+                .unwrap_or_default();
+            let stderr = js_sys::Reflect::get(&response, &JsValue::from_str("stderr"))
+                .ok()
+                .and_then(|value| js_bytes(value, "stderr").ok())
+                .unwrap_or_default();
+            let optional_status = js_sys::Reflect::get(&response, &JsValue::from_str("status"))
+                .ok()
+                .filter(|value| !value.is_null() && !value.is_undefined())
+                .and_then(|value| Self::parse_number(value, "status").ok())
+                .and_then(|value| {
+                    (i32::MIN as f64..=i32::MAX as f64)
+                        .contains(&value)
+                        .then_some(value as i32)
+                });
+            let error = js_sys::Reflect::get(&response, &JsValue::from_str("error"))
+                .ok()
+                .and_then(|value| value.as_string());
+            ExternalProcessPoll {
+                stdout,
+                stderr,
+                stdout_eof: js_sys::Reflect::get(&response, &JsValue::from_str("stdout_eof"))
+                    .ok()
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                stderr_eof: js_sys::Reflect::get(&response, &JsValue::from_str("stderr_eof"))
+                    .ok()
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                status: optional_status,
+                stdin_writable: js_sys::Reflect::get(
+                    &response,
+                    &JsValue::from_str("stdin_writable"),
+                )
+                .ok()
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+                error,
+            }
+        }
+
+        fn cancel(&mut self) {
+            let _ = self.call("cancel", &[]);
+        }
+    }
+
+    struct JsClockProvider {
+        callback: js_sys::Function,
+    }
+
+    impl JsClockProvider {
+        fn callback_error(value: JsValue) -> ClockError {
+            ClockError::Callback(
+                value
+                    .as_string()
+                    .unwrap_or_else(|| "JavaScript exception".into()),
+            )
+        }
+
+        fn number(value: JsValue, label: &str) -> Result<f64, ClockError> {
+            let value = value
+                .as_f64()
+                .ok_or_else(|| ClockError::Callback(format!("{label} must return a number")))?;
+            if !value.is_finite() || value.fract() != 0.0 {
+                return Err(ClockError::Callback(format!(
+                    "{label} must return a finite integer"
+                )));
+            }
+            Ok(value)
+        }
+
+        /// Monotonic readings (`performance.now()`) are legitimately
+        /// fractional, unlike the integer Unix-millisecond wall clock.
+        fn monotonic_number(value: JsValue, label: &str) -> Result<f64, ClockError> {
+            let value = value
+                .as_f64()
+                .ok_or_else(|| ClockError::Callback(format!("{label} must return a number")))?;
+            if !value.is_finite() || value < 0.0 {
+                return Err(ClockError::Callback(format!(
+                    "{label} must return a finite non-negative number"
+                )));
+            }
+            Ok(value)
+        }
+    }
+
+    impl ClockProvider for JsClockProvider {
+        fn now_unix_ms(&self) -> Result<i64, ClockError> {
+            let value = self
+                .callback
+                .call0(&JsValue::UNDEFINED)
+                .map_err(Self::callback_error)?;
+            let value = Self::number(value, "clock callback")?;
+            if value.abs() > 9_007_199_254_740_991.0 {
+                return Err(ClockError::Callback(
+                    "clock callback result exceeds JavaScript safe integer range".into(),
+                ));
+            }
+            let value = value as i64;
+            UtcDateTime::from_unix_ms(value)
+                .map(|_| value)
+                .map_err(|error| ClockError::Callback(error.to_string()))
+        }
+
+        fn monotonic_now_ms(&self) -> Result<u64, ClockError> {
+            let global = js_sys::global();
+            let performance = js_sys::Reflect::get(&global, &JsValue::from_str("performance"))
+                .map_err(Self::callback_error)?;
+            let now = js_sys::Reflect::get(&performance, &JsValue::from_str("now"))
+                .map_err(Self::callback_error)?
+                .dyn_into::<js_sys::Function>()
+                .map_err(|_| ClockError::Callback("performance.now is unavailable".into()))?;
+            let value = now.call0(&performance).map_err(Self::callback_error)?;
+            let value = Self::monotonic_number(value, "performance.now")?;
+            if value > u64::MAX as f64 {
+                return Err(ClockError::Callback(
+                    "performance.now returned an unsupported value".into(),
+                ));
+            }
+            // Truncate sub-millisecond precision instead of rejecting the
+            // reading; browsers and Node both return fractional values.
+            Ok(value.floor() as u64)
+        }
+    }
 
     // JS function provided by the worker scope for synchronous HTTP.
     #[wasm_bindgen]
@@ -2892,24 +3387,43 @@ mod wasm_bindings {
             body: &[u8],
             body_len: u32,
             follow_redirects: bool,
+            options_json: &str,
         ) -> JsValue;
     }
 
-    /// Network backend using synchronous `XMLHttpRequest` in a Web Worker.
+    /// Browser backend. Synchronous XHR is deliberately not treated as a
+    /// trusted broker because it cannot disable automatic redirects.
     struct BrowserNetworkBackend {
-        allowlist: HostAllowlist,
+        trusted_broker: bool,
+        /// Shared with `WasmShell`. Only set once a configuration has been
+        /// validated and accepted by the runtime. While false every request is
+        /// refused, so a rejected or mis-ordered initialization can never
+        /// leave an allow-all transport reachable.
+        policy_ready: Rc<Cell<bool>>,
     }
 
     impl NetworkBackend for BrowserNetworkBackend {
-        fn check_url(&self, url: &str) -> Result<(), NetworkError> {
-            self.allowlist.check(url)
-        }
-
         fn fetch(&self, request: &HttpRequest) -> Result<HttpResponse, NetworkError> {
-            self.allowlist.check(&request.url)?;
+            if !self.policy_ready.get() {
+                return Err(NetworkError::HostDenied(
+                    "network policy was not initialized; refusing request".into(),
+                ));
+            }
+            if !self.trusted_broker {
+                return Err(NetworkError::Other(
+                    "standalone browser network requires a trusted redirect-aware broker; synchronous XHR is refused".into(),
+                ));
+            }
 
             let headers_json =
                 serde_json::to_string(&request.headers).unwrap_or_else(|_| "[]".into());
+            let options_json = serde_json::json!({
+                "timeout_ms": request.timeout_ms,
+                "connect_timeout_ms": request.connect_timeout_ms,
+                "max_redirs": request.max_redirs,
+                "max_response_bytes": request.max_response_bytes,
+            })
+            .to_string();
             let body = request.body.as_deref().unwrap_or(&[]);
             let body_len = body.len() as u32;
 
@@ -2920,6 +3434,7 @@ mod wasm_bindings {
                 body,
                 body_len,
                 request.follow_redirects,
+                &options_json,
             );
 
             // Parse the JS result object.
@@ -2947,7 +3462,32 @@ mod wasm_bindings {
             // Check for error field (connection failure, etc.)
             if let Ok(err_val) = js_sys::Reflect::get(&result, &"error".into()) {
                 if let Some(err_msg) = err_val.as_string() {
-                    return Err(NetworkError::ConnectionFailed(err_msg));
+                    let reason = js_sys::Reflect::get(&result, &"error_reason".into())
+                        .ok()
+                        .and_then(|value| value.as_string())
+                        .unwrap_or_default();
+                    return Err(match reason.as_str() {
+                        "timeout" => NetworkError::Timeout(err_msg),
+                        "response_too_large" | "response_overflow" | "payload_too_large" => {
+                            NetworkError::ResponseTooLarge(err_msg)
+                        }
+                        "invalid_url" => NetworkError::InvalidUrl(err_msg),
+                        "host_denied" => NetworkError::HostDenied(err_msg),
+                        "too_many_redirects" => NetworkError::TooManyRedirects(err_msg),
+                        _ if err_msg.to_ascii_lowercase().contains("timeout") => {
+                            NetworkError::Timeout(err_msg)
+                        }
+                        _ => NetworkError::ConnectionFailed(err_msg),
+                    });
+                }
+            }
+
+            if let Some(limit) = request.max_response_bytes {
+                if body_bytes.len() as u64 > limit {
+                    return Err(NetworkError::ResponseTooLarge(format!(
+                        "response has {} bytes, limit is {limit}",
+                        body_bytes.len()
+                    )));
                 }
             }
 
@@ -2957,6 +3497,17 @@ mod wasm_bindings {
                 body: body_bytes,
             })
         }
+
+        fn check_url(&self, url: &str) -> Result<(), NetworkError> {
+            if !self.policy_ready.get() {
+                return Err(NetworkError::HostDenied(
+                    "network policy was not initialized; refusing request".into(),
+                ));
+            }
+            // The runtime's policy wrapper owns concrete rule matching; this
+            // backend only gates on a validated policy being present.
+            validate_http_url(url)
+        }
     }
 
     /// Browser-facing shell instance exposed via `wasm-bindgen`.
@@ -2964,6 +3515,13 @@ mod wasm_bindings {
     #[allow(missing_debug_implementations)]
     pub struct WasmShell {
         runtime: WorkerRuntime,
+        trusted_network_broker: bool,
+        /// True only after `init` has validated a network configuration and
+        /// the runtime accepted it. Gates the browser transport so a rejected
+        /// or absent configuration fails closed.
+        network_policy_ready: Rc<Cell<bool>>,
+        external_executor: Rc<RefCell<Option<js_sys::Function>>>,
+        external_stream_executor: Rc<RefCell<Option<js_sys::Function>>>,
     }
 
     #[wasm_bindgen]
@@ -2972,9 +3530,115 @@ mod wasm_bindings {
         #[wasm_bindgen(constructor)]
         pub fn new() -> Self {
             console_error_panic_hook::set_once();
+            let external_executor = Rc::new(RefCell::new(None));
+            let external_stream_executor = Rc::new(RefCell::new(None));
+            let mut runtime = WorkerRuntime::new();
+            let executor_state = external_executor.clone();
+            let handler: ExternalCommandSpecHandler = Box::new(move |spec, argv, stdin| {
+                Some(js_external_handler(&executor_state, spec, argv, stdin))
+            });
+            runtime.set_external_spec_handler(handler);
+            let stream_executor_state = external_stream_executor.clone();
+            let stream_handler: ExternalStreamHandler = Box::new(move |spec, argv| {
+                JsExternalProcess::start(&stream_executor_state, spec, argv)
+            });
+            runtime.set_external_stream_handler(stream_handler);
             Self {
-                runtime: WorkerRuntime::new(),
+                runtime,
+                trusted_network_broker: false,
+                network_policy_ready: Rc::new(Cell::new(false)),
+                external_executor,
+                external_stream_executor,
             }
+        }
+
+        /// Mark the installed host fetch function as a trusted broker.
+        ///
+        /// The caller must provide a broker that disables automatic
+        /// redirects, applies policy before every hop, enforces time and
+        /// response limits while reading, and strips cross-origin secrets.
+        /// The default is false because browser XHR cannot satisfy that
+        /// contract. The standalone XHR fixture intentionally remains
+        /// refused.
+        pub fn set_trusted_network_broker(&mut self, trusted: bool) {
+            self.trusted_network_broker = trusted;
+        }
+
+        /// Register a synchronous JavaScript wall-clock callback returning
+        /// integer Unix milliseconds. The callback is owned by this shell.
+        pub fn set_clock_callback(&mut self, callback: js_sys::Function) {
+            self.runtime
+                .set_clock_provider(Box::new(JsClockProvider { callback }));
+        }
+
+        /// Remove the clock capability. Date and SigV4 then fail rather than
+        /// falling back to a startup timestamp or a fabricated default.
+        pub fn clear_clock_callback(&mut self) {
+            self.runtime.set_clock_provider(Box::new(UnavailableClock));
+        }
+
+        /// Install an explicit fixed wall clock for deterministic embedding
+        /// tests. This is not used by the default worker bootstrap.
+        pub fn set_fixed_time_ms(&mut self, unix_ms: i64) -> Result<(), JsValue> {
+            let clock =
+                FixedClock::new(unix_ms).map_err(|error| JsValue::from_str(&error.to_string()))?;
+            self.runtime.set_clock_provider(Box::new(clock));
+            Ok(())
+        }
+
+        /// Install a synchronous external executor. The callback receives
+        /// `(command_name, fixed_executable, argv, stdin_bytes, options_json)`
+        /// and must return `{status, stdout, stderr}` with byte arrays. It
+        /// must not invoke a shell or return a Promise.
+        pub fn set_external_executor(&mut self, callback: js_sys::Function) {
+            *self.external_executor.borrow_mut() = Some(callback);
+        }
+
+        /// Remove the external executor. Registered commands then fail with
+        /// status 126 because this host cannot start native processes.
+        pub fn clear_external_executor(&mut self) {
+            *self.external_executor.borrow_mut() = None;
+        }
+
+        /// Install a synchronous operation callback for progressive external
+        /// processes. It receives one request object with `operation` equal
+        /// to `start`, `write_stdin`, `close_stdin`, `poll`, or `cancel`.
+        /// The callback must return immediately; it must never return a Promise.
+        pub fn set_external_stream_executor(&mut self, callback: js_sys::Function) {
+            *self.external_stream_executor.borrow_mut() = Some(callback);
+        }
+
+        /// Remove the progressive external process callback.
+        pub fn clear_external_stream_executor(&mut self) {
+            *self.external_stream_executor.borrow_mut() = None;
+        }
+
+        /// Register or replace a fixed executable external command.
+        /// `options_json` must be an object matching `ExternalCommandOptions`.
+        pub fn register_external(
+            &mut self,
+            name: &str,
+            executable: &str,
+            options_json: &str,
+        ) -> Result<(), JsValue> {
+            let options: ExternalCommandOptions =
+                serde_json::from_str(options_json).map_err(|error| {
+                    JsValue::from_str(&format!("invalid external options: {error}"))
+                })?;
+            self.runtime
+                .register_external(name, executable, options)
+                .map_err(|error| JsValue::from_str(&error))
+        }
+
+        /// Unregister an external command and return whether it existed.
+        pub fn unregister_external(&mut self, name: &str) -> bool {
+            self.runtime.unregister_external(name)
+        }
+
+        /// Return registered external command names as a JSON array.
+        pub fn external_commands(&self) -> String {
+            serde_json::to_string(&self.runtime.external_command_names())
+                .unwrap_or_else(|_| "[]".into())
         }
 
         /// Initialize the shell with a step budget and a network allowlist.
@@ -2982,19 +3646,62 @@ mod wasm_bindings {
         /// An empty allowlist creates a backend that denies every host, so
         /// callers get a `host denied` error instead of `network access not
         /// available`.  Returns a JSON array of events.
-        pub fn init(&mut self, step_budget: u64, allowed_hosts_json: &str) -> String {
-            let allowed_hosts: Vec<String> =
-                serde_json::from_str(allowed_hosts_json).unwrap_or_default();
-
+        pub fn init(&mut self, step_budget: u64, network_config_json: &str) -> String {
+            // Re-initialization must never leave a previously accepted policy
+            // reachable if the new configuration is rejected.
+            self.network_policy_ready.set(false);
             let backend = BrowserNetworkBackend {
-                allowlist: HostAllowlist::new(allowed_hosts.clone()),
+                trusted_broker: self.trusted_network_broker,
+                policy_ready: self.network_policy_ready.clone(),
             };
             self.runtime.set_network_backend(Box::new(backend));
+
+            let (allowed_hosts, network_policy) = match parse_network_config(network_config_json) {
+                Ok(config) => config,
+                Err(error) => {
+                    return serde_json::to_string(&[wasmsh_protocol::WorkerEvent::Diagnostic(
+                        wasmsh_protocol::DiagnosticLevel::Error,
+                        format!("invalid network configuration: {error}"),
+                    )])
+                    .unwrap_or_else(|_| "[]".into());
+                }
+            };
+
+            // Validate rules here as well as in the runtime so an invalid
+            // pattern is rejected before any transport is marked usable.
+            let resolved = network_policy
+                .clone()
+                .unwrap_or_else(|| ProtocolNetworkPolicyConfig {
+                    enabled: !allowed_hosts.is_empty(),
+                    default_action: NetworkDefaultAction::Deny,
+                    allow: allowed_hosts.clone(),
+                    deny: Vec::new(),
+                });
+            if let Err(error) = wasmsh_utils::NetworkPolicy::try_from_config(resolved) {
+                return serde_json::to_string(&[wasmsh_protocol::WorkerEvent::Diagnostic(
+                    wasmsh_protocol::DiagnosticLevel::Error,
+                    format!("invalid network policy: {error}"),
+                )])
+                .unwrap_or_else(|_| "[]".into());
+            }
 
             let events = self.runtime.handle_command(HostCommand::Init {
                 step_budget,
                 allowed_hosts,
+                network_policy,
             });
+            let rejected = events.iter().any(|event| {
+                matches!(
+                    event,
+                    wasmsh_protocol::WorkerEvent::Diagnostic(
+                        wasmsh_protocol::DiagnosticLevel::Error,
+                        _
+                    )
+                )
+            });
+            if !rejected {
+                self.network_policy_ready.set(true);
+            }
             serde_json::to_string(&events).unwrap_or_default()
         }
 
@@ -3004,6 +3711,21 @@ mod wasm_bindings {
             let events = self.runtime.handle_command(HostCommand::Run {
                 input: input.to_string(),
             });
+            serde_json::to_string(&events).unwrap_or_default()
+        }
+
+        /// Start a progressive execution. Poll with `poll_run` until an Exit
+        /// event is returned. This is required for streaming external commands.
+        pub fn start_run(&mut self, input: &str) -> String {
+            let events = self.runtime.handle_command(HostCommand::StartRun {
+                input: input.to_string(),
+            });
+            serde_json::to_string(&events).unwrap_or_default()
+        }
+
+        /// Advance a progressive execution without blocking for external I/O.
+        pub fn poll_run(&mut self) -> String {
+            let events = self.runtime.handle_command(HostCommand::PollRun);
             serde_json::to_string(&events).unwrap_or_default()
         }
 
@@ -3045,5 +3767,39 @@ mod wasm_bindings {
             });
             serde_json::to_string(&events).unwrap_or_default()
         }
+    }
+
+    fn parse_network_config(
+        raw: &str,
+    ) -> Result<(Vec<String>, Option<ProtocolNetworkPolicyConfig>), String> {
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| format!("JSON must be an array or object: {error}"))?;
+        let object = match value {
+            serde_json::Value::Array(_) => {
+                let allowed_hosts = serde_json::from_value(value)
+                    .map_err(|error| format!("allowed_hosts must be a string array: {error}"))?;
+                return Ok((allowed_hosts, None));
+            }
+            serde_json::Value::Object(object) => object,
+            _ => return Err("network configuration must be an array or object".into()),
+        };
+        let has_old = object.contains_key("allowed_hosts");
+        let has_nested = object.contains_key("network_policy");
+        if has_old && has_nested {
+            return Err("network_policy and allowed_hosts cannot both be configured".into());
+        }
+        if let Some(policy) = object.get("network_policy") {
+            let policy = serde_json::from_value(policy.clone())
+                .map_err(|error| format!("invalid network_policy: {error}"))?;
+            return Ok((Vec::new(), Some(policy)));
+        }
+        if let Some(allowed_hosts) = object.get("allowed_hosts") {
+            let allowed_hosts = serde_json::from_value(allowed_hosts.clone())
+                .map_err(|error| format!("allowed_hosts must be a string array: {error}"))?;
+            return Ok((allowed_hosts, None));
+        }
+        let policy = serde_json::from_value(serde_json::Value::Object(object))
+            .map_err(|error| format!("invalid network_policy: {error}"))?;
+        Ok((Vec::new(), Some(policy)))
     }
 }

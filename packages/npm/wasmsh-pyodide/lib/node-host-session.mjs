@@ -61,10 +61,17 @@ export class RequestClient {
   }
 
   async init(options = {}) {
+    const hasAllowedHosts = Object.hasOwn(options, "allowedHosts") && options.allowedHosts !== undefined;
+    const hasNetworkPolicy = Object.hasOwn(options, "networkPolicy") && options.networkPolicy !== undefined;
+    if (hasAllowedHosts && hasNetworkPolicy) {
+      throw new Error("networkPolicy and allowedHosts cannot both be configured");
+    }
     return this._sendRequest("init", {
       stepBudget: options.stepBudget ?? 0,
       initialFiles: normalizeInitialFiles(options.initialFiles),
-      allowedHosts: options.allowedHosts ?? [],
+      ...(hasNetworkPolicy
+        ? { networkPolicy: options.networkPolicy }
+        : { allowedHosts: options.allowedHosts ?? [] }),
     });
   }
 

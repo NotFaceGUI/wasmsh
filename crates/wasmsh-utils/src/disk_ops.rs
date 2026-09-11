@@ -349,6 +349,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             func(&mut ctx, argv)
         };

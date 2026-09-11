@@ -17,6 +17,35 @@
 /// Protocol version string.
 pub const PROTOCOL_VERSION: &str = "0.1.0";
 
+/// The default action for a structured network policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkDefaultAction {
+    /// Reject targets that match neither list.
+    #[default]
+    Deny,
+    /// Allow targets that match neither list.
+    Allow,
+}
+
+/// JSON-compatible structured network policy used by `HostCommand::Init`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkPolicyConfig {
+    /// Whether network access is enabled. Defaults to disabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Action for targets matching neither list.
+    #[serde(default)]
+    pub default_action: NetworkDefaultAction,
+    /// Allow rules.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Deny rules, always evaluated before allow rules.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
 /// A command sent from the host to the worker.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
@@ -31,6 +60,10 @@ pub enum HostCommand {
         /// IP (`192.168.1.100`), host with port (`api.example.com:8080`).
         #[serde(default)]
         allowed_hosts: Vec<String>,
+        /// Structured network policy. When present, it takes precedence over
+        /// `allowed_hosts`; supplying both is rejected by runtime adapters.
+        #[serde(default)]
+        network_policy: Option<NetworkPolicyConfig>,
     },
     /// Execute a shell command string.
     Run {

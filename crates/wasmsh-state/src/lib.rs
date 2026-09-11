@@ -170,6 +170,11 @@ pub struct ShellState {
     /// PRNG seed for `$RANDOM` (`XorShift32`). Uses `Cell` so `get_var` can remain `&self`.
     pub random_seed: Cell<u32>,
     /// Seconds elapsed since shell start ($SECONDS).
+    ///
+    /// Runtime embeddings update this from their monotonic clock before each
+    /// top-level execution. The native fallback remains available for direct
+    /// state users.
+    pub seconds_elapsed_ms: Cell<Option<u64>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub start_time: std::time::Instant,
     /// Function call stack for $FUNCNAME.
@@ -201,6 +206,7 @@ impl ShellState {
             cwd: "/".into(),
             lineno: 0,
             random_seed: Cell::new(12345),
+            seconds_elapsed_ms: Cell::new(None),
             #[cfg(not(target_arch = "wasm32"))]
             start_time: std::time::Instant::now(),
             func_stack: Vec::new(),
@@ -251,8 +257,16 @@ impl ShellState {
         }
     }
 
+    /// Update `$SECONDS` from a monotonic elapsed millisecond reading.
+    pub fn set_monotonic_elapsed_ms(&self, elapsed_ms: u64) {
+        self.seconds_elapsed_ms.set(Some(elapsed_ms));
+    }
+
     #[allow(clippy::unused_self)] // self.start_time used on non-wasm targets
     fn seconds_value(&self) -> SmolStr {
+        if let Some(elapsed_ms) = self.seconds_elapsed_ms.get() {
+            return SmolStr::from((elapsed_ms / 1_000).to_string());
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             SmolStr::from(self.start_time.elapsed().as_secs().to_string())

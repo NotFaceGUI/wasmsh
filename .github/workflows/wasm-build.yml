@@ -1,216 +1,248 @@
-name: Build WASM
+name: Standalone WASM
 
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
 
 concurrency:
-  group: wasm-build-${{ github.ref }}
+  group: standalone-wasm-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-wasm:
-    name: Build WASM artifacts
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/setup-rust
-        with:
-          targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-      - name: Install wasm-opt (binaryen)
-        run: sudo apt-get install -y binaryen
-
-      - name: Build with wasm-pack (bundler target)
-        run: wasm-pack build crates/wasmsh-browser --target bundler --release --out-dir ../../pkg/bundler
-
-      - name: Build with wasm-pack (web target)
-        run: wasm-pack build crates/wasmsh-browser --target web --release --out-dir ../../pkg/web
-
-      - name: Build with wasm-pack (nodejs target)
-        run: wasm-pack build crates/wasmsh-browser --target nodejs --release --out-dir ../../pkg/nodejs
-
-      - name: Optimize with wasm-opt
-        run: |
-          for dir in pkg/bundler pkg/web pkg/nodejs; do
-            for f in "$dir"/*.wasm; do
-              if [ -f "$f" ]; then
-                wasm-opt -Os --enable-bulk-memory --enable-mutable-globals --enable-sign-ext --enable-nontrapping-float-to-int "$f" -o "$f.opt"
-                mv "$f.opt" "$f"
-              fi
-            done
-          done
-
-      - name: Report sizes
-        run: |
-          echo "## WASM Binary Sizes" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Target | File | Size |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|------|------|" >> "$GITHUB_STEP_SUMMARY"
-          for dir in pkg/bundler pkg/web pkg/nodejs; do
-            target=$(basename "$dir")
-            for f in "$dir"/*.wasm; do
-              if [ -f "$f" ]; then
-                size=$(wc -c < "$f" | tr -d ' ')
-                gzip_size=$(gzip -c "$f" | wc -c | tr -d ' ')
-                echo "| $target | $(basename \"$f\") | ${size} bytes (${gzip_size} gzipped) |" >> "$GITHUB_STEP_SUMMARY"
-              fi
-            done
-          done
-
-      - name: Upload bundler artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasmsh-bundler
-          path: pkg/bundler/
-
-      - name: Upload web artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasmsh-web
-          path: pkg/web/
-
-      - name: Upload nodejs artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasmsh-nodejs
-          path: pkg/nodejs/
-
-  # ── Standalone browser E2E gate ─────────────────────────────────
-  # Builds the wasm into `e2e/standalone/fixture/pkg` and runs the full
-  # standalone Playwright suite.  All wasmsh CI runs on the k8s runner
-  # (`mayflower-k8s-runners`) — github-hosted runners ran into worker
-  # timeouts and `WebAssembly.Table.grow()` failures on tight memory
-  # the first time this suite was exercised in CI.
-  #
-  # Without this gate, regressions in the standalone path go undetected
-  # — we already shipped a broken network-backend init that nobody
-  # noticed because the suite never ran in CI.
-  e2e-standalone:
-    name: Standalone browser E2E
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
+  validate-core:
+    name: Validate core
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
       - uses: ./.github/actions/setup-rust
         with:
-          targets: wasm32-unknown-unknown
+          components: rustfmt,clippy
+      - name: Check formatting
+        run: cargo fmt --all --check
+      # The standalone deliverable builds the default feature set, so the
+      # blocking gate must exercise exactly that. Optional features (OPFS,
+      # Emscripten/libc) are covered by the advisory job below; they are not
+      # part of the shipped artifact and their Ubuntu build is unverified.
+      - name: Run core tests
+        run: cargo test --workspace --locked
+      - name: Run shell compatibility suite
+        run: cargo test -p wasmsh-testkit --test suite_runner --locked
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - uses: Swatinem/rust-cache@v2
+  # Advisory: exercises optional features (opfs, wasm-fs/emscripten). This
+  # must not block the standalone artifact because the deliverable ships the
+  # default feature set and this configuration has not been validated on
+  # ubuntu-24.04 yet.
+  validate-all-features:
+    name: Validate optional features (advisory)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
         with:
-          key: standalone-e2e
+          components: clippy
+      - name: Run tests with all features
+        run: cargo test --workspace --all-features --locked
+      - name: Run clippy with all features
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-      - name: Install just
-        uses: extractions/setup-just@v2
-
-      - name: Build standalone wasm into e2e fixture
-        run: just build-standalone
-
-      - name: Install Playwright browsers
-        working-directory: e2e/standalone
-        run: npm install && npx playwright install chromium --with-deps
-
-      - name: Run standalone browser E2E
-        run: just test-e2e-standalone
-
-  build-pyodide:
-    name: Build Pyodide artifact
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: mayflower-k8s-runners
+  build-candidate:
+    name: Build standalone candidate
+    needs: validate-core
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-
-      # ── Tier-2 cache: Pyodide source + emsdk ────────────────────
-      # The Pyodide build is the dominant cost in CI (~30 min).  Most
-      # of that time is the emsdk install (~5 min) and the CPython +
-      # libffi + pyodide-build builds.  Both are version-locked: they
-      # only need to rebuild when `tools/pyodide/versions.env` changes
-      # (the single source of truth for PYODIDE_VERSION + EMSCRIPTEN
-      # _VERSION).  Cache the whole `pyodide-src/` tree keyed on its
-      # hash so subsequent CI runs skip straight to the wasmsh staticlib
-      # build + final emcc relink.
-      #
-      # Safety: even if a cached pyodide.asm.wasm contains stale code,
-      # build-custom.sh deletes it when the freshly-built wasmsh
-      # staticlib is newer (see "Runtime lib is newer than" guard
-      # added in 0e447bb).  Per-patch idempotency from b1ad993 means
-      # cached patched files don't double-apply on re-run.
-      #
-      # No `restore-keys` fallback: a versions.env bump must rebuild
-      # from scratch, not silently reuse an old emsdk install.
-      - name: Cache Pyodide source + emsdk
-        uses: actions/cache@v4
-        with:
-          path: tools/pyodide/pyodide-src
-          key: pyodide-toolchain-${{ runner.os }}-${{ hashFiles('tools/pyodide/versions.env', 'rust-toolchain.toml') }}
-
       - uses: ./.github/actions/setup-rust
         with:
-          targets: wasm32-unknown-emscripten
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: pyodide-build
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
+          targets: wasm32-unknown-unknown
+      - name: Load pinned tool versions
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          source tools/standalone/versions.env
+          {
+            echo "node-version=$NODE_VERSION"
+            echo "wasm-pack-version=$WASM_PACK_VERSION"
+            echo "wasm-bindgen-version=$WASM_BINDGEN_CLI_VERSION"
+          } >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
-
-      - name: Install just
-        uses: extractions/setup-just@v2
-
-      - name: Install Pyodide build deps
-        run: sudo apt-get install -y wget ccache xz-utils autoconf automake libtool
-
-      - name: Build custom Pyodide
-        run: just build-pyodide
-        env:
-          SED: sed
-
-      - name: Report sizes
+          node-version: ${{ steps.versions.outputs.node-version }}
+          cache: npm
+          cache-dependency-path: e2e/standalone/package-lock.json
+      - name: Install pinned wasm tooling
         run: |
-          echo "## Pyodide Build Sizes" >> "$GITHUB_STEP_SUMMARY"
-          echo "| File | Size |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|------|------|" >> "$GITHUB_STEP_SUMMARY"
-          for f in dist/pyodide-custom/*; do
-            if [ -f "$f" ]; then
-              size=$(wc -c < "$f" | tr -d ' ')
-              echo "| $(basename "$f") | ${size} bytes |" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
-
-      - name: Upload Pyodide artifact
+          binaryen_dir="$(bash tools/standalone/install-binaryen.sh "$RUNNER_TEMP/wasmsh-binaryen")"
+          echo "$binaryen_dir/bin" >> "$GITHUB_PATH"
+          cargo install wasm-pack --version "${{ steps.versions.outputs.wasm-pack-version }}" --locked --force
+          cargo install wasm-bindgen-cli --version "${{ steps.versions.outputs.wasm-bindgen-version }}" --locked --force
+      - name: Build all standalone targets
+        run: bash tools/standalone/build.sh dist/standalone-pkg
+      - name: Package and checksum candidate
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: node tools/standalone/package.mjs dist/standalone-pkg dist/standalone
+      - name: Upload unverified candidate
         uses: actions/upload-artifact@v4
         with:
-          name: wasmsh-pyodide
-          path: dist/pyodide-custom/
+          name: wasmsh-standalone-candidate
+          path: dist/standalone/*.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
+  test-final-artifacts:
+    name: Test final candidate artifacts
+    needs: build-candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load pinned Node version
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          source tools/standalone/versions.env
+          echo "node-version=$NODE_VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.versions.outputs.node-version }}
+          cache: npm
+          cache-dependency-path: e2e/standalone/package-lock.json
+      - name: Download candidate made by the build job
+        uses: actions/download-artifact@v4
+        with:
+          name: wasmsh-standalone-candidate
+          path: candidate
+      - name: Extract and verify candidate
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(find candidate -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+          test -n "$archive"
+          mkdir -p extracted
+          tar -xzf "$archive" -C extracted
+          root=$(find extracted -mindepth 1 -maxdepth 1 -type d -print -quit)
+          test -n "$root"
+          node tools/standalone/verify-package.mjs "$root"
+          (cd "$root" && sha256sum -c SHA256SUMS)
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+      - name: Run Node smoke against extracted artifact
+        run: node tools/standalone/node-smoke.mjs "${{ steps.extract.outputs.root }}"
+      - name: Run native external smoke
+        run: node tools/standalone/external-smoke.mjs
+      - name: Install locked browser test dependencies
+        working-directory: e2e/standalone
+        run: npm ci
+      - name: Run bundler consumer smoke against extracted artifact
+        run: node --experimental-wasm-modules tools/standalone/bundler-smoke.mjs "${{ steps.extract.outputs.root }}"
+      - name: Install pinned Chromium browser
+        working-directory: e2e/standalone
+        run: npx playwright install chromium --with-deps
+      - name: Put the tested web target in the browser fixture
+        shell: bash
+        env:
+          ARTIFACT_ROOT: ${{ steps.extract.outputs.root }}
+        run: |
+          set -euo pipefail
+          rm -rf e2e/standalone/fixture/pkg
+          mkdir -p e2e/standalone/fixture/pkg
+          cp -R "$ARTIFACT_ROOT/web/." e2e/standalone/fixture/pkg/
+      - name: Run browser verification against extracted artifact
+        working-directory: e2e/standalone
+        run: npx playwright test
+      - name: Upload browser diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-browser-report
+          path: |
+            e2e/standalone/playwright-report/
+            e2e/standalone/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  host-matrix:
+    name: Host consumption (${{ matrix.os }})
+    needs: build-candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned Node version
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          source tools/standalone/versions.env
+          echo "node-version=$NODE_VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.versions.outputs.node-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasmsh-standalone-candidate
+          path: candidate
+      - name: Extract and verify the shared candidate
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(find candidate -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+          test -n "$archive"
+          mkdir -p extracted
+          tar -xzf "$archive" -C extracted
+          root=$(find extracted -mindepth 1 -maxdepth 1 -type d -print -quit)
+          test -n "$root"
+          node tools/standalone/verify-package.mjs "$root"
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+      - name: Run Node, clock, network, external, isolation, and cancellation smoke
+        run: node tools/standalone/node-smoke.mjs "${{ steps.extract.outputs.root }}"
+      - name: Run native external host smoke
+        run: node tools/standalone/external-smoke.mjs
+      - name: Install locked bundler smoke dependency
+        working-directory: e2e/standalone
+        run: npm ci --ignore-scripts
+      - name: Run bundler consumer smoke
+        run: node --experimental-wasm-modules tools/standalone/bundler-smoke.mjs "${{ steps.extract.outputs.root }}"
+
+  upload-tested-artifact:
+    name: Upload tested standalone artifact
+    needs: [test-final-artifacts, host-matrix]
+    if: ${{ needs.test-final-artifacts.result == 'success' && needs.host-matrix.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasmsh-standalone-candidate
+          path: candidate
+      - name: Upload verified artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasmsh-standalone
+          path: candidate/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30

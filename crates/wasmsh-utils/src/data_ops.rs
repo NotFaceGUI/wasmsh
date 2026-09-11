@@ -283,12 +283,24 @@ fn expr_eval_binary(ctx: &mut UtilContext<'_>, args: &[&str]) -> i32 {
     }
 }
 
-fn expr_match(ctx: &mut UtilContext<'_>, string: &str, _pattern: &str) -> i32 {
-    // Simple match: return length of match at start of string
-    // Full regex not implemented; return length of string if pattern starts with '.'
-    // For basic support, match literal prefix
-    let len = i64::try_from(string.len()).unwrap_or(i64::MAX);
-    expr_emit_result(ctx, len)
+fn expr_match(ctx: &mut UtilContext<'_>, string: &str, pattern: &str) -> i32 {
+    // GNU expr anchors the BRE at the start of the string and returns the
+    // length of the match, or 0 when there is no match. Wrapping the pattern
+    // in `^\(...\)` lets the existing BRE engine supply the anchored match.
+    let anchored = format!("^\\({pattern}\\)");
+    let re = match crate::regex_posix::Regex::compile_bre(&anchored) {
+        Ok(re) => re,
+        Err(error) => {
+            ctx.output
+                .stderr(format!("expr: invalid regular expression: {error}\n").as_bytes());
+            return 2;
+        }
+    };
+    let len = match re.find(string) {
+        Some((0, end)) => end,
+        _ => 0,
+    };
+    expr_emit_result(ctx, i64::try_from(len).unwrap_or(i64::MAX))
 }
 
 fn expr_index(ctx: &mut UtilContext<'_>, string: &str, chars: &str) -> i32 {

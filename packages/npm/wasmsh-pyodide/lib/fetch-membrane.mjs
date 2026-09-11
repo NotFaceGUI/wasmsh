@@ -10,9 +10,9 @@
  * bypassing the same controls that `curl` is forced through.
  *
  * The wrapper:
- * - Validates the URL against `allowedHosts` via `isHostAllowed()`.
- *   Allowlist semantics MUST match the Rust `HostAllowlist` and the
- *   `lib/allowlist.mjs` helper.
+ * - Validates the URL against the normalized NetworkPolicy before every hop.
+ *   Legacy `allowedHosts` arrays are converted to the equivalent allow-only
+ *   policy.
  * - Forces `redirect: "manual"` on the underlying fetch and drives the
  *   chain in JS so every hop's Location is re-validated. The audit
  *   (F3) called this out — without per-hop revalidation a server on an
@@ -29,11 +29,15 @@
  * cannot reach it through the `js` proxy.
  *
  * Re-arming: a worker that swaps sessions can call this again with a
- * fresh `allowedHosts` list; the wrapper is replaced and the previous
+ * fresh network policy; the wrapper is replaced and the previous
  * closure is dropped. Subsequent fetches see the new list immediately.
  */
 
-import { isHostAllowed } from "./allowlist.mjs";
+import {
+  isNetworkAllowed,
+  normalizeNetworkPolicy,
+  normalizeNetworkTarget,
+} from "./allowlist.mjs";
 
 const MEMBRANE_FLAG = Symbol.for("wasmsh.fetch-membrane");
 
@@ -59,9 +63,19 @@ function methodOf(input, init) {
 
 class HostDeniedError extends TypeError {
   constructor(url) {
-    super(`wasmsh: host denied by sandbox allowlist: ${url}`);
+    super(`wasmsh: host denied by sandbox policy: ${safeTargetForError(url)}`);
     this.name = "WasmshHostDenied";
     this.code = "WASMSH_HOST_DENIED";
+  }
+}
+
+function safeTargetForError(url) {
+  try {
+    const target = normalizeNetworkTarget(url);
+    const host = target.host.includes(":") ? `[${target.host}]` : target.host;
+    return `${new URL(url).protocol}//${host}:${target.port}`;
+  } catch {
+    return "<invalid URL>";
   }
 }
 
@@ -88,6 +102,32 @@ function shouldDowngradeToGet(status) {
 function isRedirect(status) {
   return status === 301 || status === 302 || status === 303 ||
     status === 307 || status === 308;
+}
+
+function sameOrigin(from, to) {
+  try {
+    return new URL(from).origin === new URL(to).origin;
+  } catch {
+    return false;
+  }
+}
+
+function headerValue(headers, name) {
+  if (!headers) return null;
+  try {
+    return new Headers(headers).get(name);
+  } catch {
+    return null;
+  }
+}
+
+function stripCrossOriginSensitiveHeaders(headers) {
+  if (!headers) return headers;
+  const sanitized = new Headers(headers);
+  for (const name of ["authorization", "cookie", "proxy-authorization", "host"]) {
+    sanitized.delete(name);
+  }
+  return sanitized;
 }
 
 /**
@@ -162,11 +202,12 @@ function resolveRedirect(prevUrl, location) {
   }
 }
 
-export function installFetchMembrane(globalObject, allowedHosts) {
-  const hosts = Array.isArray(allowedHosts) ? allowedHosts.slice() : [];
+export function installFetchMembrane(globalObject, networkConfig) {
+  const policy = normalizeNetworkPolicy(networkConfig);
   const existing = globalObject[MEMBRANE_FLAG];
   if (existing) {
-    existing.allowedHosts = hosts;
+    existing.networkPolicy = policy;
+    existing.allowedHosts = Array.isArray(networkConfig) ? networkConfig.slice() : [];
     return;
   }
 
@@ -177,7 +218,9 @@ export function installFetchMembrane(globalObject, allowedHosts) {
   }
 
   const state = {
-    allowedHosts: hosts,
+    networkPolicy: policy,
+    // Retained for diagnostic compatibility with existing host integrations.
+    allowedHosts: Array.isArray(networkConfig) ? networkConfig.slice() : [],
     maxResponseBytes: DEFAULT_MAX_RESPONSE_BYTES,
     maxRedirects: DEFAULT_MAX_REDIRECTS,
     timeoutMs: DEFAULT_TIMEOUT_MS,
@@ -185,7 +228,7 @@ export function installFetchMembrane(globalObject, allowedHosts) {
 
   async function brokeredFetch(input, init) {
     let url = readinessUrl(input);
-    if (!isHostAllowed(url, state.allowedHosts)) {
+    if (!isNetworkAllowed(url, state.networkPolicy)) {
       throw new HostDeniedError(url);
     }
 
@@ -202,13 +245,19 @@ export function installFetchMembrane(globalObject, allowedHosts) {
     try {
       let hopUrl = url;
       let hops = 0;
+      let crossedOrigin = false;
       while (true) {
+        let hopHeaders = callerInit.headers;
+        if (crossedOrigin) {
+          hopHeaders = stripCrossOriginSensitiveHeaders(hopHeaders);
+        }
         const hopInit = {
           ...callerInit,
           method,
           body,
           redirect: "manual",
           signal: controller.signal,
+          ...(hopHeaders === undefined ? {} : { headers: hopHeaders }),
         };
         // Pass the resolved URL string on subsequent hops so any Request
         // body/headers from the caller are still honored on the first hop.
@@ -230,9 +279,19 @@ export function installFetchMembrane(globalObject, allowedHosts) {
           try { response.body?.cancel(); } catch { /* swallow */ }
           throw new TypeError(`wasmsh: invalid redirect target: ${location}`);
         }
-        if (!isHostAllowed(next, state.allowedHosts)) {
+        if (!isNetworkAllowed(next, state.networkPolicy)) {
           try { response.body?.cancel(); } catch { /* swallow */ }
           throw new HostDeniedError(next);
+        }
+        if (!sameOrigin(hopUrl, next)) {
+          const authorization = headerValue(hopHeaders, "authorization");
+          if (authorization?.startsWith("AWS4-HMAC-SHA256 ")) {
+            try { response.body?.cancel(); } catch { /* swallow */ }
+            throw new HostDeniedError(
+              `${next} (cross-origin signed redirect is not allowed)`,
+            );
+          }
+          crossedOrigin = true;
         }
         // RFC 7231: 301/302/303 demote non-GET/HEAD to GET and drop body.
         if (shouldDowngradeToGet(response.status) && method !== "GET" && method !== "HEAD") {

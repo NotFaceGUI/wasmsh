@@ -20,6 +20,20 @@ interface worker {
     step-budget: u64,
     /// Host patterns allowed for network access.
     allowed-hosts: list<string>,
+    /// Structured policy; when supplied, allowed-hosts must be empty.
+    network-policy: option<network-policy>,
+  }
+
+  record network-policy {
+    enabled: bool,
+    default-action: network-default-action,
+    allow: list<string>,
+    deny: list<string>,
+  }
+
+  enum network-default-action {
+    deny,
+    allow,
   }
 
   /// Structured payload for `worker-event.diagnostic`.

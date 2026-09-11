@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>wasmsh playground</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0f14; color: #d7e0ea;
+         font: 14px/1.5 "Cascadia Mono", Consolas, monospace; }
+  #bar { padding: 8px 12px; background: #131a22; border-bottom: 1px solid #24303c;
+         display: flex; gap: 10px; align-items: center; }
+  #bar b { color: #7fd1ff; }
+  #status { color: #8aa0b4; }
+  #out { height: calc(100vh - 96px); overflow-y: auto; padding: 10px 12px;
+         white-space: pre-wrap; word-break: break-word; }
+  .cmd { color: #7fd1ff; }
+  .err { color: #ff8a8a; }
+  .meta { color: #6b7c8c; }
+  #line { display: flex; gap: 8px; padding: 8px 12px; border-top: 1px solid #24303c;
+          background: #10161d; }
+  #ps1 { color: #7fd1ff; }
+  #in { flex: 1; background: transparent; border: 0; outline: 0; color: #d7e0ea;
+        font: inherit; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <b>wasmsh</b>
+    <span id="status">loading…</span>
+    <label><input id="net" type="checkbox"> allow localhost network</label>
+    <button id="reset">re-init</button>
+  </div>
+  <div id="out"></div>
+  <div id="line"><span id="ps1">$</span><input id="in" autofocus
+    placeholder="type a bash command and press Enter"></div>
+<script type="module">
+const statusEl = document.getElementById("status");
+const outEl = document.getElementById("out");
+const inEl = document.getElementById("in");
+const netEl = document.getElementById("net");
+
+function write(text, cls) {
+  const span = document.createElement("span");
+  if (cls) span.className = cls;
+  span.textContent = text;
+  outEl.appendChild(span);
+  outEl.scrollTop = outEl.scrollHeight;
+}
+
+const worker = new Worker("./worker.js", { type: "module" });
+const pending = [];
+worker.addEventListener("message", (e) => {
+  const entry = pending.shift();
+  if (!entry) return;
+  if (e.data && e.data.error) entry.reject(new Error(e.data.error));
+  else entry.resolve(e.data);
+});
+worker.addEventListener("error", (e) => {
+  const err = new Error(e.message || "worker error");
+  while (pending.length) pending.shift().reject(err);
+});
+function send(msg) {
+  return new Promise((resolve, reject) => {
+    pending.push({ resolve, reject });
+    worker.postMessage(msg);
+  });
+}
+
+function decode(events, key) {
+  const parts = [];
+  for (const ev of events) if (ev && typeof ev === "object" && key in ev) parts.push(...ev[key]);
+  return new TextDecoder().decode(new Uint8Array(parts));
+}
+const stdout = (ev) => decode(ev, "Stdout");
+const stderr = (ev) => decode(ev, "Stderr");
+const exitCode = (ev) => ev.find((e) => "Exit" in e)?.Exit;
+
+async function init() {
+  const reply = await send({
+    type: "Init",
+    step_budget: 0,
+    allowed_hosts: netEl.checked ? ["localhost:3100", "127.0.0.1:3100"] : [],
+  });
+  const version = reply.events.find((e) => "Version" in e)?.Version;
+  statusEl.textContent = `ready (protocol ${version})${netEl.checked ? " · network allowlisted" : " · no network"}`;
+}
+netEl.addEventListener("change", async () => {
+  // Policy is fixed at Init; re-initialize (this clears the VFS).
+  write("\n[re-init: network policy changed; VFS reset]\n", "meta");
+  await init();
+});
+document.getElementById("reset").addEventListener("click", async () => {
+  write("\n[re-init: VFS reset]\n", "meta");
+  await init();
+});
+
+const history = [];
+let histIndex = -1;
+
+inEl.addEventListener("keydown", async (e) => {
+  if (e.key === "ArrowUp") {
+    if (histIndex < history.length - 1) histIndex++;
+    inEl.value = history[history.length - 1 - histIndex] ?? "";
+    e.preventDefault();
+    return;
+  }
+  if (e.key === "ArrowDown") {
+    histIndex = Math.max(-1, histIndex - 1);
+    inEl.value = histIndex >= 0 ? history[history.length - 1 - histIndex] : "";
+    e.preventDefault();
+    return;
+  }
+  if (e.key !== "Enter") return;
+  const cmd = inEl.value;
+  if (!cmd.trim()) return;
+  history.push(cmd);
+  histIndex = -1;
+  inEl.value = "";
+  write(`$ ${cmd}\n`, "cmd");
+  try {
+    const { events } = await send({ type: "Run", input: cmd });
+    const out = stdout(events);
+    const err = stderr(events);
+    if (out) write(out);
+    if (err) write(err, "err");
+    const code = exitCode(events);
+    if (code !== undefined && code !== 0) write(`[exit ${code}]\n`, "meta");
+  } catch (error) {
+    write(`${error.message}\n`, "err");
+  }
+});
+
+init().catch((error) => {
+  statusEl.textContent = "failed to start";
+  write(`${error.message}\n`, "err");
+});
+</script>
+</body>
+</html>

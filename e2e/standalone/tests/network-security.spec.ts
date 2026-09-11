@@ -1,15 +1,13 @@
 /**
  * Network allowlist security tests — standalone browser (wasm-bindgen).
  *
- * Verifies that curl/wget can only reach hosts in the allowed_hosts list.
+ * Verifies the standalone browser's network boundary. The fixture uses
+ * synchronous XHR, which is not a trusted redirect-aware broker, so even a
+ * policy-allowed target must be refused before XHR is called.
  *
- * The "allowed host" tests fetch a static fixture page served by the
- * Playwright dev server itself (`fixture/cors-echo.html`).  Talking to
- * a same-origin URL avoids the cross-origin problem with sync XHR
- * (no CORS preflight, no opaque-response body) and removes the test
- * dependency on any external network.  The "denied host" tests still
- * use a fake external hostname because the allowlist check happens
- * before any actual fetch is attempted.
+ * The local fixture URL is used for broker-refusal tests so CORS failures
+ * cannot be mistaken for policy enforcement. The controlled-server Rust
+ * integration test verifies actual per-hop blocking.
  */
 import { test, expect } from "@playwright/test";
 
@@ -102,29 +100,30 @@ async function initAndRun(
   );
 }
 
-// ── Allowed host ────────────────────────────────────────────────
+// ── Browser broker requirement ──────────────────────────────────
 
-test("curl to allowed host (local fixture) succeeds", async ({ page }) => {
+test("curl refuses an allowed host without a trusted broker", async ({ page }) => {
   await page.goto("/");
   const r = await initAndRun(
     page,
     [FIXTURE_HOST],
-    `curl -sL ${FIXTURE_URL}`,
+    `curl -sSL ${FIXTURE_URL}`,
   );
-  expect(r.exitCode).toBe(0);
-  expect(r.stdout.length).toBeGreaterThan(0);
-  expect(r.stdout).toMatch(/<(!|html|HTML)/);
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toContain("trusted redirect-aware broker");
 });
 
-test("wget to allowed host (local fixture) succeeds", async ({ page }) => {
+test("wget refuses an allowed host without a trusted broker", async ({ page }) => {
   await page.goto("/");
   const r = await initAndRun(
     page,
     [FIXTURE_HOST],
     `wget -qO - ${FIXTURE_URL}`,
   );
-  expect(r.exitCode).toBe(0);
-  expect(r.stdout.length).toBeGreaterThan(0);
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toContain("trusted redirect-aware broker");
 });
 
 // ── Denied host ─────────────────────────────────────────────────
@@ -207,14 +206,15 @@ test("wildcard pattern blocks the apex (subdomains-only semantics)", async ({
   expect(r2.exitCode).not.toBe(0);
 });
 
-test("explicit apex + wildcard together allow the apex", async ({ page }) => {
+test("explicit apex + wildcard still require a trusted browser broker", async ({ page }) => {
   await page.goto("/");
   const r = await initAndRun(
     page,
     [FIXTURE_HOST, `*.${FIXTURE_HOST}`],
-    `curl -sL ${FIXTURE_URL}`,
+    `curl -sSL ${FIXTURE_URL}`,
   );
-  expect(r.exitCode).toBe(0);
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stderr).toContain("trusted redirect-aware broker");
 });
 
 // ── Empty allowlist ─────────────────────────────────────────────
@@ -228,16 +228,45 @@ test("empty allowlist blocks all hosts", async ({ page }) => {
   expect(r.stderr).toMatch(/denied|allowlist/);
 });
 
+test("structured network policy reaches the standalone WASM boundary", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const result = await page.evaluate(async () => {
+    const client = (window as any).createShellWorkerClient();
+    const init = await client.send({
+      type: "Init",
+      step_budget: 0,
+      network_policy: {
+        enabled: true,
+        default_action: "allow",
+        allow: [],
+        deny: [],
+      },
+    });
+    const run = await client.send({
+      type: "Run",
+      input: "curl http://localhost:3100/cors-echo.html",
+    });
+    client.close();
+    return { init: init.events, run: run.events };
+  });
+
+  expect(result.init.some((entry: any) => "Version" in entry)).toBe(true);
+  expect(findExitCode(result.run)).not.toBe(0);
+  expect(findStderr(result.run)).toContain("trusted redirect-aware broker");
+});
+
 // ── curl | wc pipeline ──────────────────────────────────────────
 
-test("curl piped to wc works with allowed host", async ({ page }) => {
+test("curl pipeline cannot bypass the browser broker requirement", async ({ page }) => {
   await page.goto("/");
   const r = await initAndRun(
     page,
     [FIXTURE_HOST],
-    `curl -sL ${FIXTURE_URL} | wc -l`,
+    `set -o pipefail; curl -sSL ${FIXTURE_URL} | wc -l`,
   );
-  expect(r.exitCode).toBe(0);
-  const lines = parseInt(r.stdout.trim(), 10);
-  expect(lines).toBeGreaterThan(5);
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stdout).toBe("0\n");
+  expect(r.stderr).toContain("trusted redirect-aware broker");
 });

@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createBrokerBuffers } from "./fetch-broker.mjs";
+import { normalizeNetworkPolicy } from "../../../packages/npm/wasmsh-pyodide/lib/allowlist.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const sessionWorkerPath = resolve(__dirname, "./session-worker.mjs");
@@ -27,6 +28,7 @@ export async function restoreSessionWorker({
   snapshotBuffer,
   snapshotLength,
   allowedHosts,
+  networkPolicy,
   stepBudget,
   initialFiles,
   metrics,
@@ -37,9 +39,19 @@ export async function restoreSessionWorker({
   workerResourceLimits,
   compiledWasmModule,
 }) {
+  if (allowedHosts !== undefined && networkPolicy !== undefined) {
+    throw new Error("networkPolicy and allowedHosts cannot both be configured");
+  }
+  const effectiveAllowedHosts = allowedHosts ?? [];
+  const effectiveNetworkConfig = networkPolicy !== undefined
+    ? networkPolicy
+    : effectiveAllowedHosts;
+  const normalizedNetworkPolicy = normalizeNetworkPolicy(effectiveNetworkConfig);
   const restore = metrics.startRestore(queueDepth);
   restore.beginStage("worker_spawn");
-  let brokerBuffers = allowedHosts.length > 0 ? createBrokerBuffers(brokerBufferOptions) : null;
+  let brokerBuffers = normalizedNetworkPolicy.enabled
+    ? createBrokerBuffers(brokerBufferOptions)
+    : null;
   const worker = new Worker(sessionWorkerPath, {
     env: workerEnv,
     resourceLimits: workerResourceLimits,
@@ -47,7 +59,8 @@ export async function restoreSessionWorker({
       assetDir,
       snapshotBuffer,
       snapshotLength,
-      allowedHosts,
+      allowedHosts: effectiveAllowedHosts,
+      ...(networkPolicy === undefined ? {} : { networkPolicy }),
       stepBudget,
       initialFiles: normalizeInitialFiles(initialFiles),
       ...(brokerBuffers ?? {}),
@@ -107,7 +120,8 @@ export async function restoreSessionWorker({
       try {
         await fetchBroker.handleFetchMessage({
           ...brokerBuffers,
-          allowedHosts,
+          allowedHosts: effectiveAllowedHosts,
+          ...(networkPolicy === undefined ? {} : { networkPolicy }),
         });
       } catch (error) {
         // handleFetchMessage is already defensive against fetch failures;

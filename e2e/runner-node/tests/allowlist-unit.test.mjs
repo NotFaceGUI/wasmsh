@@ -9,7 +9,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { isHostAllowed } from "../../../packages/npm/wasmsh-pyodide/lib/allowlist.mjs";
+import {
+  isHostAllowed,
+  isNetworkAllowed,
+  normalizeNetworkPolicy,
+} from "../../../packages/npm/wasmsh-pyodide/lib/allowlist.mjs";
 
 test("isHostAllowed rejects every non-http(s) scheme", () => {
   const allow = ["example.com"];
@@ -42,4 +46,41 @@ test("isHostAllowed honors per-pattern port (non-default)", () => {
   // port — same constraint applies in the Rust HostAllowlist.
   assert.equal(isHostAllowed("https://api.example.com:8443/", ["api.example.com:8443"]), true);
   assert.equal(isHostAllowed("https://api.example.com:8080/", ["api.example.com:8443"]), false);
+});
+
+test("structured policy applies deny before allow and supports default allow", () => {
+  const policy = normalizeNetworkPolicy({
+    enabled: true,
+    default_action: "allow",
+    allow: ["*"],
+    deny: ["blocked.example.com"],
+  });
+  assert.equal(isNetworkAllowed("https://ok.example.com", policy), true);
+  assert.equal(isNetworkAllowed("https://blocked.example.com", policy), false);
+});
+
+test("structured policy normalizes IDNA, default ports, and IPv6", () => {
+  const policy = normalizeNetworkPolicy({
+    enabled: true,
+    default_action: "deny",
+    allow: ["bücher.example:443", "[2001:db8::1]:8080"],
+    deny: [],
+  });
+  assert.equal(isNetworkAllowed("https://xn--bcher-kva.example", policy), true);
+  assert.equal(isNetworkAllowed("http://[2001:0DB8:0:0:0:0:0:1]:8080", policy), true);
+});
+
+test("malformed structured policy is rejected during normalization", () => {
+  assert.throws(
+    () => normalizeNetworkPolicy({ enabled: true, allow: ["api.*.example.com"] }),
+    /invalid network policy/,
+  );
+  assert.throws(
+    () => normalizeNetworkPolicy({ enabled: true, default_action: "maybe" }),
+    /default_action/,
+  );
+  assert.throws(
+    () => normalizeNetworkPolicy({ allowed_hosts: [], allow: [] }),
+    /cannot both be configured/,
+  );
 });

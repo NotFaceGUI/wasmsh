@@ -54,7 +54,10 @@ try {
   const fetchOpts = {
     method: req.method,
     headers: Object.fromEntries(req.headers || []),
-    redirect: req.follow_redirects ? "follow" : "manual",
+    // Rust owns the redirect loop and checks every Location before the next
+    // request. Automatic following here would make a denied target hit before
+    // Rust can inspect it.
+    redirect: "manual",
     signal: controller.signal,
   };
   if (req.body_base64) {

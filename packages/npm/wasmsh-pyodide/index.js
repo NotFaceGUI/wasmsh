@@ -72,6 +72,11 @@ export function resolveBrowserWorkerPath() {
 }
 
 export async function createNodeSession(options = {}) {
+  const hasAllowedHosts = Object.hasOwn(options, "allowedHosts") && options.allowedHosts !== undefined;
+  const hasNetworkPolicy = Object.hasOwn(options, "networkPolicy") && options.networkPolicy !== undefined;
+  if (hasAllowedHosts && hasNetworkPolicy) {
+    throw new Error("networkPolicy and allowedHosts cannot both be configured");
+  }
   return createNodeHostSession({
     nodeExecutable: options.nodeExecutable ?? process.execPath,
     hostPath: resolveNodeHostPath(),
@@ -80,12 +85,19 @@ export async function createNodeSession(options = {}) {
     initOptions: {
       stepBudget: options.stepBudget ?? 0,
       initialFiles: options.initialFiles ?? [],
-      allowedHosts: options.allowedHosts ?? [],
+      ...(hasNetworkPolicy
+        ? { networkPolicy: options.networkPolicy }
+        : { allowedHosts: options.allowedHosts ?? [] }),
     },
   });
 }
 
 export async function createBrowserWorkerSession(options) {
+  const hasAllowedHosts = Object.hasOwn(options, "allowedHosts") && options.allowedHosts !== undefined;
+  const hasNetworkPolicy = Object.hasOwn(options, "networkPolicy") && options.networkPolicy !== undefined;
+  if (hasAllowedHosts && hasNetworkPolicy) {
+    throw new Error("networkPolicy and allowedHosts cannot both be configured");
+  }
   const worker =
     options.worker ?? new Worker(resolveBrowserWorkerPath(), { name: "wasmsh-pyodide" });
   const session = new BrowserWorkerSession(worker, options.timeoutMs);
@@ -96,7 +108,9 @@ export async function createBrowserWorkerSession(options) {
       path: file.path,
       contentBase64: encodeBase64(file.content),
     })),
-    allowedHosts: options.allowedHosts ?? [],
+    ...(hasNetworkPolicy
+      ? { networkPolicy: options.networkPolicy }
+      : { allowedHosts: options.allowedHosts ?? [] }),
   });
   return session;
 }

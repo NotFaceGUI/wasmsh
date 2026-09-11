@@ -1177,6 +1177,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             func(&mut ctx, argv)
         };
@@ -1398,6 +1399,7 @@ mod tests {
                 stdin: Some(crate::UtilStdin::from_bytes(&archive_bytes)),
                 state: None,
                 network: None,
+                clock: None,
             };
             util_tar(&mut ctx, &["tar", "-xzf", "-", "-C", "/out"])
         };

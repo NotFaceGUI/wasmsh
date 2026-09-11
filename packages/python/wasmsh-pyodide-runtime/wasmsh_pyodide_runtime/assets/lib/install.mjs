@@ -36,12 +36,19 @@ const PIP_FREEZE_RE =
  * @param {object}   opts
  * @param {(name: string) => boolean | Promise<boolean>} opts.isBundled
  *   Returns true if the package has a locally available wheel.
- * @param {string[]} opts.allowedHosts  Hosts allowed for network installs.
+ * @param {string[]} opts.allowedHosts  Legacy hosts allowed for network installs.
+ * @param {object} opts.networkPolicy   Structured network policy.
  * @param {boolean}  [opts.deps=true]   Install dependencies.
  * @returns {Promise<{installed: Array<{requirement: string}>, requirements: string[]}>}
  */
 export async function installPackages(reqs, pyodide, opts) {
-  const { isBundled, allowedHosts, deps = true } = opts;
+  const {
+    isBundled,
+    allowedHosts = [],
+    networkPolicy = undefined,
+    deps = true,
+  } = opts;
+  const policyConfig = networkPolicy ?? allowedHosts;
   const installed = [];
   let micropip = null;
 
@@ -69,17 +76,20 @@ export async function installPackages(reqs, pyodide, opts) {
 
     if (
       /^https?:\/\//i.test(req) &&
-      !isHostAllowed(req, allowedHosts)
+      !isHostAllowed(req, policyConfig)
     ) {
       throw new Error(
         `Host not allowed for package install: ${req}. ` +
-          "Configure allowedHosts when creating the session.",
+          "Configure allowedHosts or networkPolicy when creating the session.",
       );
     }
-    if (isPlainName && allowedHosts.length === 0) {
+    const networkEnabled = networkPolicy !== undefined
+      ? networkPolicy?.enabled === true
+      : allowedHosts.length > 0;
+    if (isPlainName && !networkEnabled) {
       throw new Error(
         `Package name installs require network access: ${req}. ` +
-          "Configure allowedHosts (e.g., ['cdn.jsdelivr.net', 'pypi.org', 'files.pythonhosted.org']) when creating the session.",
+          "Configure allowedHosts or an enabled networkPolicy when creating the session.",
       );
     }
 

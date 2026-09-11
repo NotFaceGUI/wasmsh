@@ -66,8 +66,7 @@ pub extern "C" fn wasmsh_probe_file_equals(path: *const c_char, expected: *const
     if path.is_null() || expected.is_null() {
         return 0;
     }
-    i32::from(probe_file_equals(
-        unsafe { CStr::from_ptr(path) },
-        unsafe { CStr::from_ptr(expected) },
-    ))
+    i32::from(probe_file_equals(unsafe { CStr::from_ptr(path) }, unsafe {
+        CStr::from_ptr(expected)
+    }))
 }

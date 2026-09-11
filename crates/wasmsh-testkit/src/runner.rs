@@ -7,6 +7,7 @@ use std::path::Path;
 
 use wasmsh_protocol::{HostCommand, WorkerEvent};
 use wasmsh_runtime::WorkerRuntime;
+use wasmsh_utils::FixedClock;
 
 use crate::toml_case::TomlTestFile;
 use crate::{features, oracle};
@@ -149,9 +150,16 @@ fn compare_oracles<F>(
 
 fn new_runtime() -> WorkerRuntime {
     let mut rt = WorkerRuntime::new();
+    // Declarative cases assert reproducible output. Keep the harness
+    // independent from the host wall clock now that production runtimes use
+    // a live clock by default on native targets.
+    rt.set_clock_provider(Box::new(
+        FixedClock::new(1_767_225_600_000).expect("test clock timestamp is valid"),
+    ));
     rt.handle_command(HostCommand::Init {
         step_budget: 100_000,
         allowed_hosts: vec![],
+        network_policy: None,
     });
     rt
 }

@@ -1,15 +1,13 @@
 /**
  * Network allowlist security tests — Pyodide browser (Emscripten).
  *
- * Verifies that curl/wget can only reach hosts in the allowed_hosts list.
+ * The browser worker uses synchronous XHR for the Rust network ABI. Since
+ * that API cannot guarantee per-hop redirect checks, allowed targets must be
+ * refused unless a trusted broker is wired in.
  *
- * The "allowed host" tests fetch a static fixture page served by the
- * Playwright dev server itself (`fixture/cors-echo.html`).  Talking to
- * a same-origin URL avoids the cross-origin problem with sync XHR
- * (no CORS preflight, no opaque-response body) and removes the test
- * dependency on any external network.  The "denied host" tests still
- * use a fake external hostname because the allowlist check happens
- * before any actual fetch is attempted.
+ * The local fixture URL is used so CORS failures cannot be mistaken for
+ * policy enforcement. Actual per-hop blocking is verified by the controlled
+ * server integration test.
  *
  * Tests run through the Pyodide browser worker which uses Emscripten's
  * extern "C" FFI for network calls (wasmsh_js_http_fetch → sync XHR).
@@ -74,21 +72,22 @@ async function run(page: any, command: string) {
 
 // ── Allowed host ────────────────────────────────────────────────
 
-test("curl to allowed host (local fixture) succeeds", async ({ page }) => {
+test("curl refuses an allowed host without a trusted broker", async ({ page }) => {
   await initWithHosts(page, [FIXTURE_HOST]);
-  const r = await run(page, `curl -sL ${FIXTURE_URL}`);
+  const r = await run(page, `curl -sSL ${FIXTURE_URL}`);
 
-  expect(r.exitCode).toBe(0);
-  expect(r.stdout.length).toBeGreaterThan(0);
-  expect(r.stdout).toMatch(/<(!|html|HTML)/);
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toContain("synchronous XHR is refused");
 });
 
-test("wget to allowed host (local fixture) succeeds", async ({ page }) => {
+test("wget refuses an allowed host without a trusted broker", async ({ page }) => {
   await initWithHosts(page, [FIXTURE_HOST]);
   const r = await run(page, `wget -qO - ${FIXTURE_URL}`);
 
-  expect(r.exitCode).toBe(0);
-  expect(r.stdout.length).toBeGreaterThan(0);
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toContain("synchronous XHR is refused");
 });
 
 // ── Denied host ─────────────────────────────────────────────────
@@ -154,10 +153,11 @@ test("wildcard pattern blocks the apex (subdomains-only semantics)", async ({
   expect(r2.exitCode).not.toBe(0);
 });
 
-test("explicit apex + wildcard together allow the apex", async ({ page }) => {
+test("explicit apex + wildcard still require a trusted browser broker", async ({ page }) => {
   await initWithHosts(page, [FIXTURE_HOST, `*.${FIXTURE_HOST}`]);
-  const r = await run(page, `curl -sL ${FIXTURE_URL}`);
-  expect(r.exitCode).toBe(0);
+  const r = await run(page, `curl -sSL ${FIXTURE_URL}`);
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stderr).toContain("synchronous XHR is refused");
 });
 
 // ── Empty allowlist ─────────────────────────────────────────────
@@ -174,11 +174,11 @@ test("empty allowlist blocks all hosts", async ({ page }) => {
 
 // ── curl piped to wc ────────────────────────────────────────────
 
-test("curl piped to wc works with allowed host", async ({ page }) => {
+test("curl pipeline cannot bypass the browser broker requirement", async ({ page }) => {
   await initWithHosts(page, [FIXTURE_HOST]);
-  const r = await run(page, `curl -sL ${FIXTURE_URL} | wc -l`);
+  const r = await run(page, `set -o pipefail; curl -sSL ${FIXTURE_URL} | wc -l`);
 
-  expect(r.exitCode).toBe(0);
-  const lines = parseInt(r.stdout.trim(), 10);
-  expect(lines).toBeGreaterThan(5);
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toContain("synchronous XHR is refused");
 });

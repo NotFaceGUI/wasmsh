@@ -11,9 +11,12 @@
 //! "not supported in sandbox" diagnostic rather than silently accepted or
 //! reported as "unknown option".
 
+use crate::clock::{sample_utc, UtcDateTime};
 use crate::helpers::resolve_path;
 use crate::net_multipart::{encode_multipart, parse_form_arg, FormPart};
-use crate::net_types::{HttpRequest, HttpResponse, NetworkBackend, NetworkError};
+use crate::net_types::{
+    validate_http_url, HttpRequest, HttpResponse, NetworkBackend, NetworkError,
+};
 use crate::UtilContext;
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
@@ -1208,8 +1211,10 @@ fn basic_auth(user_pass: &str) -> String {
 /// Credentials come from `-u ACCESS_KEY:SECRET_KEY`.  Region and service
 /// come from the `--aws-sigv4` spec (`"<prv1>[:<prv2>[:<region>[:<svc>]]]"`);
 /// both default to `us-east-1`/`s3` in line with curl's heuristics.  The
-/// request time is read from the `WASMSH_DATE` shell variable (the same
-/// source `util_date` uses) so tests are deterministic.
+/// request time is sampled from the same `ClockProvider` as `util_date`.
+/// A low-level context without a clock may use `WASMSH_DATE` as an explicit
+/// legacy compatibility mode; the runtime never falls back to that variable
+/// when a live provider is installed.
 fn apply_aws_sigv4(
     ctx: &UtilContext<'_>,
     opts: &CurlOpts,
@@ -1285,21 +1290,19 @@ fn parse_sigv4_credentials(opts: &CurlOpts) -> Result<(String, String), String> 
 }
 
 fn sigv4_timestamps(ctx: &UtilContext<'_>) -> Result<(String, String), String> {
-    let raw = ctx
-        .state
-        .and_then(|s| s.get_var("WASMSH_DATE"))
-        .map_or_else(|| "2026-01-01 00:00:00 UTC".to_string(), |v| v.to_string());
-    // Accept "YYYY-MM-DD HH:MM:SS [TZ]" — the format util_date also uses.
-    let (date, time_rest) = raw
-        .split_once(' ')
-        .ok_or_else(|| format!("WASMSH_DATE: unparseable date '{raw}'"))?;
-    let time = time_rest.split_whitespace().next().unwrap_or("00:00:00");
-    let date_stamp = date.replace('-', "");
-    let time_stamp = time.replace(':', "");
-    if date_stamp.len() != 8 || time_stamp.len() != 6 {
-        return Err(format!("WASMSH_DATE: invalid date format '{raw}'"));
-    }
-    Ok((date_stamp.clone(), format!("{date_stamp}T{time_stamp}Z")))
+    let parts = if let Some(clock) = ctx.clock {
+        sample_utc(clock).map_err(|error| error.to_string())?
+    } else {
+        let raw = ctx
+            .state
+            .and_then(|state| state.get_var("WASMSH_DATE"))
+            .ok_or_else(|| {
+                "clock unavailable; install a host callback or set WASMSH_DATE in legacy mode"
+                    .to_string()
+            })?;
+        UtcDateTime::parse_legacy(&raw).map_err(|error| format!("WASMSH_DATE: {error}"))?
+    };
+    Ok((parts.date_stamp(), parts.amz_date()))
 }
 
 /// Canonicalize the path portion of the URL for `SigV4`.  AWS requires a
@@ -1601,6 +1604,8 @@ fn fetch_with_redirects(
     // If the caller didn't want redirects followed, the backend sees the raw
     // request and the loop short-circuits after one fetch.
     if !initial.follow_redirects {
+        validate_http_url(&initial.url)?;
+        backend.check_url(&initial.url)?;
         return backend.fetch(initial);
     }
     let max = initial.max_redirs.unwrap_or(50);
@@ -1609,6 +1614,8 @@ fn fetch_with_redirects(
     request.follow_redirects = false;
     let mut hops: u32 = 0;
     loop {
+        validate_http_url(&request.url)?;
+        backend.check_url(&request.url)?;
         let response = backend.fetch(&request)?;
         if !is_redirect_status(response.status) {
             return Ok(response);
@@ -1622,8 +1629,20 @@ fn fetch_with_redirects(
             )));
         }
         let next_url = resolve_redirect_url(&request.url, &location)
-            .map_err(|e| NetworkError::Other(format!("invalid redirect target: {e}")))?;
+            .map_err(|e| NetworkError::InvalidUrl(format!("invalid redirect target: {e}")))?;
+        validate_http_url(&next_url)?;
         backend.check_url(&next_url)?;
+        if is_cross_origin(&request.url, &next_url)? {
+            let has_sigv4 = request.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("authorization") && value.starts_with("AWS4-HMAC-SHA256 ")
+            });
+            if has_sigv4 {
+                return Err(NetworkError::HostDenied(
+                    "cross-origin redirect rejected for a signed request".into(),
+                ));
+            }
+            strip_cross_origin_sensitive_headers(&mut request.headers);
+        }
         // Method downgrade rules: 301/302/303 demote non-GET/HEAD to GET and
         // drop the body; 307/308 preserve method and body.
         if matches!(response.status, 301..=303)
@@ -1635,6 +1654,26 @@ fn fetch_with_redirects(
         request.url = next_url;
         hops += 1;
     }
+}
+
+fn is_cross_origin(from: &str, to: &str) -> Result<bool, NetworkError> {
+    let from = url::Url::parse(from)
+        .map_err(|e| NetworkError::InvalidUrl(format!("invalid redirect source: {e}")))?;
+    let to = url::Url::parse(to)
+        .map_err(|e| NetworkError::InvalidUrl(format!("invalid redirect target: {e}")))?;
+    Ok(
+        (from.scheme(), from.host_str(), from.port_or_known_default())
+            != (to.scheme(), to.host_str(), to.port_or_known_default()),
+    )
+}
+
+fn strip_cross_origin_sensitive_headers(headers: &mut Vec<(String, String)>) {
+    headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("authorization")
+            && !name.eq_ignore_ascii_case("cookie")
+            && !name.eq_ignore_ascii_case("proxy-authorization")
+            && !name.eq_ignore_ascii_case("host")
+    });
 }
 
 fn is_redirect_status(status: u16) -> bool {
@@ -2697,7 +2736,18 @@ fn wget_fetch_one(
     for _ in 0..attempts {
         match fetch_with_redirects(backend, &request) {
             Ok(r) => return Ok(r),
-            Err(e) => last_err = Some(e),
+            Err(e) => {
+                // A policy denial or malformed URL will not change between
+                // attempts; retrying only wastes time and can make an AI loop.
+                let retryable = matches!(
+                    e,
+                    NetworkError::ConnectionFailed(_) | NetworkError::Timeout(_)
+                );
+                last_err = Some(e);
+                if !retryable {
+                    break;
+                }
+            }
         }
     }
     Err(last_err.unwrap_or_else(|| NetworkError::Other("no attempts made".into())))
@@ -2791,6 +2841,7 @@ mod tests {
     use super::*;
     use crate::net_types::{HostAllowlist, HttpResponse, NetworkBackend, NetworkError};
     use crate::VecOutput;
+    use crate::{FixedClock, UtcDateTime};
     use std::cell::RefCell;
     use wasmsh_fs::MemoryFs;
 
@@ -2849,6 +2900,12 @@ mod tests {
     fn run_curl(argv: &[&str], backend: &dyn NetworkBackend) -> (i32, VecOutput) {
         let mut fs = MemoryFs::new();
         let mut output = VecOutput::default();
+        let clock = FixedClock::new(
+            UtcDateTime::from_calendar(2026, 1, 1, 0, 0, 0, 0)
+                .unwrap()
+                .epoch_ms(),
+        )
+        .unwrap();
         let status = {
             let mut ctx = UtilContext {
                 fs: &mut fs,
@@ -2857,6 +2914,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: Some(backend),
+                clock: Some(&clock),
             };
             util_curl(&mut ctx, argv)
         };
@@ -2869,6 +2927,12 @@ mod tests {
         fs: &mut MemoryFs,
     ) -> (i32, VecOutput) {
         let mut output = VecOutput::default();
+        let clock = FixedClock::new(
+            UtcDateTime::from_calendar(2026, 1, 1, 0, 0, 0, 0)
+                .unwrap()
+                .epoch_ms(),
+        )
+        .unwrap();
         let status = {
             let mut ctx = UtilContext {
                 fs,
@@ -2877,6 +2941,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: Some(backend),
+                clock: Some(&clock),
             };
             util_curl(&mut ctx, argv)
         };
@@ -2910,6 +2975,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             util_curl(&mut ctx, &["curl", "http://example.com"])
         };
@@ -4047,6 +4113,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: Some(backend),
+                clock: None,
             };
             util_wget(&mut ctx, argv)
         };
@@ -4255,6 +4322,60 @@ mod tests {
         assert!(!captured[1].follow_redirects);
     }
 
+    #[test]
+    fn cross_origin_redirect_drops_sensitive_headers() {
+        let backend = mock_backend(b"ok");
+        backend.redirect_responses.borrow_mut().push((
+            "http://example.com/redir".into(),
+            redirect_response("http://api.test.co/data"),
+        ));
+        let (status, _) = run_curl(
+            &[
+                "curl",
+                "-L",
+                "-H",
+                "Authorization: Bearer secret",
+                "-H",
+                "Cookie: session=secret",
+                "-H",
+                "Proxy-Authorization: Basic secret",
+                "-H",
+                "Host: example.com",
+                "http://example.com/redir",
+            ],
+            &backend,
+        );
+        assert_eq!(status, 0);
+        let captured = backend.captured.borrow();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[1].headers.iter().all(|(name, _)| !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "authorization" | "cookie" | "proxy-authorization" | "host"
+        )));
+    }
+
+    #[test]
+    fn cross_origin_redirect_rejects_sigv4_before_second_fetch() {
+        let backend = mock_backend(b"ok");
+        backend.redirect_responses.borrow_mut().push((
+            "http://example.com/redir".into(),
+            redirect_response("http://api.test.co/data"),
+        ));
+        let (status, output) = run_curl(
+            &[
+                "curl",
+                "-L",
+                "-H",
+                "Authorization: AWS4-HMAC-SHA256 Credential=x",
+                "http://example.com/redir",
+            ],
+            &backend,
+        );
+        assert_ne!(status, 0);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("signed request"));
+        assert_eq!(backend.captured.borrow().len(), 1);
+    }
+
     // ── Verbose redacts credentials ─────────────────────────────
 
     #[test]
@@ -4323,7 +4444,7 @@ mod tests {
             &["curl", "-v", "http://alice:hunter2@example.com/api"],
             &backend,
         );
-        assert_eq!(status, 0);
+        assert_ne!(status, 0);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("hunter2"), "url userinfo leaked: {stderr}");
         assert!(!stderr.contains("alice:"));
@@ -4515,6 +4636,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: Some(&backend),
+                clock: None,
             };
             util_wget(&mut ctx, &["wget", "http://example.com/report.csv"])
         };

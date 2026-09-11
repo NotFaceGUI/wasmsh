@@ -15,6 +15,7 @@ once at the start of every session:
 rt.handle_command(HostCommand::Init {
     step_budget: 100_000,
     allowed_hosts: vec![],
+    network_policy: None,
 });
 ```
 

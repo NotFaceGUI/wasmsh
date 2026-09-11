@@ -1,19 +1,14 @@
 name: Publish LangChain Adapters
 
-# Tag-triggered publish for the langchain-wasmsh adapter packages.
+# Legacy manual publish for the langchain-wasmsh adapter packages.
 #
 # Tag formats:
 #   langchain-wasmsh-py-v<version>      → PyPI       (langchain-wasmsh)
 #   langchain-wasmsh-npm-v<version>     → npm        (@mayflowergmbh/langchain-wasmsh)
 #
-# Both jobs also run on workflow_dispatch so a human can trigger them
-# manually from the Actions UI when a release is cut without a tag.
+# This workflow is intentionally outside the default delivery trigger chain.
 
 on:
-  push:
-    tags:
-      - 'langchain-wasmsh-py-v*'
-      - 'langchain-wasmsh-npm-v*'
   workflow_dispatch:
     inputs:
       target:

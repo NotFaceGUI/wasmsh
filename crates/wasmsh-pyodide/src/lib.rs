@@ -40,6 +40,13 @@ pub extern "C" fn wasmsh_runtime_new() -> *mut RuntimeHandle {
             python_membrane::set_allowed_hosts(allowed_hosts.clone());
             Box::new(network::PyodideNetworkBackend::new(allowed_hosts))
         })),
+        network_policy_backend_factory: Some(Box::new(|policy| {
+            let policy = match wasmsh_utils::net_types::NetworkPolicy::try_from_config(policy) {
+                Ok(policy) => policy,
+                Err(error) => unreachable!("JSON bridge validates network policy first: {error}"),
+            };
+            Box::new(network::PyodideNetworkBackend::from_policy(policy))
+        })),
     });
     Box::into_raw(Box::new(RuntimeHandle { runtime }))
 }

@@ -3217,6 +3217,7 @@ mod tests {
                 stdin: Some(crate::UtilStdin::from_bytes(stdin_data)),
                 state: None,
                 network: None,
+                clock: None,
             };
             util_awk(&mut ctx, argv)
         };
@@ -3239,6 +3240,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             let argv = vec!["awk", program, path];
             util_awk(&mut ctx, &argv)
@@ -3876,6 +3878,7 @@ mod tests {
                 },
                 state: None,
                 network: None,
+                clock: None,
             };
             util_awk(&mut ctx, &argv)
         };
@@ -4189,6 +4192,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             let argv = vec!["awk", "{ print FILENAME, $0 }", "/file1.txt", "/file2.txt"];
             util_awk(&mut ctx, &argv)

@@ -1609,12 +1609,15 @@ pub(crate) fn util_timeout(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
         return 1;
     }
 
-    // Output the command that would be executed
-    // (actual timeout enforcement is at the VM level via step_budget)
-    let cmd = args.join(" ");
-    let out = format!("{cmd}\n");
-    ctx.output.stdout(out.as_bytes());
-    0
+    // The synchronous VM cannot preempt an in-process command, and a utility
+    // has no subcommand executor. Printing the command and returning 0 made
+    // an AI believe it had run when it never did, so refuse explicitly and
+    // point at the host-level wall-clock limit for external processes.
+    let _ = args;
+    ctx.output.stderr(
+        b"timeout: running a command with a time limit is not supported in this sandbox; use the host timeout for external processes\n",
+    );
+    125
 }
 
 // ---------------------------------------------------------------------------
@@ -1787,6 +1790,7 @@ mod tests {
                 stdin: None,
                 state: None,
                 network: None,
+                clock: None,
             };
             f(&mut ctx, argv)
         };
@@ -1812,6 +1816,7 @@ mod tests {
                 stdin: Some(crate::UtilStdin::from_bytes(stdin)),
                 state: None,
                 network: None,
+                clock: None,
             };
             f(&mut ctx, argv)
         };
@@ -2452,11 +2457,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn timeout_passes_through_command() {
+    fn timeout_refuses_without_silently_succeeding() {
         let mut fs = make_fs();
-        let (status, stdout, _) = run(util_timeout, &["timeout", "5", "echo", "hello"], &mut fs);
-        assert_eq!(status, 0);
-        assert_eq!(stdout, "echo hello\n");
+        let (status, stdout, stderr) =
+            run(util_timeout, &["timeout", "5", "echo", "hello"], &mut fs);
+        assert_eq!(status, 125);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("not supported"));
     }
 
     #[test]

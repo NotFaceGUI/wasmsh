@@ -9,6 +9,7 @@ import { createRunnerMetrics } from "./metrics.mjs";
 import { restoreSessionWorker } from "./restore-engine.mjs";
 import { createSessionRegistry } from "./session-registry.mjs";
 import { applyCompileCacheEnv } from "./compile-cache.mjs";
+import { normalizeNetworkPolicy } from "../../../packages/npm/wasmsh-pyodide/lib/allowlist.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const templateWorkerPath = resolve(__dirname, "./template-worker.mjs");
@@ -196,7 +197,8 @@ export async function createRunner(options = {}) {
 
   async function createSession({
     sessionId,
-    allowedHosts = [],
+    allowedHosts,
+    networkPolicy,
     initialFiles = [],
     stepBudget = 0,
   } = {}) {
@@ -214,6 +216,24 @@ export async function createRunner(options = {}) {
       error.code = "WASMSH_SESSION_EXISTS";
       throw error;
     }
+    if (allowedHosts !== undefined && networkPolicy !== undefined) {
+      throw new Error("networkPolicy and allowedHosts cannot both be configured");
+    }
+    const effectiveAllowedHosts = allowedHosts ?? [];
+    const effectiveNetworkConfig = networkPolicy !== undefined
+      ? networkPolicy
+      : effectiveAllowedHosts;
+    // Normalize before spawning a worker. This makes malformed rules an
+    // initialization error and ensures broker provisioning follows the same
+    // enabled/disabled decision as the guest-side membrane.
+    try {
+      normalizeNetworkPolicy(effectiveNetworkConfig);
+    } catch (error) {
+      if (error && typeof error === "object") {
+        error.code = "WASMSH_INVALID_NETWORK_POLICY";
+      }
+      throw error;
+    }
     pendingCreates += 1;
     try {
       await acquireRestoreSlot();
@@ -223,7 +243,8 @@ export async function createRunner(options = {}) {
           assetDir,
           snapshotBuffer: sharedSnapshot.buffer,
           snapshotLength: sharedSnapshot.byteLength,
-          allowedHosts,
+          allowedHosts: networkPolicy === undefined ? effectiveAllowedHosts : undefined,
+          ...(networkPolicy === undefined ? {} : { networkPolicy }),
           stepBudget,
           initialFiles: initialFiles.map((file) => ({
             path: file.path,

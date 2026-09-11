@@ -165,10 +165,7 @@ mod tests {
         // Python preamble — network policy lives in the JS membrane.
         // This test guards against accidental re-introduction of a
         // Python-readable allowlist that user code could mutate.
-        let p = build_preamble(&[
-            "api.example.com".into(),
-            "*.internal.test".into(),
-        ]);
+        let p = build_preamble(&["api.example.com".into(), "*.internal.test".into()]);
         assert!(
             !p.contains("api.example.com"),
             "Python preamble must not embed the host allowlist"

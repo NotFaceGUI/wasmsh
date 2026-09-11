@@ -980,6 +980,7 @@ mod tests {
                 stdin: Some(crate::UtilStdin::from_bytes(input_bytes)),
                 state: None,
                 network: None,
+                clock: None,
             };
             util_bc(&mut ctx, &argv)
         };

@@ -63,6 +63,7 @@ fn main() {
     rt.handle_command(HostCommand::Init {
         step_budget: 100_000,
         allowed_hosts: vec![],
+        network_policy: None,
     });
 
     let events = rt.handle_command(HostCommand::Run {
@@ -102,6 +103,7 @@ fn main() {
     rt.handle_command(HostCommand::Init {
         step_budget: 100_000,
         allowed_hosts: vec![],
+        network_policy: None,
     });
 
     // 1. Seed a CSV file inside the sandbox.

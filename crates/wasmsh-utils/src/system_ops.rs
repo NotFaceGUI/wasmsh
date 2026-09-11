@@ -2,6 +2,7 @@
 
 use std::fmt::Write;
 
+use crate::clock::{sample_utc, UtcDateTime};
 use crate::UtilContext;
 
 pub(crate) fn print_all_exported(ctx: &mut UtilContext<'_>) {
@@ -162,55 +163,6 @@ pub(crate) fn util_sleep(_ctx: &mut UtilContext<'_>, _argv: &[&str]) -> i32 {
     0
 }
 
-struct DateParts {
-    year: u16,
-    month: u8,
-    day: u8,
-    hour: u8,
-    minute: u8,
-    second: u8,
-}
-
-fn parse_date_string(s: &str) -> DateParts {
-    // Parse "YYYY-MM-DD HH:MM:SS" format
-    let mut parts = DateParts {
-        year: 2026,
-        month: 1,
-        day: 1,
-        hour: 0,
-        minute: 0,
-        second: 0,
-    };
-    let s = s.trim();
-    if let Some((date_part, rest)) = s.split_once(' ') {
-        let dp: Vec<&str> = date_part.split('-').collect();
-        if dp.len() == 3 {
-            parts.year = dp[0].parse().unwrap_or(2026);
-            parts.month = dp[1].parse().unwrap_or(1);
-            parts.day = dp[2].parse().unwrap_or(1);
-        }
-        let time_part = rest.split_whitespace().next().unwrap_or("00:00:00");
-        let tp: Vec<&str> = time_part.split(':').collect();
-        if !tp.is_empty() {
-            parts.hour = tp[0].parse().unwrap_or(0);
-        }
-        if tp.len() > 1 {
-            parts.minute = tp[1].parse().unwrap_or(0);
-        }
-        if tp.len() > 2 {
-            parts.second = tp[2].parse().unwrap_or(0);
-        }
-    } else {
-        let dp: Vec<&str> = s.split('-').collect();
-        if dp.len() == 3 {
-            parts.year = dp[0].parse().unwrap_or(2026);
-            parts.month = dp[1].parse().unwrap_or(1);
-            parts.day = dp[2].parse().unwrap_or(1);
-        }
-    }
-    parts
-}
-
 const MONTH_NAMES: [&str; 12] = [
     "January",
     "February",
@@ -242,18 +194,7 @@ const WEEKDAY_NAMES: [&str; 7] = [
 
 const WEEKDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-fn day_of_week(y: u16, m: u8, d: u8) -> usize {
-    // Zeller's formula (0=Sunday)
-    let y = y as i32;
-    let m = m as i32;
-    let d = d as i32;
-    let (y, m) = if m < 3 { (y - 1, m + 12) } else { (y, m) };
-    let dow = (d + (13 * (m + 1)) / 5 + y + y / 4 - y / 100 + y / 400) % 7;
-    // Zeller gives 0=Saturday, convert to 0=Sunday
-    ((dow + 6) % 7) as usize
-}
-
-fn format_date(fmt: &str, parts: &DateParts) -> String {
+fn format_date(fmt: &str, parts: UtcDateTime) -> String {
     let mut result = String::new();
     let mut chars = fmt.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -277,7 +218,10 @@ fn format_date(fmt: &str, parts: &DateParts) -> String {
                 Some('S') => {
                     let _ = write!(result, "{:02}", parts.second);
                 }
-                Some('s') => result.push('0'), // epoch seconds, fake
+                Some('s') => result.push_str(&parts.epoch_seconds().to_string()),
+                Some('N') => {
+                    let _ = write!(result, "{:03}000000", parts.millisecond);
+                }
                 Some('F') => {
                     let _ = write!(
                         result,
@@ -293,11 +237,11 @@ fn format_date(fmt: &str, parts: &DateParts) -> String {
                     );
                 }
                 Some('A') => {
-                    let dow = day_of_week(parts.year, parts.month, parts.day);
+                    let dow = parts.weekday_sunday_zero();
                     result.push_str(WEEKDAY_NAMES[dow]);
                 }
                 Some('a') => {
-                    let dow = day_of_week(parts.year, parts.month, parts.day);
+                    let dow = parts.weekday_sunday_zero();
                     result.push_str(WEEKDAY_ABBR[dow]);
                 }
                 Some('B') => {
@@ -331,6 +275,19 @@ fn format_date(fmt: &str, parts: &DateParts) -> String {
                 Some('p') => {
                     result.push_str(if parts.hour < 12 { "AM" } else { "PM" });
                 }
+                Some('j') => {
+                    let month_days: [u16; 12] =
+                        [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+                    let leap = parts.year.is_multiple_of(4)
+                        && (!parts.year.is_multiple_of(100) || parts.year.is_multiple_of(400));
+                    let offset = month_days[(parts.month - 1) as usize];
+                    let leap_day = u16::from(leap && parts.month > 2);
+                    let _ = write!(result, "{:03}", offset + u16::from(parts.day) + leap_day);
+                }
+                Some('u') => {
+                    result.push_str(&(((parts.weekday_sunday_zero() + 6) % 7 + 1).to_string()));
+                }
+                Some('w') => result.push_str(&parts.weekday_sunday_zero().to_string()),
                 Some('R') => {
                     let _ = write!(result, "{:02}:{:02}", parts.hour, parts.minute);
                 }
@@ -347,46 +304,160 @@ fn format_date(fmt: &str, parts: &DateParts) -> String {
 }
 
 pub(crate) fn util_date(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
-    let base_str = ctx
-        .state
-        .and_then(|s| s.get_var("WASMSH_DATE"))
-        .map_or_else(|| "2026-01-01 00:00:00 UTC".to_string(), |s| s.to_string());
-
-    let parts = parse_date_string(&base_str);
-
-    // Find +FORMAT argument
     let mut format_arg: Option<&str> = None;
+    let mut explicit_date: Option<&str> = None;
+    let mut output_mode = DateOutput::Default;
     let mut i = 1;
     while i < argv.len() {
         let arg = argv[i];
         if let Some(fmt) = arg.strip_prefix('+') {
             format_arg = Some(fmt);
-            i += 1;
         } else if arg == "-d" || arg == "--date" {
-            i += 2; // skip arg, ignore
-        } else if arg == "-u" || arg == "-R" || arg == "-I" {
-            i += 1; // accept, no special handling
-        } else {
+            if i + 1 >= argv.len() {
+                return date_error(ctx, "option requires an argument: -d");
+            }
+            explicit_date = Some(argv[i + 1]);
             i += 1;
+        } else if let Some(value) = arg.strip_prefix("--date=") {
+            explicit_date = Some(value);
+        } else if arg == "-u" || arg == "--utc" {
+            // All shell dates are UTC. Keep the option explicit and accepted.
+        } else if arg == "-R" || arg == "--rfc-email" {
+            output_mode = DateOutput::Rfc2822;
+        } else if arg == "-I" || arg == "--iso-8601" {
+            output_mode = DateOutput::Iso(DatePrecision::Date);
+        } else if let Some(value) = arg.strip_prefix("-I") {
+            output_mode = match DatePrecision::parse(value) {
+                Some(precision) => DateOutput::Iso(precision),
+                None => return date_error(ctx, "unsupported -I precision"),
+            };
+        } else if let Some(value) = arg.strip_prefix("--iso-8601=") {
+            output_mode = match DatePrecision::parse(value) {
+                Some(precision) => DateOutput::Iso(precision),
+                None => return date_error(ctx, "unsupported ISO-8601 precision"),
+            };
+        } else if arg == "--" {
+            if i + 1 < argv.len() {
+                i += 1;
+                if let Some(fmt) = argv[i].strip_prefix('+') {
+                    format_arg = Some(fmt);
+                } else {
+                    return date_error(ctx, "unexpected operand");
+                }
+            }
+        } else if arg.starts_with('-') {
+            return date_error(ctx, &format!("unsupported option: {arg}"));
+        } else {
+            return date_error(ctx, "unexpected operand");
         }
+        i += 1;
     }
 
-    if let Some(fmt) = format_arg {
-        let out = format_date(fmt, &parts);
-        ctx.output.stdout(out.as_bytes());
-        ctx.output.stdout(b"\n");
+    let parts = if let Some(value) = explicit_date {
+        match UtcDateTime::parse_legacy(value) {
+            Ok(parts) => parts,
+            Err(error) => return date_error(ctx, &error.to_string()),
+        }
+    } else if let Some(clock) = ctx.clock {
+        match sample_utc(clock) {
+            Ok(parts) => parts,
+            Err(error) => return date_error(ctx, &error.to_string()),
+        }
     } else {
-        ctx.output.stdout(base_str.as_bytes());
-        if !base_str.ends_with('\n') {
-            ctx.output.stdout(b"\n");
+        let Some(raw) = ctx.state.and_then(|state| state.get_var("WASMSH_DATE")) else {
+            return date_error(
+                ctx,
+                "clock unavailable; install a host callback or set WASMSH_DATE in legacy mode",
+            );
+        };
+        match UtcDateTime::parse_legacy(&raw) {
+            Ok(parts) => parts,
+            Err(error) => return date_error(ctx, &error.to_string()),
+        }
+    };
+
+    let output = if let Some(fmt) = format_arg {
+        format_date(fmt, parts)
+    } else {
+        match output_mode {
+            DateOutput::Default => format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                parts.year, parts.month, parts.day, parts.hour, parts.minute, parts.second
+            ),
+            DateOutput::Rfc2822 => {
+                format!(
+                    "{}, {:02} {} {:04} {:02}:{:02}:{:02} +0000",
+                    WEEKDAY_ABBR[parts.weekday_sunday_zero()],
+                    parts.day,
+                    MONTH_ABBR[(parts.month - 1) as usize],
+                    parts.year,
+                    parts.hour,
+                    parts.minute,
+                    parts.second
+                )
+            }
+            DateOutput::Iso(precision) => format_iso(parts, precision),
+        }
+    };
+    ctx.output.stdout(output.as_bytes());
+    ctx.output.stdout(b"\n");
+    0
+}
+
+#[derive(Clone, Copy)]
+enum DateOutput {
+    Default,
+    Rfc2822,
+    Iso(DatePrecision),
+}
+
+#[derive(Clone, Copy)]
+enum DatePrecision {
+    Date,
+    Hours,
+    Minutes,
+    Seconds,
+}
+
+impl DatePrecision {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "" | "date" => Some(Self::Date),
+            "hours" => Some(Self::Hours),
+            "minutes" => Some(Self::Minutes),
+            "seconds" => Some(Self::Seconds),
+            _ => None,
         }
     }
-    0
+}
+
+fn format_iso(parts: UtcDateTime, precision: DatePrecision) -> String {
+    match precision {
+        DatePrecision::Date => format!("{:04}-{:02}-{:02}", parts.year, parts.month, parts.day),
+        DatePrecision::Hours => format!(
+            "{:04}-{:02}-{:02}T{:02}+00:00",
+            parts.year, parts.month, parts.day, parts.hour
+        ),
+        DatePrecision::Minutes => format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}+00:00",
+            parts.year, parts.month, parts.day, parts.hour, parts.minute
+        ),
+        DatePrecision::Seconds => format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
+            parts.year, parts.month, parts.day, parts.hour, parts.minute, parts.second
+        ),
+    }
+}
+
+fn date_error(ctx: &mut UtilContext<'_>, message: &str) -> i32 {
+    ctx.output.stderr(format!("date: {message}\n").as_bytes());
+    1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FixedClock, UtcDateTime};
     use wasmsh_fs::BackendFs;
     use wasmsh_state::{ShellState, ShellVar};
 
@@ -407,6 +478,7 @@ mod tests {
                 stdin: None,
                 state: Some(&state),
                 network: None,
+                clock: None,
             },
             argv,
         );
@@ -434,5 +506,87 @@ mod tests {
         assert_eq!(status, 1);
         assert_eq!(stdout, "");
         assert_eq!(stderr, "");
+    }
+
+    fn run_date(argv: &[&str], clock: Option<&dyn crate::ClockProvider>) -> (i32, String, String) {
+        let mut fs = BackendFs::new();
+        let mut output = crate::VecOutput::default();
+        let status = util_date(
+            &mut UtilContext {
+                fs: &mut fs,
+                output: &mut output,
+                cwd: "/",
+                stdin: None,
+                state: None,
+                network: None,
+                clock,
+            },
+            argv,
+        );
+        (
+            status,
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    }
+
+    #[test]
+    fn date_samples_one_fixed_clock_value_for_all_format_fields() {
+        let clock = FixedClock::new(
+            UtcDateTime::from_calendar(2024, 2, 29, 23, 59, 59, 987)
+                .unwrap()
+                .epoch_ms(),
+        )
+        .unwrap();
+        let (status, stdout, stderr) =
+            run_date(&["date", "+%Y-%m-%d %H:%M:%S %s %N %A"], Some(&clock));
+        assert_eq!(status, 0);
+        assert_eq!(
+            stdout,
+            "2024-02-29 23:59:59 1709251199 987000000 Thursday\n"
+        );
+        assert_eq!(stderr, "");
+    }
+
+    #[test]
+    fn date_without_clock_fails_instead_of_using_a_startup_default() {
+        let (status, stdout, stderr) = run_date(&["date", "+%s"], None);
+        assert_eq!(status, 1);
+        assert_eq!(stdout, "");
+        assert!(stderr.contains("clock unavailable"));
+    }
+
+    #[test]
+    fn date_options_and_legacy_wasmsh_date_are_explicit() {
+        let (status, stdout, stderr) = run_date(&["date", "-R"], None);
+        assert_eq!(status, 1);
+        assert_eq!(stdout, "");
+        assert!(stderr.contains("clock unavailable"));
+
+        let mut fs = BackendFs::new();
+        let mut output = crate::VecOutput::default();
+        let mut state = ShellState::new();
+        state.set_var("WASMSH_DATE".into(), "2026-01-02 03:04:05 UTC".into());
+        let status = util_date(
+            &mut UtilContext {
+                fs: &mut fs,
+                output: &mut output,
+                cwd: "/",
+                stdin: None,
+                state: Some(&state),
+                network: None,
+                clock: None,
+            },
+            &["date", "-R"],
+        );
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "Fri, 02 Jan 2026 03:04:05 +0000\n"
+        );
+
+        let (status, _, stderr) = run_date(&["date", "--silently-ignore-me"], None);
+        assert_eq!(status, 1);
+        assert!(stderr.contains("unsupported option"));
     }
 }
