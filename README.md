@@ -1,6 +1,6 @@
 # wasmsh
 
-## 本 Fork 的项目目标
+## 项目目标
 
 面向 AI 助手提供统一的 Bash 兼容沙箱，减少对宿主 PowerShell / sh 和系统工具环境的依赖。主交付物为 GitHub Actions 编译的独立 sh WASM，不包含 WASM Python / Pyodide。
 
@@ -10,7 +10,7 @@
 
 以上文档描述目标、边界和验收证据；实际已实现能力以
 [`SUPPORTED.md`](SUPPORTED.md) 与实施跟踪为准。当前主交付是独立 standalone
-sh WASM；Python、集群部署和发布渠道属于保留的 legacy profile，不会进入
+sh WASM；Python、集群部署和发布渠道属于可选 profile，不会进入
 standalone 产物。
 
 ## Standalone quick start
@@ -27,9 +27,9 @@ API 和网络 broker 约束见
 [Standalone WASM embedding](docs/guides/standalone-embedding.md)。
 
 **Bash-compatible shell runtime in Rust, compiled to WebAssembly.** The primary
-delivery of this fork is the standalone sh WASM built by this repository's
-GitHub Actions; browsers, Pyodide, and the Kubernetes sandbox pool are legacy
-profiles retained from upstream and are not part of the standalone artifact.
+delivery is the standalone sh WASM built by this repository's GitHub Actions;
+browsers, Pyodide, and the Kubernetes sandbox pool are optional profiles and
+are not part of the standalone artifact.
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![standalone WASM](https://img.shields.io/badge/build-standalone%20wasm-blue)](.github/workflows/wasm-build.yml)
@@ -41,7 +41,13 @@ filesystem without giving the script implicit host access. The primary
 standalone delivery runs the shell in WebAssembly with 88 utilities, binary
 events, no Python runtime, no native processes by default, and no network
 unless a host capability is explicitly installed. Python/Pyodide remains a
-separate legacy profile.
+separate optional profile.
+
+Bash compatibility is a **verified subset**, not an open-ended promise: the
+suite in [`tests/suite/differential/`](tests/suite/differential/) runs scripts
+through both wasmsh and a real `bash` and asserts identical stdout, stderr,
+and exit status, with a dedicated `oracle` CI job. What is verified, what
+diverges, and what is only stubbed is listed in [`SUPPORTED.md`](SUPPORTED.md).
 
 Primary and legacy deployment modes from one core:
 
@@ -153,8 +159,8 @@ the pinned wasm-pack, wasm-bindgen-cli, and Binaryen 117 from
 `just ci` for the Rust checks.
 
 The registry packages below (`crates.io`, npm, PyPI, container images) belong
-to the upstream Pyodide/Kubernetes profile and are **not** published by this
-fork; do not expect the standalone shell there.
+to the optional Pyodide/Kubernetes profile and are **not** published by the
+standalone build; do not expect the standalone shell there.
 
 | Registry | Package | Install |
 |-|-|-|

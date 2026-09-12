@@ -19,7 +19,7 @@ Everything else is either **known divergent** (documented below) or
 PTY or job control, several utilities are stubs, and locale handling is fixed
 to UTF-8/C. See [Known divergences and degraded commands](#known-divergences-and-degraded-commands).
 
-## Fork Delivery Status
+## Delivery Status
 
 The standalone artifact is the primary AI-shell delivery. Its base tier is
 the in-process Bash-compatible runtime, POSIX virtual filesystem, binary
