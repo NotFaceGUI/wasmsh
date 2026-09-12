@@ -191,10 +191,121 @@ fn try_expand_array_subscript(name: &str, state: &mut ShellState, out: &mut Stri
     if try_expand_array_length_or_keys(name, state, out) {
         return true;
     }
+    if try_expand_array_slice(name, state, out) {
+        return true;
+    }
     if try_expand_array_all_values(name, state, out) {
         return true;
     }
     try_expand_array_single_element(name, state, out)
+}
+
+/// Handle `${arr[@]:offset}` and `${arr[@]:offset:length}`. Without this the
+/// `[@]` is mistaken for a single subscript and the whole expansion yields an
+/// empty string.
+fn try_expand_array_slice(name: &str, state: &mut ShellState, out: &mut String) -> bool {
+    let Some(bracket_pos) = name.find('[') else {
+        return false;
+    };
+    let Some(rel_end) = name[bracket_pos..].find(']') else {
+        return false;
+    };
+    let end = bracket_pos + rel_end;
+    let base = &name[..bracket_pos];
+    let index = &name[bracket_pos + 1..end];
+    if base.is_empty() || (index != "@" && index != "*") {
+        return false;
+    }
+    let Some(slice_spec) = name[end + 1..].strip_prefix(':') else {
+        return false;
+    };
+    let values: Vec<String> = state
+        .get_array_values(base)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let slice = apply_array_slice(&values, slice_spec);
+    out.push_str(&slice.join(" "));
+    true
+}
+
+/// Apply a bash `${arr[@]:offset[:length]}` slice spec to `values`. A negative
+/// offset counts from the end; a negative length counts back from the end; a
+/// length is clamped to the array bounds.
+fn apply_array_slice(values: &[String], slice_spec: &str) -> Vec<String> {
+    let (offset_str, length_str) = match slice_spec.split_once(':') {
+        Some((o, l)) => (o.trim(), Some(l.trim())),
+        None => (slice_spec.trim(), None),
+    };
+    // Use i128 to keep the negative-offset arithmetic free of sign/width
+    // surprises while never overflowing for realistic array sizes.
+    let len = i128::try_from(values.len()).unwrap_or(i128::MAX);
+    let mut offset: i128 = offset_str.parse().unwrap_or(0);
+    if offset < 0 {
+        offset += len;
+    }
+    offset = offset.max(0);
+    let start = usize::try_from(offset.min(len)).unwrap_or(0);
+    let end_idx = match length_str {
+        Some(spec) => {
+            let count: i128 = spec.parse().unwrap_or(len);
+            if count < 0 {
+                usize::try_from((len + count).max(offset)).unwrap_or(start)
+            } else {
+                usize::try_from((offset + count).min(len)).unwrap_or(values.len())
+            }
+        }
+        None => values.len(),
+    };
+    values[start.min(values.len())..end_idx.min(values.len()).max(start.min(values.len()))].to_vec()
+}
+
+/// Return the individual elements for a quoted multi-field expansion, or `None`
+/// when `name` is not multi-field. `[*]` is excluded: it joins into one field.
+/// Handles `"$@"`, `${a[@]}`, `${!a[@]}` and the slice forms
+/// `${a[@]:o}` / `${a[@]:o:l}`.
+///
+/// Used by the runtime when splitting `for` word lists so `"${a[@]}"` yields
+/// one field per element (bash semantics) instead of one joined field.
+#[must_use]
+pub fn array_multi_expansion(name: &str, state: &mut ShellState) -> Option<Vec<String>> {
+    if name == "@" {
+        return Some(state.positional.iter().map(ToString::to_string).collect());
+    }
+    let bracket_pos = name.find('[')?;
+    let rel_end = name[bracket_pos..].find(']')?;
+    let end = bracket_pos + rel_end;
+    let base = &name[..bracket_pos];
+    let index = &name[bracket_pos + 1..end];
+    if index != "@" {
+        return None;
+    }
+
+    // `${!a[@]}` — keys.
+    let (base, is_keys) = match base.strip_prefix('!') {
+        Some(rest) => (rest, true),
+        None => (base, false),
+    };
+    if base.is_empty() || base.starts_with('#') {
+        return None;
+    }
+
+    let mut elements: Vec<String> = if is_keys {
+        state.get_array_keys(base)
+    } else {
+        state
+            .get_array_values(base)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+
+    // Optional `:offset[:length]` slice after the closing bracket.
+    if let Some(slice_spec) = name[end + 1..].strip_prefix(':') {
+        elements = apply_array_slice(&elements, slice_spec);
+    }
+
+    Some(elements)
 }
 
 /// Handle `${#arr[@]}` (array length) and `${!arr[@]}` (array keys).
@@ -255,6 +366,13 @@ fn try_expand_array_single_element(name: &str, state: &mut ShellState, out: &mut
 fn try_expand_string_length(name: &str, state: &ShellState, out: &mut String) -> bool {
     if let Some(var_name) = name.strip_prefix('#') {
         if !var_name.is_empty() {
+            // `${#@}` and `${#*}` are the *number* of positional parameters,
+            // not the character count of their joined text. Every other name
+            // (including `$#`, `${#0}`, `${#?}`) is the string length.
+            if var_name == "@" || var_name == "*" {
+                out.push_str(&state.positional.len().to_string());
+                return true;
+            }
             let len = state.get_var(var_name).map_or(0, |v| v.len());
             out.push_str(&len.to_string());
             return true;
@@ -577,7 +695,17 @@ fn expand_param_default_op(
         "-" => expand_param_default_value(val, operand, state, out, depth, false),
         ":=" => expand_param_assign_value(var_name, val, operand, state, out, depth, true),
         "=" => expand_param_assign_value(var_name, val, operand, state, out, depth, false),
-        ":?" => expand_param_error_value(var_name, val, operand, out, true),
+        ":?" | "?" => {
+            let require_non_empty = operator == ":?";
+            let before = out.len();
+            expand_param_error_value(var_name, val, operand, out, require_non_empty);
+            if out.len() != before {
+                // Bash reports the message on stderr and the command fails; do
+                // not leave the text in stdout as a normal expansion result.
+                let message = out.split_off(before);
+                state.set_fatal_shell_error(&message);
+            }
+        }
         ":+" => expand_param_alt_value(val.as_ref(), operand, out, true),
         _ => expand_param_alt_value(val.as_ref(), operand, out, false),
     }
@@ -1149,7 +1277,7 @@ enum ArithToken {
 }
 
 /// Tokenize an arithmetic expression string into a sequence of tokens.
-fn arith_tokenize(input: &str) -> Vec<ArithToken> {
+fn arith_tokenize(input: &str, state: &mut ShellState) -> Vec<ArithToken> {
     let bytes = input.as_bytes();
     let mut tokens = Vec::new();
     let mut pos = 0;
@@ -1158,6 +1286,8 @@ fn arith_tokenize(input: &str) -> Vec<ArithToken> {
         let b = bytes[pos];
         if b.is_ascii_whitespace() {
             pos += 1;
+        } else if b == b'$' {
+            arith_tokenize_dollar(input, bytes, &mut pos, &mut tokens, state);
         } else if b.is_ascii_digit() {
             arith_tokenize_number(input, bytes, &mut pos, &mut tokens);
         } else if b.is_ascii_alphabetic() || b == b'_' {
@@ -1167,6 +1297,72 @@ fn arith_tokenize(input: &str) -> Vec<ArithToken> {
         }
     }
     tokens
+}
+
+/// Tokenize a `$`-prefixed parameter reference inside `$(( ))` as a literal
+/// number. Bash substitutes the value before evaluating the expression, so
+/// `$1`, `$#`, `${arr[2]}` and `$var` all become their numeric value. Without
+/// this the `$` was silently dropped and `$1` became the literal `1`, while
+/// `$#` became `0` — wrong results that are easy to miss.
+///
+/// A bare `$name` (alphabetic/underscore) is left for the identifier path so it
+/// stays a live variable reference; everything else is resolved here through
+/// the shared parameter expander.
+fn arith_tokenize_dollar(
+    input: &str,
+    bytes: &[u8],
+    pos: &mut usize,
+    tokens: &mut Vec<ArithToken>,
+    state: &mut ShellState,
+) {
+    *pos += 1; // consume `$`
+    let Some(&next) = bytes.get(*pos) else {
+        tokens.push(ArithToken::Number(0));
+        return;
+    };
+
+    let name: String;
+    if next == b'{' {
+        let start = *pos + 1;
+        let mut depth = 1u32;
+        let mut i = start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        name = input[start..i.min(bytes.len())].to_string();
+        *pos = (i + 1).min(bytes.len());
+    } else if next.is_ascii_digit() {
+        let start = *pos;
+        while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+            *pos += 1;
+        }
+        name = input[start..*pos].to_string();
+    } else if next.is_ascii_alphabetic() || next == b'_' {
+        // Live variable reference: let the main loop tokenize the identifier.
+        return;
+    } else {
+        let ch = input[*pos..].chars().next().unwrap_or('\0');
+        *pos += ch.len_utf8();
+        name = ch.to_string();
+    }
+
+    let mut out = String::new();
+    expand_parameter(&SmolStr::from(name.as_str()), state, &mut out, 0);
+    // Strip the nounset side channel the expander may have set; arithmetic
+    // resolves an unset parameter to 0 rather than aborting.
+    let _ = state.take_nounset_error();
+    let value = out.trim().parse::<i64>().unwrap_or(0);
+    tokens.push(ArithToken::Number(value));
 }
 
 /// Tokenize a numeric literal (decimal, hex, binary, octal, or base#value).
@@ -1502,11 +1698,20 @@ fn arith_tokenize_operator(bytes: &[u8], pos: &mut usize, tokens: &mut Vec<Arith
     }
 }
 
+/// Maximum recursion depth of the arithmetic parser. `$(( ))` nests through
+/// grouping, exponentiation, unary operators and the ternary operator, all of
+/// which recurse. The bound is far below the depth that overflows a native or
+/// WASM stack; exceeding it reports a normal arithmetic error rather than
+/// aborting the process.
+const MAX_ARITH_DEPTH: u32 = 64;
+
 /// Parser state for the arithmetic evaluator.
 struct ArithParser<'a> {
     tokens: Vec<ArithToken>,
     pos: usize,
     state: &'a mut ShellState,
+    /// Current recursion depth, bounded by [`MAX_ARITH_DEPTH`].
+    depth: u32,
 }
 
 impl<'a> ArithParser<'a> {
@@ -1515,7 +1720,31 @@ impl<'a> ArithParser<'a> {
             tokens,
             pos: 0,
             state,
+            depth: 0,
         }
+    }
+
+    /// Enter one recursion level, rejecting input past [`MAX_ARITH_DEPTH`].
+    /// The error is recorded on the shell state so command dispatch reports a
+    /// non-zero status instead of a silent `0`.
+    fn enter_depth(&mut self) -> Result<(), ()> {
+        if self.depth >= MAX_ARITH_DEPTH {
+            self.state
+                .set_arith_error("expression recursion limit exceeded");
+            return Err(());
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn exit_depth(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    /// Record a division-by-zero style error and return the sentinel value.
+    fn arith_error(&mut self, message: &str) -> i64 {
+        self.state.set_arith_error(message);
+        0
     }
 
     fn peek(&self) -> Option<&ArithToken> {
@@ -1560,6 +1789,12 @@ impl<'a> ArithParser<'a> {
 
     // Assignment: right-associative
     fn parse_assign(&mut self) -> i64 {
+        // Guard the recursion depth. This function is the cycle for grouping
+        // `( )`, the ternary operator and assignment chains, so one check here
+        // bounds all of them.
+        if self.enter_depth().is_err() {
+            return 0;
+        }
         // Check if the current token is an identifier followed by an assignment operator.
         // Save position so we can backtrack.
         let save = self.pos;
@@ -1567,13 +1802,16 @@ impl<'a> ArithParser<'a> {
         if let Some(ArithToken::Ident(name)) = self.peek().cloned() {
             self.pos += 1;
             if let Some(result) = self.try_compound_assign(&name) {
+                self.exit_depth();
                 return result;
             }
             // Not an assignment -- backtrack
             self.pos = save;
         }
 
-        self.parse_ternary()
+        let result = self.parse_ternary();
+        self.exit_depth();
+        result
     }
 
     /// Try to parse a compound assignment operator after an identifier.
@@ -1793,10 +2031,18 @@ impl<'a> ArithParser<'a> {
                 val = val.wrapping_mul(rhs);
             } else if self.eat(&ArithToken::Slash) {
                 let rhs = self.parse_exponentiation();
-                val = if rhs == 0 { 0 } else { val.wrapping_div(rhs) };
+                val = if rhs == 0 {
+                    self.arith_error("division by 0")
+                } else {
+                    val.wrapping_div(rhs)
+                };
             } else if self.eat(&ArithToken::Percent) {
                 let rhs = self.parse_exponentiation();
-                val = if rhs == 0 { 0 } else { val.wrapping_rem(rhs) };
+                val = if rhs == 0 {
+                    self.arith_error("division by 0")
+                } else {
+                    val.wrapping_rem(rhs)
+                };
             } else {
                 break;
             }
@@ -1806,17 +2052,31 @@ impl<'a> ArithParser<'a> {
 
     // Exponentiation: ** (right-associative)
     fn parse_exponentiation(&mut self) -> i64 {
+        if self.enter_depth().is_err() {
+            return 0;
+        }
         let base = self.parse_unary();
-        if self.eat(&ArithToken::StarStar) {
+        let result = if self.eat(&ArithToken::StarStar) {
             let exp = self.parse_exponentiation(); // right-associative recursion
             wrapping_pow(base, exp)
         } else {
             base
-        }
+        };
+        self.exit_depth();
+        result
     }
 
     // Unary: ! ~ + - ++var --var
     fn parse_unary(&mut self) -> i64 {
+        if self.enter_depth().is_err() {
+            return 0;
+        }
+        let result = self.parse_unary_inner();
+        self.exit_depth();
+        result
+    }
+
+    fn parse_unary_inner(&mut self) -> i64 {
         match self.peek().cloned() {
             Some(ArithToken::Bang) => {
                 self.pos += 1;
@@ -1924,7 +2184,7 @@ fn wrapping_pow(base: i64, exp: i64) -> i64 {
 /// Variable references (bare names without `$`) are resolved from shell state;
 /// unset variables default to 0.
 pub fn eval_arithmetic(expr: &str, state: &mut ShellState) -> i64 {
-    let tokens = arith_tokenize(expr.trim());
+    let tokens = arith_tokenize(expr.trim(), state);
     if tokens.is_empty() {
         return 0;
     }
@@ -2195,8 +2455,13 @@ mod tests {
     fn expand_error_if_unset() {
         let mut state = ShellState::new();
         let word = make_word(vec![WordPart::Parameter("X:?missing".into())]);
+        // `${X:?missing}` must not contribute text to stdout; it records a
+        // fatal shell error that command dispatch turns into stderr + exit 1.
         let result = expand_word(&word, &mut state);
-        assert!(result.contains("missing"));
+        assert!(result.is_empty(), "unexpected stdout text: {result:?}");
+        let (fatal, message) = state.take_shell_error().expect("expected shell error");
+        assert!(fatal);
+        assert!(message.contains("missing"), "message was {message:?}");
     }
 
     #[test]
@@ -2746,5 +3011,43 @@ mod tests {
         state.set_var("x".into(), "file.tar.gz".into());
         let word = make_word(vec![WordPart::Parameter("x%%.*".into())]);
         assert_eq!(expand_word(&word, &mut state), "file");
+    }
+
+    #[test]
+    fn division_by_zero_records_arithmetic_error() {
+        let mut state = ShellState::new();
+        // The value is a placeholder; the recorded error is what makes the
+        // command fail instead of silently succeeding with a wrong result.
+        assert_eq!(eval_arithmetic("1 / 0", &mut state), 0);
+        assert_eq!(state.take_arith_error().as_deref(), Some("division by 0"));
+        assert!(state.take_arith_error().is_none());
+    }
+
+    #[test]
+    fn deeply_nested_arithmetic_is_rejected_not_overflowed() {
+        let mut state = ShellState::new();
+        let depth = 500usize;
+        let mut expr = String::new();
+        for _ in 0..depth {
+            expr.push('(');
+        }
+        expr.push('1');
+        for _ in 0..depth {
+            expr.push(')');
+        }
+        // Must not overflow the stack; the depth guard returns 0 and records
+        // an error so the caller can report a non-zero status.
+        let value = eval_arithmetic(&expr, &mut state);
+        assert_eq!(value, 0);
+    }
+
+    #[test]
+    fn arithmetic_dollar_parameter_is_resolved() {
+        let mut state = ShellState::new();
+        state.positional = vec!["7".into(), "8".into()];
+        assert_eq!(eval_arithmetic("$1 + 1", &mut state), 8);
+        assert_eq!(eval_arithmetic("$#", &mut state), 2);
+        state.set_var("a".into(), "5".into());
+        assert_eq!(eval_arithmetic("$a * 2", &mut state), 10);
     }
 }

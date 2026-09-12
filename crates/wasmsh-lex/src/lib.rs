@@ -87,12 +87,23 @@ fn is_reserved_word(s: &str) -> bool {
     RESERVED_WORDS.contains(&s)
 }
 
+/// Maximum nesting depth of `$( ... )` / `$(( ... ))` / `${ ... }` while
+/// lexing one word. Scanning these is recursive (`consume_dollar` →
+/// `consume_dollar_paren` → `consume_command_subst` → `consume_dollar`), so
+/// deeply nested input would otherwise overflow the stack — and because the
+/// inner text is re-lexed at each execution level, the cost compounds. Bounding
+/// it at lex time keeps every later level's re-parse cheap.
+const MAX_LEX_DEPTH: u32 = 48;
+
 /// The shell lexer.
 #[derive(Debug)]
 pub struct Lexer<'src> {
     source: &'src [u8],
     pos: usize,
     mode: LexerMode,
+    /// Current nesting depth of recursive substitutions, bounded by
+    /// [`MAX_LEX_DEPTH`].
+    subst_depth: u32,
 }
 
 impl<'src> Lexer<'src> {
@@ -102,7 +113,25 @@ impl<'src> Lexer<'src> {
             source: source.as_bytes(),
             pos: 0,
             mode: LexerMode::Normal,
+            subst_depth: 0,
         }
+    }
+
+    /// Enter one level of recursive substitution scanning, rejecting input past
+    /// [`MAX_LEX_DEPTH`] with an ordinary lexer error.
+    fn enter_subst(&mut self) -> Result<u32, LexerError> {
+        if self.subst_depth >= MAX_LEX_DEPTH {
+            return Err(LexerError {
+                message: format!("maximum substitution nesting depth ({MAX_LEX_DEPTH}) exceeded"),
+                span: self.span_from(self.pos),
+            });
+        }
+        self.subst_depth += 1;
+        Ok(self.subst_depth)
+    }
+
+    fn exit_subst(&mut self) {
+        self.subst_depth = self.subst_depth.saturating_sub(1);
     }
 
     #[must_use]
@@ -238,6 +267,9 @@ impl<'src> Lexer<'src> {
                 Some(b'$') => {
                     self.consume_dollar()?;
                 }
+                Some(b'`') => {
+                    self.consume_backtick()?;
+                }
                 Some(_) => {
                     self.pos += 1;
                 }
@@ -249,6 +281,37 @@ impl<'src> Lexer<'src> {
         self.pos += 1; // backslash
         if self.peek().is_some() {
             self.pos += 1; // escaped char
+        }
+    }
+
+    /// Consume a legacy `` `...` `` command substitution as part of the current
+    /// word. Spaces inside the backticks must not break the word, and `\`` `,
+    /// `\$`, `\\` are escaped inside it.
+    fn consume_backtick(&mut self) -> Result<(), LexerError> {
+        let start = self.pos;
+        self.pos += 1; // opening `
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(LexerError {
+                        message: "unterminated backquote".into(),
+                        span: self.span_from(start),
+                    });
+                }
+                Some(b'`') => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some(b'\\') => {
+                    self.pos += 1;
+                    if self.peek().is_some() {
+                        self.pos += 1;
+                    }
+                }
+                Some(_) => {
+                    self.pos += 1;
+                }
+            }
         }
     }
 
@@ -275,12 +338,15 @@ impl<'src> Lexer<'src> {
     /// Consume `$(...)` or `$((...))`.
     fn consume_dollar_paren(&mut self) -> Result<(), LexerError> {
         self.pos += 1; // (
-        if self.peek() == Some(b'(') {
+        self.enter_subst()?;
+        let result = if self.peek() == Some(b'(') {
             self.pos += 1;
             self.consume_arithmetic()
         } else {
             self.consume_command_subst()
-        }
+        };
+        self.exit_subst();
+        result
     }
 
     /// Consume an identifier (alphanumeric + underscore).
@@ -470,6 +536,7 @@ impl<'src> Lexer<'src> {
         match next {
             b'\'' => self.consume_single_quoted(),
             b'"' => self.consume_double_quoted(),
+            b'`' => self.consume_backtick(),
             b'\\' => {
                 self.consume_backslash();
                 Ok(())
@@ -659,9 +726,13 @@ fn is_special_param(b: u8) -> bool {
 }
 
 fn is_word_break(b: u8) -> bool {
+    // `#` is deliberately absent: it only starts a comment at the beginning of
+    // a word (`echo #x`), not inside one. Treating it as a word break made
+    // `echo a#b` lose `#b`. A leading `#` is still recognised as a comment in
+    // `next_normal_token`.
     matches!(
         b,
-        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'#'
+        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')'
     )
 }
 
@@ -1084,5 +1155,25 @@ mod tests {
         let toks = tokens_with_text("<(echo $HOME)");
         assert_eq!(toks.len(), 1);
         assert_eq!(toks[0].1, "<(echo $HOME)");
+    }
+
+    #[test]
+    fn deeply_nested_command_substitution_is_a_lexer_error() {
+        // Scanning `$( ... )` is recursive; unbounded nesting used to overflow
+        // the stack (and, in WASM, poison the shell instance). It must now be a
+        // normal lexer error.
+        let depth = 500usize;
+        let source = format!("echo {}x{}", "$(".repeat(depth), ")".repeat(depth));
+        let err = tokenize(&source).expect_err("expected a nesting-depth error");
+        assert!(
+            err.message.contains("nesting depth"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn shallow_nested_substitution_still_lexes() {
+        assert!(tokenize("echo \"$(echo $(echo x))\"").is_ok());
     }
 }

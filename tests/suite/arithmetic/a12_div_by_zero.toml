@@ -5,8 +5,14 @@ tier = "P0"
 requires = ["arithmetic-expansion", "echo"]
 
 [input]
-script = "echo $((10 / 0))"
+script = "echo $((10 / 0))\necho \"after status=$?\""
 
 [expect]
 status = 0
-stdout = "0\n"
+stdout = "after status=1\n"
+stderr_contains = ["division by 0"]
+
+[oracle]
+compare = true
+shells = ["bash"]
+ignore_stderr = true

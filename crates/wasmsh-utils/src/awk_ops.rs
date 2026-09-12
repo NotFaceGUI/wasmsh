@@ -741,6 +741,12 @@ struct AwkProgram {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// Maximum recursion depth of the awk expression parser. Grouping, power,
+/// unary operators and the ternary operator all recurse; without a bound a
+/// deeply nested expression overflows the stack (a hard abort that in the WASM
+/// build also poisons the shell instance).
+const MAX_AWK_DEPTH: u32 = 64;
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -750,6 +756,8 @@ struct Parser {
     /// True while parsing the argument list of a `print`/`printf` statement.
     /// A top-level `>` there is a redirection, not a comparison.
     in_print_args: bool,
+    /// Current expression recursion depth, bounded by [`MAX_AWK_DEPTH`].
+    depth: u32,
 }
 
 impl Parser {
@@ -759,7 +767,21 @@ impl Parser {
             pos: 0,
             paren_depth: 0,
             in_print_args: false,
+            depth: 0,
         }
+    }
+
+    /// Enter one recursion level, returning a parse error past the bound.
+    fn enter_depth(&mut self) -> Result<(), String> {
+        if self.depth >= MAX_AWK_DEPTH {
+            return Err("expression recursion limit exceeded".to_string());
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn exit_depth(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     fn peek(&self) -> &Token {
@@ -1168,7 +1190,10 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, String> {
-        self.parse_assign()
+        self.enter_depth()?;
+        let result = self.parse_assign();
+        self.exit_depth();
+        result
     }
 
     fn parse_assign(&mut self) -> Result<Expr, String> {
@@ -1341,6 +1366,13 @@ impl Parser {
     }
 
     fn parse_power(&mut self) -> Result<Expr, String> {
+        self.enter_depth()?;
+        let result = self.parse_power_inner();
+        self.exit_depth();
+        result
+    }
+
+    fn parse_power_inner(&mut self) -> Result<Expr, String> {
         let base = self.parse_unary()?;
         if *self.peek() == Token::Caret {
             self.advance();
@@ -1352,6 +1384,13 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
+        self.enter_depth()?;
+        let result = self.parse_unary_inner();
+        self.exit_depth();
+        result
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expr, String> {
         match self.peek().clone() {
             Token::Not => {
                 self.advance();
@@ -1412,6 +1451,15 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
+        // `$` field references recurse through `parse_primary`, so bound them
+        // here too (grouping is already covered via `parse_expr`).
+        self.enter_depth()?;
+        let result = self.parse_primary_inner();
+        self.exit_depth();
+        result
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Expr, String> {
         match self.peek().clone() {
             Token::Number(n) => Ok(self.parse_literal_expr(Expr::Num(n))),
             Token::StringLit(s) => Ok(self.parse_literal_expr(Expr::Str(s))),
@@ -4978,5 +5026,21 @@ END { print count }
         let (status, out, _) = run_awk("END{print NR}", &input);
         assert_eq!(status, 0);
         assert_eq!(out, "2\n");
+    }
+
+    #[test]
+    fn deeply_nested_awk_expression_errors_instead_of_overflowing() {
+        // 400 nested parentheses used to overflow the recursive-descent parser
+        // stack (a hard abort that poisons the WASM shell instance). The depth
+        // guard must turn it into an ordinary awk error.
+        let depth = 400usize;
+        let expr = format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
+        let program = format!("BEGIN{{print {expr}}}");
+        let (status, out, err) = run_awk(&program, "");
+        assert_ne!(status, 0, "expected failure, got out={out:?}");
+        assert!(
+            err.contains("recursion limit") || err.contains("too deep") || !err.is_empty(),
+            "expected a depth diagnostic, got {err:?}"
+        );
     }
 }

@@ -24,6 +24,8 @@ pub fn implemented_features() -> HashSet<&'static str> {
     f.insert("double-quoting");
     f.insert("backslash-escape");
     f.insert("parameter-expansion");
+    f.insert("positional-parameters");
+    f.insert("word-splitting");
     f.insert("parameter-default");
     f.insert("parameter-assign-default");
     f.insert("parameter-alternative");

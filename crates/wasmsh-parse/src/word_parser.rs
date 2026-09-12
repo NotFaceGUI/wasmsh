@@ -33,6 +33,7 @@ fn parse_word_part(
         b'"' => parse_double_quoted_part(text, pos, lit, parts),
         b'\\' => parse_escaped_literal(bytes, pos, lit),
         b'$' => parse_dollar_part(text, bytes, pos, lit, parts),
+        b'`' => parse_backtick_part(bytes, pos, lit, parts),
         b'<' | b'>' if bytes.get(*pos + 1) == Some(&b'(') => {
             parse_process_subst(text, bytes, pos, lit, parts);
         }
@@ -41,6 +42,37 @@ fn parse_word_part(
             *pos += 1;
         }
     }
+}
+
+/// Parse `` `...` `` legacy command substitution into a `CommandSubstitution`
+/// part carrying the inner source. Backslashes escape `` ` ``, `$`, and `\`
+/// inside the backticks; those escape characters are consumed here so the
+/// runtime sees plain shell source.
+fn parse_backtick_part(bytes: &[u8], pos: &mut usize, lit: &mut String, parts: &mut Vec<WordPart>) {
+    flush(lit, parts);
+    *pos += 1; // opening backtick
+    let mut inner = String::new();
+    while *pos < bytes.len() {
+        match bytes[*pos] {
+            b'`' => {
+                *pos += 1;
+                break;
+            }
+            b'\\'
+                if bytes
+                    .get(*pos + 1)
+                    .is_some_and(|c| matches!(c, b'`' | b'$' | b'\\')) =>
+            {
+                inner.push(bytes[*pos + 1] as char);
+                *pos += 2;
+            }
+            b => {
+                inner.push(b as char);
+                *pos += 1;
+            }
+        }
+    }
+    parts.push(WordPart::CommandSubstitution(inner.into()));
 }
 
 fn parse_single_quoted_part(
@@ -164,6 +196,8 @@ fn parse_double_quoted(text: &str, pos: &mut usize) -> Vec<WordPart> {
                     lit.push('$');
                 }
             }
+            // A backtick substitution is active inside double quotes too.
+            b'`' => parse_backtick_part(bytes, pos, &mut lit, &mut parts),
             _ => {
                 lit.push(bytes[*pos] as char);
                 *pos += 1;
@@ -455,8 +489,9 @@ fn ansi_c_escape(bytes: &[u8], pos: &mut usize, result: &mut String) {
             result.push('"');
             *pos += 1;
         }
-        b'0' => {
-            *pos += 1;
+        // `\NNN` — one to three octal digits. The leading digit need not be
+        // `0` (bash: `$'\101'` is `A`), unlike C where a leading 0 is required.
+        b'0'..=b'7' => {
             result.push(parse_octal_digits(bytes, pos, 3) as char);
         }
         b'x' => {
@@ -675,8 +710,11 @@ mod tests {
 
     #[test]
     fn ansi_c_quote_octal() {
-        // \0101 = 'A' (65 in octal is 101)
-        assert_eq!(parse_word_parts("$'\\0101'"), vec![lit("A")]);
+        // `\NNN` takes at most three octal digits with no mandatory leading
+        // zero: `\101` is `A` (0o101 = 65), and bash reads `\0101` as `\010`
+        // followed by a literal `1`.
+        assert_eq!(parse_word_parts("$'\\101'"), vec![lit("A")]);
+        assert_eq!(parse_word_parts("$'\\0101'"), vec![lit("\x081")]);
     }
 
     #[test]

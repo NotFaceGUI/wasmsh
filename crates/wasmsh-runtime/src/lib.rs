@@ -40,7 +40,7 @@ use crate::pattern::{glob_match_ext, glob_match_inner, has_extglob_pattern};
 use crate::signals::{find_runtime_signal_spec, RuntimeSignalSpec, SignalDefaultAction};
 
 pub use crate::pattern::extglob_match;
-use wasmsh_ast::{CaseTerminator, RedirectionOp, Word, WordPart};
+use wasmsh_ast::{CaseTerminator, RedirectionOp, Span, Word, WordPart};
 use wasmsh_expand::expand_words_argv;
 use wasmsh_fs::{BackendFs, FileHandle, OpenOptions, Vfs, VfsWriteSink};
 use wasmsh_hir::{
@@ -68,6 +68,7 @@ const FD_BOTH: u32 = u32::MAX;
 const CMD_LOCAL: &str = "local";
 const CMD_BREAK: &str = "break";
 const CMD_CONTINUE: &str = "continue";
+const CMD_RETURN: &str = "return";
 const CMD_EXIT: &str = "exit";
 const CMD_EVAL: &str = "eval";
 const CMD_SOURCE: &str = "source";
@@ -129,8 +130,16 @@ impl Default for BrowserConfig {
     }
 }
 
-/// Maximum recursion depth for eval, source, and command substitution.
-const MAX_RECURSION_DEPTH: u32 = 100;
+/// Maximum recursion depth for eval, source, function calls, and command
+/// substitution. These share one counter, which bounds the *total* nesting
+/// even when a function body contains a substitution.
+///
+/// Measured overflow on a ~1 MiB stack (native main thread and the WASM
+/// default): ~84 nested command substitutions and ~120 nested function calls.
+/// 48 keeps roughly a 2x margin below the tighter of the two while still
+/// allowing realistic recursive scripts (tree walks, backtracking). The
+/// previous value of 100 sat above the substitution overflow point.
+const MAX_RECURSION_DEPTH: u32 = 48;
 
 /// Transient execution state, reset between top-level commands.
 #[derive(Clone)]
@@ -138,6 +147,10 @@ const MAX_RECURSION_DEPTH: u32 = 100;
 struct ExecState {
     break_depth: u32,
     loop_continue: bool,
+    /// Set by the `return` builtin to unwind the current function (or sourced
+    /// file). Holds the return status. Unlike `exit_requested` it is cleared
+    /// when the enclosing function frame finishes.
+    return_requested: Option<i32>,
     exit_requested: Option<i32>,
     errexit_suppressed: bool,
     local_save_stack: Vec<(smol_str::SmolStr, Option<smol_str::SmolStr>)>,
@@ -163,6 +176,7 @@ impl ExecState {
         Self {
             break_depth: 0,
             loop_continue: false,
+            return_requested: None,
             exit_requested: None,
             errexit_suppressed: false,
             local_save_stack: Vec::new(),
@@ -180,6 +194,7 @@ impl ExecState {
     fn reset(&mut self) {
         self.break_depth = 0;
         self.loop_continue = false;
+        self.return_requested = None;
         self.exit_requested = None;
         self.errexit_suppressed = false;
         self.resource_exhausted = false;
@@ -384,6 +399,14 @@ impl wasmsh_utils::UtilOutput for RuntimeUtilSink<'_> {
         self.command_pipes
             .borrow_mut()
             .push((command.to_string(), data.to_vec()));
+    }
+}
+
+/// Wrap a single `WordPart` as a standalone `Word` for one-part expansion.
+fn synthetic_word(part: &WordPart) -> Word {
+    Word {
+        parts: vec![part.clone()],
+        span: Span { start: 0, end: 0 },
     }
 }
 
@@ -3254,6 +3277,7 @@ enum RuntimeCommandKind {
     Local,
     Break,
     Continue,
+    Return,
     Exit,
     Eval,
     Source,
@@ -3483,6 +3507,36 @@ impl RuntimeVmExecutor<'_> {
         let msg = format!("wasmsh: {var_name}: unbound variable\n");
         self.write_visible_stderr(vm, msg.as_bytes());
         vm.state.last_status = 1;
+        // `set -u` on an unbound variable aborts a non-interactive script.
+        self.exec.exit_requested = Some(1);
+        true
+    }
+
+    /// Report a pending hard arithmetic error (`$((1/0))`, depth guard, syntax)
+    /// so the simple command fails with status 1 instead of silently returning
+    /// `0`. Mirrors [`Self::consume_nounset_error`].
+    fn consume_arith_error(&mut self, vm: &mut Vm) -> bool {
+        let Some(message) = vm.state.take_arith_error() else {
+            return false;
+        };
+        let msg = format!("wasmsh: {message}\n");
+        self.write_visible_stderr(vm, msg.as_bytes());
+        vm.state.last_status = 1;
+        true
+    }
+
+    /// Report a pending shell error (`${x:?message}`, readonly assignment).
+    /// Fatal errors additionally request script exit, matching bash.
+    fn consume_expansion_error(&mut self, vm: &mut Vm) -> bool {
+        let Some((fatal, message)) = vm.state.take_shell_error() else {
+            return false;
+        };
+        let msg = format!("wasmsh: {message}\n");
+        self.write_visible_stderr(vm, msg.as_bytes());
+        vm.state.last_status = 1;
+        if fatal {
+            self.exec.exit_requested = Some(1);
+        }
         true
     }
 }
@@ -3492,7 +3546,17 @@ impl VmExecutor for RuntimeVmExecutor<'_> {
         let value = value.map_or_else(String::new, |word| {
             wasmsh_expand::expand_word(word, &mut vm.state)
         });
-        if self.consume_nounset_error(vm) {
+        if self.consume_nounset_error(vm)
+            || self.consume_arith_error(vm)
+            || self.consume_expansion_error(vm)
+        {
+            return;
+        }
+        if vm.state.is_var_readonly(name) {
+            vm.state
+                .set_shell_error(&format!("{name}: readonly variable"));
+            let _ = self.consume_expansion_error(vm);
+            vm.state.last_status = 1;
             return;
         }
         let trimmed = value.trim();
@@ -3550,7 +3614,10 @@ impl VmExecutor for RuntimeVmExecutor<'_> {
             .iter()
             .map(|word| wasmsh_expand::expand_word(word, &mut vm.state))
             .collect();
-        if self.consume_nounset_error(vm) {
+        if self.consume_nounset_error(vm)
+            || self.consume_arith_error(vm)
+            || self.consume_expansion_error(vm)
+        {
             return 1;
         }
         let argv_refs: Vec<&str> = expanded.iter().map(String::as_str).collect();
@@ -5056,6 +5123,19 @@ impl WorkerRuntime {
         self.mark_stop_reason(StopReason::Exhausted(reason));
     }
 
+    /// Record that a recursion-depth limit was hit for the *current command*.
+    ///
+    /// Unlike a step-output/step-budget exhaustion this must not abort the
+    /// whole run: recursion is inherently recoverable (the stack is bounded by
+    /// the call itself), and the sandbox contract is that a runaway recursion
+    /// in one command fails that command while later commands still run
+    /// (`f(){ f; }; f || true; echo after`). The structured reason is still
+    /// recorded for observability, and the command reports status 128.
+    fn mark_recursion_exhaustion(&mut self, reason: ExhaustionReason) {
+        self.exec.stop_reason = Some(StopReason::Exhausted(reason));
+        self.vm.state.last_status = 128;
+    }
+
     fn ensure_stop_reason(&mut self) {
         if !self.exec.resource_exhausted || self.exec.stop_reason.is_some() {
             return;
@@ -5340,7 +5420,7 @@ impl WorkerRuntime {
             .enter_recursion(self.vm.limits.recursion_limit)
         {
             self.exec.recursion_depth -= 1;
-            self.mark_budget_exhaustion(reason);
+            self.mark_recursion_exhaustion(reason);
             return vec![WorkerEvent::Stderr(
                 b"wasmsh: maximum recursion depth exceeded\n".to_vec(),
             )];
@@ -6533,7 +6613,11 @@ impl WorkerRuntime {
             return None;
         }
         let expanded = expand_words_argv(&resolved, &mut self.vm.state);
-        if self.check_nounset_error() || expanded.is_empty() {
+        if self.check_nounset_error()
+            || self.check_arith_error()
+            || self.check_expansion_error()
+            || expanded.is_empty()
+        {
             return None;
         }
         let tagged: Vec<(String, bool)> = expanded
@@ -7795,7 +7879,7 @@ impl WorkerRuntime {
             self.vm.budget.visible_output_bytes = saved_output_bytes;
             self.proc_subst_out_scopes = saved_proc_subst_out_scopes;
             self.proc_subst_in_scopes = saved_proc_subst_in_scopes;
-            self.mark_budget_exhaustion(reason);
+            self.mark_recursion_exhaustion(reason);
             return vec![WorkerEvent::Stderr(
                 b"wasmsh: maximum recursion depth exceeded\n".to_vec(),
             )];
@@ -8761,7 +8845,7 @@ impl WorkerRuntime {
         }
         let expanded = expand_words_argv(&resolved, &mut self.vm.state);
 
-        if self.check_nounset_error() {
+        if self.check_nounset_error() || self.check_arith_error() || self.check_expansion_error() {
             return;
         }
         if expanded.is_empty() {
@@ -8810,6 +8894,35 @@ impl WorkerRuntime {
         let msg = format!("wasmsh: {var_name}: unbound variable\n");
         self.write_stderr(msg.as_bytes());
         self.vm.state.last_status = 1;
+        // `set -u` on an unbound variable aborts a non-interactive script.
+        self.exec.exit_requested = Some(1);
+        true
+    }
+
+    /// Drain a pending hard arithmetic error and report it through the fallback
+    /// interpreter's stderr sink.
+    fn check_arith_error(&mut self) -> bool {
+        let Some(message) = self.vm.state.take_arith_error() else {
+            return false;
+        };
+        let msg = format!("wasmsh: {message}\n");
+        self.write_stderr(msg.as_bytes());
+        self.vm.state.last_status = 1;
+        true
+    }
+
+    /// Drain a pending shell error (`${x:?message}`, readonly assignment).
+    /// Fatal errors additionally request script exit, matching bash.
+    fn check_expansion_error(&mut self) -> bool {
+        let Some((fatal, message)) = self.vm.state.take_shell_error() else {
+            return false;
+        };
+        let msg = format!("wasmsh: {message}\n");
+        self.write_stderr(msg.as_bytes());
+        self.vm.state.last_status = 1;
+        if fatal {
+            self.exec.exit_requested = Some(1);
+        }
         true
     }
 
@@ -8934,6 +9047,7 @@ impl WorkerRuntime {
             CMD_LOCAL => Some(RuntimeCommandKind::Local),
             CMD_BREAK => Some(RuntimeCommandKind::Break),
             CMD_CONTINUE => Some(RuntimeCommandKind::Continue),
+            CMD_RETURN => Some(RuntimeCommandKind::Return),
             CMD_EXIT => Some(RuntimeCommandKind::Exit),
             CMD_EVAL => Some(RuntimeCommandKind::Eval),
             CMD_SOURCE | CMD_DOT => Some(RuntimeCommandKind::Source),
@@ -9131,6 +9245,23 @@ impl WorkerRuntime {
             RuntimeCommandKind::Continue => {
                 self.exec.loop_continue = true;
                 self.vm.state.last_status = 0;
+            }
+            RuntimeCommandKind::Return => {
+                // Unwind the current function (or sourced file). Outside a
+                // function, bash reports an error and does not stop the script.
+                if self.vm.state.func_stack.is_empty() {
+                    self.write_stderr(
+                        b"wasmsh: return: can only `return' from a function or sourced script\n",
+                    );
+                    self.vm.state.last_status = 1;
+                } else {
+                    let code = argv
+                        .get(1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(self.vm.state.last_status);
+                    self.exec.return_requested = Some(code);
+                    self.vm.state.last_status = code;
+                }
             }
             RuntimeCommandKind::Exit => {
                 let code = argv
@@ -9506,9 +9637,8 @@ impl WorkerRuntime {
             .enter_recursion(self.vm.limits.recursion_limit)
         {
             self.exec.recursion_depth -= 1;
-            self.mark_budget_exhaustion(reason);
+            self.mark_recursion_exhaustion(reason);
             self.write_stderr(b"wasmsh: maximum recursion depth exceeded\n");
-            self.vm.state.last_status = 1;
             return;
         }
         let old_positional = std::mem::take(&mut self.vm.state.positional);
@@ -9525,6 +9655,11 @@ impl WorkerRuntime {
             runtime.execute_command(body);
             runtime.run_return_trap_if_needed();
         });
+        // A `return` inside the body unwinds only this function frame; clear it
+        // so the caller's statements keep running.
+        if self.exec.return_requested.is_some() {
+            self.exec.return_requested = None;
+        }
         let new_locals: Vec<_> = self.exec.local_save_stack.drain(locals_before..).collect();
         for (name, old_val) in new_locals.into_iter().rev() {
             if let Some(val) = old_val {
@@ -9831,7 +9966,9 @@ impl WorkerRuntime {
         if self.exec.loop_continue {
             self.exec.loop_continue = false;
         }
-        self.exec.exit_requested.is_some()
+        // `return` must escape every enclosing loop up to the function frame;
+        // it is left pending so the frame can clear it and set the status.
+        self.exec.return_requested.is_some() || self.exec.exit_requested.is_some()
     }
 
     /// Execute a `for` loop.
@@ -9866,11 +10003,13 @@ impl WorkerRuntime {
     /// Expand word list for `for` and `select` commands.
     fn expand_for_words(&mut self, words: Option<&[Word]>) -> Vec<String> {
         if let Some(ws) = words {
-            let resolved = self.resolve_command_subst(ws);
             let mut result = Vec::new();
-            for w in &resolved {
-                let expanded = wasmsh_expand::expand_word_split(w, &mut self.vm.state);
-                result.extend(expanded.fields);
+            // Split while the AST still distinguishes quoted, literal and
+            // substitution parts. Resolving `$( )` first would erase that
+            // distinction, so `for f in $(ls)` could no longer split on IFS
+            // while `for f in "$(ls)"` must not.
+            for w in ws {
+                self.split_for_word(w, &mut result);
             }
             let result: Vec<String> = result
                 .into_iter()
@@ -9884,6 +10023,129 @@ impl WorkerRuntime {
                 .iter()
                 .map(ToString::to_string)
                 .collect()
+        }
+    }
+
+    /// Split one `for`-list word into fields the way bash does.
+    ///
+    /// Literal and quoted text is never split (`for w in a\ b x` is two fields,
+    /// not three). Unquoted expansions split on IFS. A quoted multi-field
+    /// expansion (`"${a[@]}"`, `"$@"`) yields one field per element, with the
+    /// first element merging into the text before it and the last into the text
+    /// after it.
+    fn split_for_word(&mut self, word: &Word, out: &mut Vec<String>) {
+        let ifs = self
+            .vm
+            .state
+            .get_var("IFS")
+            .unwrap_or_else(|| smol_str::SmolStr::from(" \t\n"));
+        let mut current = String::new();
+        let mut quoted_seen = false;
+        self.split_for_parts(
+            &word.parts,
+            &ifs,
+            false,
+            &mut current,
+            out,
+            &mut quoted_seen,
+        );
+        if !current.is_empty() || quoted_seen {
+            out.push(current);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn split_for_parts(
+        &mut self,
+        parts: &[WordPart],
+        ifs: &str,
+        protected: bool,
+        current: &mut String,
+        out: &mut Vec<String>,
+        quoted_seen: &mut bool,
+    ) {
+        for part in parts {
+            match part {
+                WordPart::Literal(text) => current.push_str(text),
+                WordPart::SingleQuoted(text) => {
+                    *quoted_seen = true;
+                    current.push_str(text);
+                }
+                WordPart::DoubleQuoted(inner) => {
+                    *quoted_seen = true;
+                    for p in inner {
+                        if let WordPart::Parameter(name) = p {
+                            if let Some(elements) =
+                                wasmsh_expand::array_multi_expansion(name, &mut self.vm.state)
+                            {
+                                if elements.is_empty() {
+                                    continue;
+                                }
+                                current.push_str(&elements[0]);
+                                for element in &elements[1..] {
+                                    out.push(std::mem::take(current));
+                                    current.push_str(element);
+                                }
+                                continue;
+                            }
+                        }
+                        match p {
+                            WordPart::Literal(text) | WordPart::SingleQuoted(text) => {
+                                current.push_str(text);
+                            }
+                            WordPart::CommandSubstitution(inner) => {
+                                current.push_str(&self.execute_subst(inner));
+                            }
+                            _ => {
+                                let expanded = wasmsh_expand::expand_word(
+                                    &synthetic_word(p),
+                                    &mut self.vm.state,
+                                );
+                                current.push_str(&expanded);
+                            }
+                        }
+                    }
+                }
+                WordPart::CommandSubstitution(inner) => {
+                    let text = self.execute_subst(inner).to_string();
+                    self.split_unquoted(&text, ifs, current, out);
+                }
+                WordPart::Parameter(_) | WordPart::Arithmetic(_) => {
+                    let expanded =
+                        wasmsh_expand::expand_word(&synthetic_word(part), &mut self.vm.state);
+                    if protected {
+                        current.push_str(&expanded);
+                    } else {
+                        self.split_unquoted(&expanded, ifs, current, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Split unquoted expansion text on IFS, appending to `current` and pushing
+    /// completed fields. The first piece joins any pending `current`.
+    #[allow(clippy::unused_self)]
+    fn split_unquoted(&self, text: &str, ifs: &str, current: &mut String, out: &mut Vec<String>) {
+        if ifs.is_empty() {
+            current.push_str(text);
+            return;
+        }
+        let mut first = true;
+        for piece in text.split(|c: char| ifs.contains(c)) {
+            if piece.is_empty() {
+                continue;
+            }
+            if first {
+                current.push_str(piece);
+                first = false;
+            } else {
+                if !current.is_empty() {
+                    out.push(std::mem::take(current));
+                }
+                current.push_str(piece);
+            }
         }
     }
 
@@ -10021,7 +10283,7 @@ impl WorkerRuntime {
         if self.exec.loop_continue {
             self.exec.loop_continue = false;
         }
-        if self.exec.exit_requested.is_some() {
+        if self.exec.return_requested.is_some() || self.exec.exit_requested.is_some() {
             return false;
         }
         true
@@ -10927,6 +11189,7 @@ impl WorkerRuntime {
     fn should_stop_execution(&self) -> bool {
         self.exec.break_depth > 0
             || self.exec.loop_continue
+            || self.exec.return_requested.is_some()
             || self.exec.exit_requested.is_some()
             || self.exec.resource_exhausted
     }
@@ -10987,6 +11250,16 @@ impl WorkerRuntime {
     /// - Plain `name=val` -- scalar assignment
     fn execute_assignment(&mut self, raw_name: &smol_str::SmolStr, value: Option<&Word>) {
         let (name_str, is_append) = Self::split_assignment_name(raw_name.as_str());
+        // A write to a readonly variable fails the command; `set_var` would
+        // otherwise silently drop it. Report immediately (bash prints the
+        // error and continues with the next command) rather than deferring it
+        // to the next dispatch, which would abort an unrelated command.
+        if self.vm.state.is_var_readonly(name_str) {
+            let msg = format!("wasmsh: {name_str}: readonly variable\n");
+            self.write_stderr(msg.as_bytes());
+            self.vm.state.last_status = 1;
+            return;
+        }
         if self.try_assign_array_element(name_str, value) {
             return;
         }

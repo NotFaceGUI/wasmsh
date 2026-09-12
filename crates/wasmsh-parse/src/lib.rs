@@ -40,6 +40,20 @@ pub fn parse(source: &str) -> Result<Program, ParseError> {
 // Words that terminate compound-list bodies (not command-starters).
 const TERMINATOR_WORDS: &[&str] = &["then", "elif", "else", "fi", "do", "done", "esac", "}"];
 
+/// Maximum nesting depth of compound commands (`( )`, `{ }`, `if`, loops,
+/// `case`, function bodies). The parser is recursive descent, so an unbounded
+/// depth overflows the call stack. A stack overflow aborts the process — in the
+/// WASM build that is an uncatchable `unreachable` trap which also leaves the
+/// `WasmShell` borrow permanently held. Rejecting over-deep input with an
+/// ordinary parse error keeps the process (and the sandbox session) alive.
+///
+/// Nested `if`/`for`/`while`/`case`/`( )`/`{ }`/function bodies each cost about
+/// 17 KiB of stack in this recursive-descent parser, and both the native main
+/// thread and the WASM default stack are ~1 MiB, so overflow begins around 59
+/// levels. 24 keeps a comfortable margin and still exceeds any realistic
+/// hand-written or generated script.
+const MAX_NESTING_DEPTH: u32 = 24;
+
 /// A pending here-doc that needs its body read after the command line.
 struct PendingHereDoc {
     delimiter: String,
@@ -56,6 +70,9 @@ struct Parser<'src> {
     peeked: VecDeque<Token>,
     prev_end: u32,
     pending_heredocs: Vec<PendingHereDoc>,
+    /// Current compound-command nesting depth, bounded by
+    /// [`MAX_NESTING_DEPTH`] to keep recursive descent off the stack limit.
+    nesting_depth: u32,
 }
 
 impl<'src> Parser<'src> {
@@ -69,7 +86,25 @@ impl<'src> Parser<'src> {
             peeked: VecDeque::new(),
             prev_end: 0,
             pending_heredocs: Vec::new(),
+            nesting_depth: 0,
         })
+    }
+
+    /// Enter one level of compound-command nesting, rejecting input that would
+    /// recurse past [`MAX_NESTING_DEPTH`].
+    fn enter_nesting(&mut self) -> Result<(), ParseError> {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            return Err(ParseError {
+                message: format!("maximum nesting depth ({MAX_NESTING_DEPTH}) exceeded"),
+                offset: self.current.span.start,
+            });
+        }
+        self.nesting_depth += 1;
+        Ok(())
+    }
+
+    fn exit_nesting(&mut self) {
+        self.nesting_depth = self.nesting_depth.saturating_sub(1);
     }
 
     fn advance(&mut self) -> Result<Token, ParseError> {
@@ -438,6 +473,16 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_command(&mut self) -> Result<Command, ParseError> {
+        // Every compound body re-enters here, so one enter/exit pair bounds the
+        // recursion depth of the entire recursive-descent parser. Without it a
+        // deeply nested `if`/`( )`/`{ }`/function body overflows the stack.
+        self.enter_nesting()?;
+        let result = self.parse_command_inner();
+        self.exit_nesting();
+        result
+    }
+
+    fn parse_command_inner(&mut self) -> Result<Command, ParseError> {
         if self.at(&TokenKind::LParen) {
             return self.parse_command_lparen();
         }
@@ -2101,5 +2146,33 @@ mod tests {
         // A subshell ( echo hi ) should not be confused with (( ))
         let cmd = first_command("(echo hi)");
         assert!(matches!(cmd, Command::Subshell(_)));
+    }
+
+    #[test]
+    fn deeply_nested_commands_are_rejected_not_overflowed() {
+        // Deeply nested input must return a parse error rather than recursing
+        // until the stack overflows (which would abort the process, and in the
+        // WASM build also poison the shell instance).
+        let depth = 500usize;
+        let mut source = String::new();
+        for _ in 0..depth {
+            source.push_str("if true; then ");
+        }
+        source.push_str("true; ");
+        for _ in 0..depth {
+            source.push_str("fi ");
+        }
+        let err = parse(&source).expect_err("expected a nesting-depth error");
+        assert!(
+            err.message.contains("nesting depth"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn moderately_nested_commands_still_parse() {
+        let source = "if true; then if true; then if true; then echo ok; fi; fi; fi";
+        assert!(parse(source).is_ok());
     }
 }

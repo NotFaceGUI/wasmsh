@@ -1,0 +1,20 @@
+[test]
+name = "param-error-operator-is-fatal"
+tags = ["parameter-expansion", "error", "P1"]
+tier = "P1"
+requires = ["parameter-expansion", "echo"]
+
+# `${x:?msg}` must not emit text on stdout and must fail the script. Not
+# oracle-compared: depending on invocation bash reports either 1 (script file)
+# or 127 (`bash -c`), and the stderr wording is not portable.
+[input]
+script = """
+echo before
+: "${w:?custom message}"
+echo unreachable
+"""
+
+[expect]
+status = 1
+stdout = "before\n"
+stderr_contains = ["custom message"]

@@ -1,0 +1,27 @@
+[test]
+name = "for-list-quote-aware-field-splitting"
+tags = ["for-in", "word-splitting", "quoting", "arrays", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["for-in", "word-splitting", "indexed-array", "command-substitution", "echo"]
+
+[input]
+script = """
+for w in a\\ b x; do printf "[%s]" "$w"; done; echo
+for w in "a b" x; do printf "(%s)" "$w"; done; echo
+v="a b"; for w in $v; do printf "<%s>" "$w"; done; echo
+for w in "$v"; do printf "{%s}" "$w"; done; echo
+arr=(x y z); for e in "${arr[@]}"; do printf "A%s" "$e"; done; echo
+for f in $(printf 'p\\nq'); do printf "C%s" "$f"; done; echo
+show() { for a in "$@"; do printf "D%s" "$a"; done; echo; }
+show "one two" three
+"""
+
+[expect]
+status = 0
+stdout = "[a b][x]\n(a b)(x)\n<a><b>\n{a b}\nAxAyAz\nCpCq\nDone twoDthree\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

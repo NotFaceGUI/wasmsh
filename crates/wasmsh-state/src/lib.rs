@@ -14,6 +14,26 @@ use smol_str::SmolStr;
 /// [`ShellState::set_nounset_error`] / [`ShellState::take_nounset_error`].
 const NOUNSET_ERROR_VAR: &str = "_NOUNSET_ERROR";
 
+/// Reserved shell variable used as a side channel between arithmetic
+/// evaluation and command dispatch to report hard arithmetic errors (division
+/// by zero, overflow of the parser depth guard, or an arithmetic syntax error).
+/// Bash aborts the current command with status 1 on these; returning `0` instead
+/// would silently produce a wrong result. Treated as an implementation detail of
+/// [`ShellState`]; callers go through [`ShellState::set_arith_error`] /
+/// [`ShellState::take_arith_error`].
+const ARITH_ERROR_VAR: &str = "_ARITH_ERROR";
+
+/// Reserved shell variable carrying a fatal command-level shell error, such as
+/// `${x:?message}` on a null or unset variable or an assignment to a readonly
+/// variable. Bash writes the message to stderr and fails the command
+/// (non-interactive shells exit). Callers go through
+/// [`ShellState::set_shell_error`] / [`ShellState::take_shell_error`].
+const SHELL_ERROR_VAR: &str = "_SHELL_ERROR";
+
+/// Sentinel prefix marking a shell error as fatal (aborts the script), so the
+/// single reserved variable can carry both fatal and non-fatal errors.
+const SHELL_ERROR_FATAL_PREFIX: char = '\u{1}';
+
 /// The value held by a shell variable: scalar, indexed array, or associative array.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VarValue {
@@ -437,6 +457,73 @@ impl ShellState {
         }
         self.env.remove(NOUNSET_ERROR_VAR);
         Some(name)
+    }
+
+    /// Record a hard arithmetic error (division by zero, depth guard, syntax).
+    /// The pending message is consumed by [`ShellState::take_arith_error`] at
+    /// the next command dispatch point so the command reports status 1 instead
+    /// of a silently wrong `0`.
+    pub fn set_arith_error(&mut self, message: &str) {
+        self.env.set(
+            SmolStr::from(ARITH_ERROR_VAR),
+            ShellVar::scalar(SmolStr::from(message)),
+        );
+    }
+
+    /// Consume the pending arithmetic error, if any, and clear the sentinel.
+    pub fn take_arith_error(&mut self) -> Option<SmolStr> {
+        let message = self.env.get(ARITH_ERROR_VAR)?.value.as_scalar();
+        if message.is_empty() {
+            return None;
+        }
+        self.env.remove(ARITH_ERROR_VAR);
+        Some(message)
+    }
+
+    /// Whether `name` is currently marked readonly.
+    #[must_use]
+    pub fn is_var_readonly(&self, name: &str) -> bool {
+        self.env.get(name).is_some_and(|var| var.readonly)
+    }
+
+    /// Record a command-level shell error (e.g. a readonly assignment) that
+    /// fails the current command but lets a non-interactive script continue,
+    /// matching bash.
+    pub fn set_shell_error(&mut self, message: &str) {
+        self.set_shell_error_inner(message, false);
+    }
+
+    /// Record a *fatal* shell error (e.g. `${x:?msg}` or `set -u` unbound
+    /// variable). Bash aborts a non-interactive script on these; callers see
+    /// the `fatal` flag from [`ShellState::take_shell_error`].
+    pub fn set_fatal_shell_error(&mut self, message: &str) {
+        self.set_shell_error_inner(message, true);
+    }
+
+    fn set_shell_error_inner(&mut self, message: &str, fatal: bool) {
+        let encoded = if fatal {
+            format!("{SHELL_ERROR_FATAL_PREFIX}{message}")
+        } else {
+            message.to_string()
+        };
+        self.env.set(
+            SmolStr::from(SHELL_ERROR_VAR),
+            ShellVar::scalar(SmolStr::from(encoded)),
+        );
+    }
+
+    /// Consume the pending shell error, if any, returning `(fatal, message)`.
+    pub fn take_shell_error(&mut self) -> Option<(bool, SmolStr)> {
+        let message = self.env.get(SHELL_ERROR_VAR)?.value.as_scalar();
+        if message.is_empty() {
+            return None;
+        }
+        self.env.remove(SHELL_ERROR_VAR);
+        if let Some(rest) = message.strip_prefix(SHELL_ERROR_FATAL_PREFIX) {
+            Some((true, SmolStr::from(rest)))
+        } else {
+            Some((false, message))
+        }
     }
 
     /// Return all variable names (across all scopes) that start with the given prefix.

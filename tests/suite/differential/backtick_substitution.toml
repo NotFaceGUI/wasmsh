@@ -1,0 +1,26 @@
+[test]
+name = "legacy-backtick-command-substitution"
+tags = ["command-substitution", "backtick", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["command-substitution", "echo"]
+
+[input]
+script = """
+x=`echo bt`
+echo "[$x]"
+echo "v=`printf hi`"
+echo `echo \\`echo deep\\``
+echo [`echo a b`]
+for f in `printf 'a\\nb'`; do printf "(%s)" "$f"; done
+echo
+"""
+
+[expect]
+status = 0
+stdout = "[bt]\nv=hi\ndeep\n[a b]\n(a)(b)\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

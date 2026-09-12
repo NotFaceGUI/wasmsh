@@ -1,0 +1,24 @@
+[test]
+name = "positional-count-and-array-slice"
+tags = ["parameter-expansion", "arrays", "positional", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["parameter-expansion", "indexed-array", "echo"]
+
+[input]
+script = """
+set -- f a b c
+echo "count=${#@} star=${#*}"
+a=(x y z q r)
+echo "[${a[@]:1:2}]"
+echo "[${a[@]: -2}]"
+"""
+
+[expect]
+status = 0
+stdout = "count=4 star=4\n[y z]\n[q r]\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

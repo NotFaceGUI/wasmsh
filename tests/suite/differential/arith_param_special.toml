@@ -1,0 +1,26 @@
+[test]
+name = "arith-dollar-parameter-substitution"
+tags = ["arithmetic", "parameter-expansion", "positional", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["arithmetic-expansion", "positional-parameters", "echo"]
+
+[input]
+script = """
+set -- 7 8
+echo $(( $1 + 1 ))
+echo $(( $# ))
+echo $(( $x + 1 ))
+echo $(( ${y} + 2 ))
+a=(10 20)
+echo $(( ${a[1]} + 1 ))
+"""
+
+[expect]
+status = 0
+stdout = "8\n2\n1\n2\n21\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

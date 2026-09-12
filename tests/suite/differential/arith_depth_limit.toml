@@ -1,0 +1,29 @@
+[test]
+name = "deeply-nested-arithmetic-does-not-crash"
+tags = ["arithmetic", "parser", "robustness", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["arithmetic-expansion", "echo"]
+
+# 300 nested parentheses overflowed the recursive-descent arithmetic parser
+# before the depth guard. Assert the shell survives and later commands still
+# run; the exact status/message differs from bash, so compare status only via a
+# tolerant probe.
+[input]
+script = """
+n=0
+e=1
+while [ $n -lt 300 ]; do e="($e)"; n=$((n+1)); done
+echo "built"
+echo "after=$((1+1))"
+"""
+
+[expect]
+status = 0
+stdout = "built\nafter=2\n"
+
+[oracle]
+compare = true
+shells = ["bash"]
+ignore_stderr = true

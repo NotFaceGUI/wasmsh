@@ -584,6 +584,54 @@ fixed; each is now guarded by a case in `tests/suite/differential/`:
 - `tar -C` directory switching for create and extract
 - `sh file` / `sh -c` running as a child shell (no variable/function leakage)
 
+### Fixed in the sandbox-hardening pass
+
+A follow-up differential audit against the in-process runtime
+(`wasmsh-dev`) surfaced a second batch. Each is guarded by a case in
+`tests/suite/differential/` or a Rust unit test:
+
+- **Parser depth bounds (availability).** The recursive-descent shell parser,
+  the lexer's `$( )` scanner, the arithmetic evaluator, and the awk expression
+  parser had no recursion limit; deeply nested input overflowed the stack. A
+  stack overflow is a hard abort — in the WASM build it is an uncatchable trap
+  that also permanently poisons the `WasmShell` instance (wasm-bindgen's borrow
+  guard is never released). All four now reject over-deep input with a normal
+  error. The limits are `MAX_NESTING_DEPTH=24` (parse), `MAX_LEX_DEPTH=48`
+  (lexer substitutions), `MAX_ARITH_DEPTH=64`, `MAX_AWK_DEPTH=64`, and the
+  runtime `MAX_RECURSION_DEPTH=48` (shared by eval/source/function calls and
+  command substitution), sized against the ~1 MiB native/WASM stack (measured
+  overflow at ~59/84/~1000/~200/~120 respectively).
+- `return` did not unwind the current function or loop; execution continued
+  past it. It now sets a dedicated unwind flag honored by functions and loops.
+- `$((x/0))` and `$((x%0))` returned `0` instead of failing the command.
+- Arithmetic `$`-parameters were dropped: `$(( $1 + 1 ))` used the literal `1`,
+  and `$(( $# ))` was `0`. `$1`, `$#`, `$?`, `${x}`, `${a[i]}` now resolve.
+- `stat -c %a` / `%A` / `%f` returned hardcoded 644/755 instead of the VFS mode,
+  contradicting `ls -l` and `[ -x ]`.
+- `echo a#b` truncated at the `#`; `#` is only a comment at the start of a word.
+- `${#@}` / `${#*}` returned the character count of the joined parameters
+  instead of the number of positional parameters.
+- `${arr[@]:offset[:length]}` expanded to an empty string.
+- `${x:?msg}` printed the message to stdout and exited 0; it now fails the
+  command (fatal for a non-interactive script).
+- A write to a `readonly` variable was silently dropped; it now fails the
+  command with a diagnostic.
+- `for` word lists split quoted and backslash-escaped text (`for w in "a b"`
+  yielded two fields) and did not split unquoted command substitution. Field
+  splitting is now quote-aware, and `"${arr[@]}"` / `"$@"` yield one field per
+  element.
+
+### Remaining known divergences (not yet fixed)
+
+- `${arr[@]:1:-1}` (negative slice length on an array): bash reports an error,
+  wasmsh returns the truncated slice. Negative-length string slices match bash.
+- `timeout`, `sleep`, and `nproc` remain intentional stubs (see the table
+  above); `join` and `od` are not implemented.
+- `jq`/`yq --version` are still parsed as filters rather than version queries.
+- `readonly` assignment fails the command with status 1 but does not abort a
+  script; bash's abort behaviour here is inconsistent (it depends on `;` versus
+  newline separation), so wasmsh uses the predictable non-fatal form.
+
 ---
 
 ## Non-Goals

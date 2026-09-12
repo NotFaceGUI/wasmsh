@@ -1,0 +1,30 @@
+[test]
+name = "stat-mode-reflects-chmod"
+tags = ["stat", "chmod", "vfs", "P1"]
+tier = "P1"
+requires = ["stat", "chmod", "echo"]
+
+# Not oracle-compared: on this MSYS host `chmod` is a no-op on the real
+# filesystem, so bash would report 644 regardless. wasmsh's VFS models modes,
+# and the point of the case is that `stat` agrees with `ls -l` / `[ -x ]`
+# instead of returning a hardcoded default.
+[input]
+script = """
+printf 'x' > /tmp/mode_probe
+chmod 755 /tmp/mode_probe
+echo "a=$(stat -c %a /tmp/mode_probe)"
+echo "A=$(stat -c %A /tmp/mode_probe)"
+chmod 640 /tmp/mode_probe
+echo "b=$(stat -c %a /tmp/mode_probe)"
+echo "B=$(stat -c %A /tmp/mode_probe)"
+"""
+
+[expect]
+status = 0
+stdout = "a=755\nA=-rwxr-xr-x\nb=640\nB=-rw-r-----\n"
+
+[known_divergence]
+id = "chmod-noop-host"
+description = "Reference bash on an MSYS filesystem cannot change modes, so the oracle reports the default mode; wasmsh models real modes."
+wasmsh_behavior = "stat reports the mode set by chmod"
+reference_behavior = "chmod is a no-op on the MSYS mount, so stat reports 644"

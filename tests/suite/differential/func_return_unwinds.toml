@@ -1,0 +1,40 @@
+[test]
+name = "return-unwinds-function-and-loop"
+tags = ["function", "return", "control-flow", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["function", "return", "for-in", "echo"]
+
+[input]
+script = """
+f() {
+  echo before
+  true && return
+  echo unreachable
+}
+f
+echo done
+
+g() {
+  for i in 1 2 3; do
+    echo "i=$i"
+    if [ "$i" = 2 ]; then return; fi
+  done
+  echo loop-end
+}
+g
+echo "status=$?"
+
+h() { return 7; }
+h
+echo "h=$?"
+"""
+
+[expect]
+status = 0
+stdout = "before\ndone\ni=1\ni=2\nstatus=0\nh=7\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

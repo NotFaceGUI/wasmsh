@@ -14,3 +14,8 @@ echo "VERSION=$VERSION"
 [expect]
 status = 0
 stdout = "VERSION=1.0\n"
+
+[oracle]
+compare = true
+shells = ["bash"]
+ignore_stderr = true

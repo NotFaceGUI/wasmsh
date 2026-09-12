@@ -1,0 +1,24 @@
+[test]
+name = "hash-inside-word-is-not-a-comment"
+tags = ["lexer", "comment", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["echo"]
+
+[input]
+script = """
+echo a#b
+echo a # real comment
+echo "a#b"
+printf '[%s]' pre#post
+echo
+"""
+
+[expect]
+status = 0
+stdout = "a#b\na\na#b\n[pre#post]\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

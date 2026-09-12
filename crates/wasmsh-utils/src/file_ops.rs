@@ -998,7 +998,20 @@ pub(crate) fn util_realpath(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
     0
 }
 
-fn stat_format(fmt: &str, name: &str, size: u64, is_dir: bool) -> String {
+/// Render a permission bit set in symbolic form, e.g. `rwxr-xr-x`.
+fn stat_symbolic_mode(mode: u32, is_dir: bool) -> String {
+    let mut out = String::with_capacity(10);
+    out.push(if is_dir { 'd' } else { '-' });
+    for shift in [6u32, 3, 0] {
+        let bits = (mode >> shift) & 0o7;
+        out.push(if bits & 0o4 != 0 { 'r' } else { '-' });
+        out.push(if bits & 0o2 != 0 { 'w' } else { '-' });
+        out.push(if bits & 0o1 != 0 { 'x' } else { '-' });
+    }
+    out
+}
+
+fn stat_format(fmt: &str, name: &str, size: u64, is_dir: bool, mode: u32) -> String {
     let mut result = String::new();
     let mut chars = fmt.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -1009,13 +1022,22 @@ fn stat_format(fmt: &str, name: &str, size: u64, is_dir: bool) -> String {
                     let _ = write!(result, "{size}");
                 }
                 Some('F') => result.push_str(if is_dir { "directory" } else { "regular file" }),
-                Some('a') => result.push_str(if is_dir { "755" } else { "644" }),
-                Some('A') => {
-                    result.push_str(if is_dir { "drwxr-xr-x" } else { "-rw-r--r--" });
+                // `%a` is the octal permission bits; `%A` the symbolic form.
+                // Both must reflect the VFS mode, not a fixed default, or
+                // `stat` contradicts `ls -l` and `[ -x ]`.
+                Some('a') => {
+                    // GNU `stat -c %a` prints the octal bits with no leading
+                    // zero (`644`, `755`, `1777`).
+                    let _ = write!(result, "{:o}", mode & 0o7777);
                 }
+                Some('A') => result.push_str(&stat_symbolic_mode(mode, is_dir)),
                 Some('U' | 'G') => result.push_str("user"),
                 Some('h') => result.push('1'),
-                Some('f') => result.push_str(if is_dir { "41ed" } else { "81a4" }),
+                // `%f` is the raw st_mode in hex (type bits + permissions).
+                Some('f') => {
+                    let type_bits = if is_dir { 0o040_000 } else { 0o100_000 };
+                    let _ = write!(result, "{:x}", type_bits | (mode & 0o7777));
+                }
                 Some('Y') => result.push('0'),
                 Some('%') | None => result.push('%'),
                 Some(c) => {
@@ -1078,7 +1100,7 @@ pub(crate) fn util_stat(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
         match ctx.fs.stat(&full) {
             Ok(meta) => {
                 if let Some(fmt) = format_str {
-                    let out = stat_format(fmt, path, meta.size, meta.is_dir);
+                    let out = stat_format(fmt, path, meta.size, meta.is_dir, meta.mode);
                     ctx.output.stdout(out.as_bytes());
                     if !printf_mode {
                         ctx.output.stdout(b"\n");

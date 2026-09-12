@@ -501,11 +501,49 @@ fn printf_escape(bytes: &[u8], i: usize, output: &mut String) -> usize {
             output.push('\x08');
             i + 2
         }
+        b'f' => {
+            output.push('\x0c');
+            i + 2
+        }
+        b'v' => {
+            output.push('\x0b');
+            i + 2
+        }
+        // `\NNN` — one to three octal digits, leading `0` not required.
+        b'0'..=b'7' => {
+            let (ch, new_i) = parse_echo_octal(bytes, i + 1);
+            output.push(ch);
+            new_i
+        }
+        // `\xNN` — one or two hex digits.
+        b'x' => {
+            let (ch, new_i) = parse_hex_escape(bytes, i + 2);
+            output.push(ch);
+            new_i
+        }
         _ => {
             output.push('\\');
             i + 1
         }
     }
+}
+
+/// Parse up to two hex digits after `\x`, returning `(char, new_index)`.
+fn parse_hex_escape(bytes: &[u8], mut i: usize) -> (char, usize) {
+    let mut val: u8 = 0;
+    let mut count = 0;
+    while i < bytes.len() && count < 2 {
+        let digit = match bytes[i] {
+            b'0'..=b'9' => bytes[i] - b'0',
+            b'a'..=b'f' => bytes[i] - b'a' + 10,
+            b'A'..=b'F' => bytes[i] - b'A' + 10,
+            _ => break,
+        };
+        val = val * 16 + digit;
+        i += 1;
+        count += 1;
+    }
+    (val as char, i)
 }
 
 /// Process backslash escape sequences for `%b` in printf.
@@ -522,8 +560,25 @@ fn process_printf_backslash_escapes(s: &str) -> String {
                 b'a' => result.push('\x07'),
                 b'b' => result.push('\x08'),
                 b'r' => result.push('\r'),
+                b'f' => result.push('\x0c'),
+                b'v' => result.push('\x0b'),
+                // `%b` octal has two forms: `\NNN` (up to 3 digits) and
+                // `\0NNN` (a leading `0` that does not count toward the three).
+                // So `\101` and `\0101` are both `A`, while `\010` is `\b`.
                 b'0' => {
                     let (ch, new_i) = parse_echo_octal(bytes, i + 2);
+                    result.push(ch);
+                    i = new_i;
+                    continue;
+                }
+                b'1'..=b'7' => {
+                    let (ch, new_i) = parse_echo_octal(bytes, i + 1);
+                    result.push(ch);
+                    i = new_i;
+                    continue;
+                }
+                b'x' => {
+                    let (ch, new_i) = parse_hex_escape(bytes, i + 2);
                     result.push(ch);
                     i = new_i;
                     continue;

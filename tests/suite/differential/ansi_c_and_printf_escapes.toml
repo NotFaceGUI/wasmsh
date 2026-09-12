@@ -1,0 +1,23 @@
+[test]
+name = "ansi-c-and-printf-octal-escapes"
+tags = ["quoting", "printf", "escapes", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["ansi-c-quoting", "printf", "echo"]
+
+[input]
+script = """
+echo $'\\101'
+echo $'\\x41'
+printf '%b' '\\101'; echo
+printf 'A\\x42C\\n'
+"""
+
+[expect]
+status = 0
+stdout = "A\nA\nA\nABC\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

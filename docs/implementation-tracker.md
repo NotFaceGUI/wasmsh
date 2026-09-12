@@ -81,3 +81,20 @@
 - **端到端验收**：`e2e/etl/{gen,run,verify}.sh` 多文件离线 ETL（nginx 日志 + 脏 CSV + JSONL → 规范化留痕 → 不依赖 `join` 的 awk 对账三表 → region 聚合 + 日志统计 → jq summary.json → Markdown 日报 → tar + sha256sum MANIFEST）。`crates/wasmsh-testkit/tests/etl_acceptance.rs` 在单一沙箱会话内跑两次：`set -euo pipefail` 生效、`PIPESTATUS` 正确、`verify.sh` 用另一种算法重算不变量并通过、两次运行 MANIFEST 内容哈希逐字节一致（幂等），并且故意破坏 `matched.tsv` 后 `verify.sh` 必须失败；denominator 为 0 时明确判失败。
 - **本地证据（2026-09-12）**：`cargo test --workspace --locked` 1565 通过、0 失败；`cargo test -p wasmsh-testkit --test suite_runner --locked` 621/627 通过（6 个 pre-existing feature-gate SKIP）；`cargo clippy --workspace --all-targets --locked -- -D warnings` 干净；`WASMSH_ORACLE=1` 下 22 个差分用例全部与真实 bash 逐字节一致。
 - **仍未支持/已知偏差**（诚实清单，见 `SUPPORTED.md`）：`sleep` 立即返回、`nproc` 固定值、`timeout` 对进程内命令不真正计时、`ulimit` 只读、`stat`/`date` 为子集；locale 固定 UTF-8/C；`ls -l` 的 owner/group/时间固定；工作树 CRLF 脚本按字面处理。`timeout`、`sleep` 桩、`nproc` 桩均已在文档标注，不再宣称完整 bash 兼容。
+
+## 9. 沙箱可用性与静默偏差硬修（2026-09-12 续）
+
+触发：一次以 wasmsh standalone WASM 为唯一 bash 沙箱的插件实测，在深层嵌套输入下踩到 wasmsh 崩溃，且把 `WasmShell` 实例永久毒化（`recursive use of an object detected...`），随后差分审计又暴露一批"返回 0 但结果错"的静默偏差。本轮在 `main` 上直接修复，全部由差分用例或单测守护。
+
+- **致命崩溃根因与修复**：递归下降的 shell parser / 算术求值器 / awk 表达式 parser 均无递归上限，深层嵌套按字节数溢出调用栈；栈溢出是硬 abort，WASM 下不可捕获的 trap 会跳过 wasm-bindgen 的借用释放，导致实例永久不可用。四处均加深度上限并以普通错误返回：`MAX_NESTING_DEPTH=24`（parse）、`MAX_LEX_DEPTH=48`（lexer 的 `$( )` 扫描，嵌套输入在执行期会逐层重新 lex，故在下限处就截断）、`MAX_ARITH_DEPTH=64`、`MAX_AWK_DEPTH=64`；运行期 `MAX_RECURSION_DEPTH` 由 100 降到 48（原来 ~84 层命令替换即溢出，48 给 ~2x 余量，仍支持深度 ≤40 的递归函数与阶乘等真实用法）。实测溢出点分别约 59/84/~1000/~200/~120，上限取 ~1 MiB 原生/WASM 栈的安全值。
+- **递归可恢复**：函数递归耗尽改为命令级（不再终止整个 run），`f(){ f; }; f || true; echo after` 现在输出 `after`；结构化 `StopReason::Exhausted(RecursionDepth)` 仍保留可观测。
+- **`return` 之前完全不生效**：内建 `return` 只返回状态码，运行期没有解绑机制，`return` 之后的语句照常执行、递归函数不会终止。新增 `ExecState::return_requested` + `RuntimeCommandKind::Return`，函数帧与循环共同遵守，`return` 现在从函数及嵌套循环中正确退出。
+- **静默错结果修复**：`$((x/0))`/`$((x%0))` 返回 0 → 现在失败并写诊断（`_ARITH_ERROR` 通道）；算术中的 `$` 参数被丢弃（`$(( $1 + 1 ))` 用字面量 1、`$(( $# ))` 为 0）→ `$1`/`$#`/`$?`/`${x}`/`${a[i]}` 现在正确解析；`stat -c %a/%A/%f` 硬编码 644/755 与 `ls -l` 矛盾 → 改为渲染 VFS `mode`；`echo a#b` 被截断 → `#` 仅在词首作注释；`${#@}`/`${#*}` 算成拼接后的字符数 → 改为位置参数个数；`${arr[@]:o:l}` 展开为空 → 实现切片；`${x:?msg}` 打到 stdout 且退出 0 → 改为 stderr + 脚本失败（`_SHELL_ERROR` fatal 通道）；只读变量赋值被静默丢弃 → 现在失败并诊断。
+- **字段拆分修正**：`for` 词表按引号语义拆分（`for w in "a b"`/`a\ b` 是单字段，`$x` 按 IFS 拆，`"${a[@]}"`/`"$@"` 每元素一个字段），且不再对已解析的命令替换做二次错误拆分。`split_for_word` 在 AST 层区分字面/带引号/替换。
+- **词法与转义**：新增反引号 `` `...` `` 命令替换（词法与词解析两层，双引号内也生效）；`$'\101'`/`$'\x41'` 与 printf 格式串的 `\NNN`/`\xNN` 解码；`%b` 的 `\0NNN` 与 `\NNN` 两种八进制形式。
+
+- **新增用例**：`tests/suite/differential/` 新增 `hash_inside_word`、`arith_param_special`、`func_return_unwinds`、`for_word_split_quoting`、`arg_count_and_slice`、`nesting_depth_limit`、`arith_depth_limit`、`param_error_fatal`、`stat_mode_reflects_chmod`、`backtick_substitution`、`ansi_c_and_printf_escapes`；`a12_div_by_zero`、`cx30_readonly_enforcement` 更新为正确语义（并对真实 bash 做 oracle 比较）。Rust 单测：parser 深层嵌套被拒、算术深度保护、除零记录错误、算术 `$` 参数、awk 深度保护、ANSI-C 八进制。
+- **feature 登记**：`features.rs` 补 `positional-parameters`、`word-splitting`；修正 `sandbox/recursion_limit_recovery` 里写错的 `or-list` → `and-or-list`。
+- **文档**：`SUPPORTED.md` 新增 "Fixed in the sandbox-hardening pass" 与 "Remaining known divergences"，明确 `timeout`/`sleep`/`nproc` 桩、缺 `join`/`od`、`jq/yq --version`、数组负长度切片等仍存差异。
+- **本地证据（本轮）**：`cargo test --workspace --locked` 全绿；TOML 套件 631 通过、5 个 feature-gate SKIP、0 失败（含 54 个 `differential/` 用例全部与真实 bash 逐字节一致）；`cargo clippy --workspace --all-targets --locked` 干净；`cargo fmt --all` 已跑。独立 `sh-audit` 差分 harness：修复前 16 MATCH / 2 CRASH，修复后 29 MATCH / 0 CRASH，深层嵌套输入全部变为优雅错误且会话可继续使用。
+- **仍未做**：`join`/`od` 未实现；`jq`/`yq --version` 仍被当过滤器；`timeout`/`sleep`/`nproc` 仍为桩；数组负长度切片 `${a[@]:1:-1}` 与 bash 的报错行为不同；`readonly` 赋值为命令级失败而非脚本级 abort（bash 自身在 `;` 与换行下不一致）。以上均在 `SUPPORTED.md` 记录。
