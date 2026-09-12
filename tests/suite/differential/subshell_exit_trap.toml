@@ -1,0 +1,26 @@
+[test]
+name = "subshell-runs-a-trap-installed-inside-it"
+tags = ["trap", "trap-exit", "subshell", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["trap", "trap-exit", "subshell", "echo", "exit"]
+
+# A subshell inherits no caught traps, but a trap installed *inside* it is
+# active and fires when the subshell ends — before the parent continues. A trap
+# installed outside must not fire inside the subshell (bash fires it only once,
+# when the outer shell exits).
+[input]
+script = """
+( trap 'echo INNER' EXIT; echo body ); echo after
+( trap 'echo CEXIT' EXIT; echo b; exit 3 ); echo "rc=$?"
+trap 'echo OUTER' EXIT; ( echo sub ); echo done
+"""
+
+[expect]
+status = 0
+stdout = "body\nINNER\nafter\nb\nCEXIT\nrc=3\nsub\ndone\nOUTER\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

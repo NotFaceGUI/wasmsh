@@ -145,3 +145,19 @@
 - **关于 catch_unwind**：`wasm32-unknown-unknown` 实测 `panic = "abort"`（`rustc --print cfg` 确认），panic 是不可捕获的 trap，`catch_unwind` 无法释放 wasm-bindgen 借用标记，因此**结构性消除可达 panic** 才是唯一持久修法；报告里"catch 后显式释放借用"的建议在本目标下不成立，已如实记录在 `SUPPORTED.md`。
 - **回归**：新增 `crates/wasmsh-runtime/tests/output_process_substitution.rs` 9 条断言——3 个原 panic 触发、3 个原本正常的对照（`<(cmd)`、`> >(cat)`、`tee >(cat)`）、`tee >(consumer > file)` 与 `cmd > >(consumer > file)` 的落盘校验，以及"连跑三个触发后同一实例仍能 `echo alive`"的复用断言。
 - **本地证据**：`cargo test --workspace` 全绿（50 个测试目标）；`cargo test -p wasmsh-browser --lib` 250 通过（该 crate 的 `run_shell` 正是无 isolated runtime 的配置，含 `process_subst_out_*` 4 条既有用例）；TOML 套件全绿；`cargo clippy -p wasmsh-runtime --all-targets -- -D warnings` 干净；`cargo fmt --all` 干净。
+
+
+## 13. v0.9.4 —— 子 shell 内 EXIT trap 修复（2026-09-12 续）
+
+触发：0.9.2 复跑报告把四条语言差异列为"真实"，其中 `c77-trap-exit` 是唯一真正仍具破坏性的行为差异——`trap ... EXIT` 在 `( … )` 内安装时不触发。逐条复核对拍后：
+
+- **三条是报告侧误报**：`c07-empty-quotes`、`c32-case-fallthrough`、`c47-printf-c` 的"bash"列填错，实测 bash 与 wasmsh 一致——`bash -c "echo \"['']['x']\""` → `['']['x']`（单引号在双引号内是字面量）、`case a;;& b`（b 不匹配）→ 仅 `A`、`printf '%c' 65` → `6`（GNU coreutils printf 同为 `6`）。三条用例在 0.9.2 复跑中本就 PASS，报告表格与结果自相矛盾。
+- **一条是真 bug**：`( trap 'echo INNER' EXIT; echo body ); echo after` 在 bash 下输出 `body / INNER / after`，wasmsh 只输出 `body / after`。根因：子 shell 执行体没有"结束时触发自身 EXIT trap"的步骤，而子 shell 语义上是一个独立进程，在 `( … )` 内注册的 trap 应在其结束时触发。
+- **修复**：`HirCommand::Subshell` 分支现在保存继承来的 `_TRAP_EXIT`/`_TRAP_IGNORE_EXIT`，在子 shell 作用域内清空，执行 body 后以子 shell 状态调用 `run_exit_trap_if_needed(..., false)` 并把事件并回父级缓冲，再恢复父级 trap 变量。父 shell 安装的 trap 仍不在子 shell 内触发（与 bash 一致：只在外层 shell 退出时触发一次）。
+- **回归**：新增 `tests/suite/differential/subshell_exit_trap.toml`，覆盖"子内安装触发""子内安装 + `exit 3`""父级安装不在子内触发"三种组合，与真实 bash 逐字节对拍。
+- **本地证据**：`cargo test --workspace` 全绿（50 个测试目标）；TOML 套件全绿；`cargo fmt --all` 干净。
+
+## 14. v0.9.3 发布（2026-09-12 续）
+
+- **提交**：`d12dc09` `fix(runtime): stop >(cmd > file) from panicking and poisoning the WASM instance` + `e96d0c6` `chore(release): bump version to 0.9.3`，`panic = "abort"`（wasm32）下无法 catch，故结构性消除可达 panic。
+- **发布结果**：`Standalone Release` run `34687056625`——Validate release source 通过（含新增 9 条输出进程替换回归）。

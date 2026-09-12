@@ -8916,16 +8916,53 @@ impl WorkerRuntime {
                     // aliases defined inside it do not survive it (bash).
                     let saved_functions = rt.functions.clone();
                     let saved_aliases = rt.aliases.clone();
+                    // A subshell inherits no caught traps, but a trap installed
+                    // inside it is active and fires when the subshell ends.
+                    let saved_trap_exit = rt.vm.state.get_var("_TRAP_EXIT").map(|v| v.to_string());
+                    let saved_trap_ignore = rt
+                        .vm
+                        .state
+                        .get_var("_TRAP_IGNORE_EXIT")
+                        .map(|v| v.to_string());
+                    let _ = rt.vm.state.unset_var("_TRAP_EXIT");
+                    let _ = rt.vm.state.unset_var("_TRAP_IGNORE_EXIT");
                     rt.vm.state.env.push_scope();
                     rt.execute_body(&block.body);
-                    rt.vm.state.env.pop_scope();
-                    rt.functions = saved_functions;
-                    rt.aliases = saved_aliases;
                     // A fatal condition (nounset, `${x:?}`, excessive recursion)
                     // or `exit` ends only the subshell; the parent continues with
                     // the subshell's status (bash: `( exit 3 )` returns 3).
-                    if let Some(code) = rt.exec.exit_requested.take() {
-                        rt.vm.state.last_status = code;
+                    let child_status = rt
+                        .exec
+                        .exit_requested
+                        .take()
+                        .unwrap_or(rt.vm.state.last_status);
+                    rt.vm.state.last_status = child_status;
+                    let mut trap_events = Vec::new();
+                    rt.run_exit_trap_if_needed(&mut trap_events, false);
+                    rt.merge_sub_events_with_diagnostics(trap_events);
+                    // The trap's own status and unwinds stay inside the subshell.
+                    rt.exec.exit_requested = None;
+                    rt.vm.state.last_status = child_status;
+                    rt.vm.state.env.pop_scope();
+                    rt.functions = saved_functions;
+                    rt.aliases = saved_aliases;
+                    match saved_trap_exit {
+                        Some(value) => rt
+                            .vm
+                            .state
+                            .set_var("_TRAP_EXIT".into(), value.as_str().into()),
+                        None => {
+                            let _ = rt.vm.state.unset_var("_TRAP_EXIT");
+                        }
+                    }
+                    match saved_trap_ignore {
+                        Some(value) => rt
+                            .vm
+                            .state
+                            .set_var("_TRAP_IGNORE_EXIT".into(), value.as_str().into()),
+                        None => {
+                            let _ = rt.vm.state.unset_var("_TRAP_IGNORE_EXIT");
+                        }
                     }
                     rt.exec.exit_requested = saved_exit;
                 });

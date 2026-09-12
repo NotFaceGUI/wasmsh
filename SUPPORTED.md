@@ -689,6 +689,22 @@ Note on recovery: wasm32-unknown-unknown is compiled with `panic = "abort"`
 state. Eliminating reachable panics is the only durable mitigation; the
 invariant arms above now fail soft instead of aborting.
 
+### Fixed in the subshell-trap pass (v0.9.4)
+
+A `trap … EXIT` installed inside `( … )` did not fire when the subshell ended:
+
+```sh
+( trap 'echo INNER' EXIT; echo body ); echo after
+# bash:  body / INNER / after
+# wasmsh (before): body / after
+```
+
+The subshell now saves the inherited EXIT trap, clears it for the subshell
+scope, runs the body, and — if the body installed a trap — fires it as the
+subshell ends, before the parent continues. A trap installed *outside* the
+subshell still does not fire inside it (bash fires it only when the outer shell
+exits). Guarded by `tests/suite/differential/subshell_exit_trap.toml`.
+
 ### Remaining known divergences (not yet fixed)
 
 - `${arr[@]:1:-1}` (negative slice length on an array): bash reports an error,
