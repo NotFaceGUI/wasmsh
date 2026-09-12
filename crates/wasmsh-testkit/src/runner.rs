@@ -48,7 +48,7 @@ pub fn run_toml_case(case: &TomlTestFile) -> TestOutcome {
 
 fn run_toml_case_with_oracle<F>(case: &TomlTestFile, run_oracle: F) -> TestOutcome
 where
-    F: Fn(&str, &str) -> Option<oracle::OracleResult>,
+    F: Fn(&str, &str) -> oracle::OracleOutcome,
 {
     let missing = features::missing_features(&case.test.requires);
     if !missing.is_empty() {
@@ -99,17 +99,33 @@ where
         case.expect.stderr_contains.as_ref(),
         &mut failures,
     );
-    compare_oracles(case, &script, status, &stdout, &run_oracle, &mut failures);
+    let oracle_skips = compare_oracles(
+        case,
+        &script,
+        status,
+        &stdout,
+        &stderr,
+        &run_oracle,
+        &mut failures,
+    );
     compare_files(case, &mut rt, &mut failures);
     compare_env(case, &mut rt, &mut failures);
 
-    if failures.is_empty() {
-        TestOutcome::Passed
-    } else {
-        TestOutcome::Failed {
+    if !failures.is_empty() {
+        return TestOutcome::Failed {
             reason: failures.join("\n"),
-        }
+        };
     }
+
+    // An oracle-enabled case whose reference shell could not be found must
+    // surface as a visible SKIP rather than silently passing.
+    if let Some(reason) = oracle_skips {
+        return TestOutcome::Skipped {
+            reason: format!("oracle unavailable: {reason}"),
+        };
+    }
+
+    TestOutcome::Passed
 }
 
 fn compare_oracles<F>(
@@ -117,34 +133,49 @@ fn compare_oracles<F>(
     script: &str,
     status: i32,
     stdout: &str,
+    stderr: &str,
     run_oracle: &F,
     failures: &mut Vec<String>,
-) where
-    F: Fn(&str, &str) -> Option<oracle::OracleResult>,
+) -> Option<String>
+where
+    F: Fn(&str, &str) -> oracle::OracleOutcome,
 {
-    let Some(oracle_config) = case.oracle.as_ref() else {
-        return;
-    };
+    let mut skipped = Vec::new();
+    let mut ran_any = false;
+    let oracle_config = case.oracle.as_ref()?;
     if !oracle_config.compare {
-        return;
+        return None;
     }
 
     let shells = if oracle_config.shells.is_empty() {
-        vec!["sh".to_string()]
+        vec!["bash".to_string()]
     } else {
         oracle_config.shells.clone()
     };
 
     for shell in shells {
-        let Some(result) = run_oracle(script, shell.as_str()) else {
-            continue;
-        };
-        failures.extend(oracle::compare_oracle(
-            status,
-            stdout,
-            &result,
-            oracle_config.ignore_stderr,
-        ));
+        match run_oracle(script, shell.as_str()) {
+            oracle::OracleOutcome::Ran(result) => {
+                ran_any = true;
+                failures.extend(oracle::compare_oracle(
+                    status,
+                    stdout,
+                    stderr,
+                    &result,
+                    oracle_config.ignore_stderr,
+                ));
+            }
+            oracle::OracleOutcome::Disabled => {}
+            oracle::OracleOutcome::Skipped { shell, reason } => {
+                skipped.push(format!("{shell}: {reason}"));
+            }
+        }
+    }
+
+    if ran_any || skipped.is_empty() {
+        None
+    } else {
+        Some(skipped.join("; "))
     }
 }
 
@@ -335,7 +366,7 @@ shells = ["stub-sh"]
         );
 
         let outcome = run_toml_case_with_oracle(&case, |_, shell| {
-            Some(oracle::OracleResult {
+            oracle::OracleOutcome::Ran(oracle::OracleResult {
                 shell: shell.to_string(),
                 status: 7,
                 stdout: "goodbye\n".into(),
@@ -373,13 +404,72 @@ shells = ["stub-sh"]
         );
 
         let outcome = run_toml_case_with_oracle(&case, |_, _| {
-            Some(oracle::OracleResult {
+            oracle::OracleOutcome::Ran(oracle::OracleResult {
                 shell: "stub-sh".into(),
                 status: 7,
                 stdout: "goodbye\n".into(),
                 stderr: String::new(),
             })
         });
+
+        assert!(matches!(outcome, TestOutcome::Passed));
+    }
+
+    #[test]
+    fn oracle_missing_shell_is_reported_as_skip() {
+        let case = parse_case(
+            r#"
+[test]
+name = "oracle missing"
+
+[input]
+script = "echo hello"
+
+[expect]
+status = 0
+stdout = "hello\n"
+
+[oracle]
+compare = true
+shells = ["stub-sh"]
+"#,
+        );
+
+        let outcome = run_toml_case_with_oracle(&case, |_, shell| oracle::OracleOutcome::Skipped {
+            shell: shell.to_string(),
+            reason: "not found on PATH".into(),
+        });
+
+        match outcome {
+            TestOutcome::Skipped { reason } => {
+                assert!(reason.contains("oracle unavailable"), "{reason}");
+                assert!(reason.contains("not found"), "{reason}");
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oracle_global_disabled_does_not_skip() {
+        let case = parse_case(
+            r#"
+[test]
+name = "oracle disabled globally"
+
+[input]
+script = "echo hello"
+
+[expect]
+status = 0
+stdout = "hello\n"
+
+[oracle]
+compare = true
+shells = ["stub-sh"]
+"#,
+        );
+
+        let outcome = run_toml_case_with_oracle(&case, |_, _| oracle::OracleOutcome::Disabled);
 
         assert!(matches!(outcome, TestOutcome::Passed));
     }

@@ -270,8 +270,11 @@ fn ls_human_size(size: u64) -> String {
 struct LsEntry {
     name: String,
     is_dir: bool,
+    is_symlink: bool,
     size: u64,
     mode: u32,
+    /// Raw link target when `is_symlink` is set.
+    link_target: Option<String>,
 }
 
 /// Permission bits assumed when an entry cannot be stat'd.
@@ -283,10 +286,17 @@ fn default_mode(is_dir: bool) -> u32 {
     }
 }
 
-/// Render permission bits the way `ls -l` does: `-rw-r--r--`, `drwxr-xr-x`.
-fn mode_string(mode: u32, is_dir: bool) -> String {
+/// Render permission bits the way `ls -l` does: `-rw-r--r--`, `drwxr-xr-x`,
+/// `lrwxrwxrwx`.
+fn mode_string(mode: u32, is_dir: bool, is_symlink: bool) -> String {
     let mut out = String::with_capacity(10);
-    out.push(if is_dir { 'd' } else { '-' });
+    out.push(if is_symlink {
+        'l'
+    } else if is_dir {
+        'd'
+    } else {
+        '-'
+    });
     for shift in [6, 3, 0] {
         let bits = (mode >> shift) & 0o7;
         out.push(if bits & 0o4 != 0 { 'r' } else { '-' });
@@ -303,16 +313,29 @@ fn ls_collect_entries(fs: &mut BackendFs, dir: &str, flags: &LsFlags) -> Result<
         .filter(|e| flags.all || !e.name.starts_with('.'))
         .map(|e| {
             let child = child_path(dir, &e.name);
-            let meta = fs.stat(&child).ok();
+            // A symlink's own mode is shown (`lrwxrwxrwx`), so use lstat for
+            // links and follow to the target for everything else.
+            let meta = if e.is_symlink {
+                fs.lstat(&child).ok()
+            } else {
+                fs.stat(&child).ok()
+            };
             let size = meta.as_ref().map_or(0, |m| m.size);
             let mode = meta
                 .as_ref()
                 .map_or_else(|| default_mode(e.is_dir), |m| m.mode);
+            let link_target = if e.is_symlink {
+                fs.read_link(&child).ok()
+            } else {
+                None
+            };
             LsEntry {
                 name: e.name,
                 is_dir: e.is_dir,
+                is_symlink: e.is_symlink,
                 size,
                 mode,
+                link_target,
             }
         })
         .collect();
@@ -328,21 +351,31 @@ fn ls_collect_entries(fs: &mut BackendFs, dir: &str, flags: &LsFlags) -> Result<
 }
 
 fn ls_emit_entry(output: &mut dyn UtilOutput, e: &LsEntry, flags: &LsFlags) {
+    let suffix = if flags.classify {
+        if e.is_symlink {
+            "@"
+        } else if e.is_dir {
+            "/"
+        } else {
+            ""
+        }
+    } else {
+        ""
+    };
     if flags.long {
-        let mode = mode_string(e.mode, e.is_dir);
+        let mode = mode_string(e.mode, e.is_dir, e.is_symlink);
         let sz = if flags.human {
             ls_human_size(e.size)
         } else {
             format!("{}", e.size)
         };
-        let suffix = if flags.classify && e.is_dir { "/" } else { "" };
-        let line = format!(
-            "{mode}  1 user user {sz:>5} Jan  1 00:00 {}{suffix}\n",
-            e.name
-        );
+        let mut name = format!("{}{suffix}", e.name);
+        if let Some(target) = &e.link_target {
+            let _ = write!(name, " -> {target}");
+        }
+        let line = format!("{mode}  1 user user {sz:>5} Jan  1 00:00 {name}\n");
         output.stdout(line.as_bytes());
     } else {
-        let suffix = if flags.classify && e.is_dir { "/" } else { "" };
         output.stdout(e.name.as_bytes());
         output.stdout(suffix.as_bytes());
         output.stdout(b"\n");
@@ -400,11 +433,13 @@ pub(crate) fn util_ls(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
             let e = LsEntry {
                 name: path.to_string(),
                 is_dir: true,
+                is_symlink: false,
                 size: 0,
                 mode: ctx
                     .fs
                     .stat(&full)
                     .map_or_else(|_| default_mode(true), |m| m.mode),
+                link_target: None,
             };
             ls_emit_entry(ctx.output, &e, &flags);
             continue;
@@ -419,11 +454,19 @@ pub(crate) fn util_ls(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
                 }
             }
             Ok(meta) => {
+                let link_meta = ctx.fs.lstat(&full).ok();
+                let is_symlink = link_meta.as_ref().is_some_and(|m| m.is_symlink);
                 let e = LsEntry {
                     name: path.to_string(),
                     is_dir: false,
+                    is_symlink,
                     size: meta.size,
-                    mode: meta.mode,
+                    mode: link_meta.as_ref().map_or(meta.mode, |m| m.mode),
+                    link_target: if is_symlink {
+                        ctx.fs.read_link(&full).ok()
+                    } else {
+                        None
+                    },
                 };
                 ls_emit_entry(ctx.output, &e, &flags);
             }
@@ -535,8 +578,10 @@ fn parse_rm_flags(ctx: &mut UtilContext<'_>, argv: &[&str]) -> Result<(RmFlags, 
 
 fn rm_one(ctx: &mut UtilContext<'_>, path: &str, flags: &RmFlags) -> i32 {
     let full = resolve_path(ctx.cwd, path);
-    match ctx.fs.stat(&full) {
-        Ok(meta) if meta.is_dir => {
+    // Use lstat so a dangling symlink is removed as a link rather than
+    // reported as a missing target.
+    match ctx.fs.lstat(&full) {
+        Ok(meta) if meta.is_dir && !meta.is_symlink => {
             if !flags.recursive {
                 let msg = format!("rm: cannot remove '{path}': Is a directory\n");
                 ctx.output.stderr(msg.as_bytes());
@@ -710,6 +755,7 @@ struct CpFlags {
     force: bool,
     no_clobber: bool,
     verbose: bool,
+    symbolic: bool,
 }
 
 fn parse_cp_flags<'a>(argv: &'a [&'a str]) -> (CpFlags, Vec<&'a str>) {
@@ -718,6 +764,7 @@ fn parse_cp_flags<'a>(argv: &'a [&'a str]) -> (CpFlags, Vec<&'a str>) {
         force: false,
         no_clobber: false,
         verbose: false,
+        symbolic: false,
     };
     let mut args = Vec::new();
     for arg in &argv[1..] {
@@ -728,6 +775,7 @@ fn parse_cp_flags<'a>(argv: &'a [&'a str]) -> (CpFlags, Vec<&'a str>) {
                     'f' => flags.force = true,
                     'n' => flags.no_clobber = true,
                     'v' => flags.verbose = true,
+                    's' => flags.symbolic = true,
                     // 'p' (preserve attrs) etc. — no-op in VFS
                     _ => {}
                 }
@@ -784,6 +832,21 @@ pub(crate) fn util_cp(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
             let _ = ctx.fs.remove_file(&dst);
         }
 
+        if flags.symbolic {
+            // `cp -s` creates a symlink that stores the source operand as
+            // written (relative targets resolve against the link's dir).
+            if let Err(e) = ctx.fs.symlink(src_arg, &dst) {
+                emit_error(ctx.output, "cp", dst_arg, &e);
+                status = 1;
+                continue;
+            }
+            if flags.verbose {
+                let msg = format!("'{src_arg}' -> '{dst_arg}'\n");
+                ctx.output.stdout(msg.as_bytes());
+            }
+            continue;
+        }
+
         if is_dir {
             if !flags.recursive {
                 let msg = format!("cp: -r not specified; omitting directory '{src_arg}'\n");
@@ -811,9 +874,9 @@ pub(crate) fn util_cp(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
 }
 
 pub(crate) fn util_ln(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
-    // VFS doesn't support real links/symlinks, so ln creates a copy
     let mut force = false;
     let mut verbose = false;
+    let mut symbolic = false;
     let mut args = Vec::new();
     for arg in &argv[1..] {
         if arg.starts_with('-') && arg.len() > 1 && *arg != "--" {
@@ -821,7 +884,8 @@ pub(crate) fn util_ln(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
                 match ch {
                     'f' => force = true,
                     'v' => verbose = true,
-                    // 's' (symbolic), 'n' (no-dereference) etc. — accepted, VFS always copies
+                    's' => symbolic = true,
+                    // 'n' (no-dereference) etc. — accepted
                     _ => {}
                 }
             }
@@ -837,6 +901,24 @@ pub(crate) fn util_ln(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
     let dst_arg = args[1];
     let src = resolve_path(ctx.cwd, src_arg);
     let dst = resolve_path(ctx.cwd, dst_arg);
+
+    if symbolic {
+        // `ln -s TARGET LINK` stores TARGET verbatim (relative links resolve
+        // against the link's directory), not the resolved path.
+        if force {
+            let _ = ctx.fs.remove_file(&dst);
+        }
+        if let Err(e) = ctx.fs.symlink(src_arg, &dst) {
+            emit_error(ctx.output, "ln", dst_arg, &e);
+            return 1;
+        }
+        if verbose {
+            let msg = format!("'{dst_arg}' -> '{src_arg}'\n");
+            ctx.output.stdout(msg.as_bytes());
+        }
+        return 0;
+    }
+
     if force {
         let _ = ctx.fs.remove_file(&dst);
     }
@@ -852,7 +934,6 @@ pub(crate) fn util_ln(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
 }
 
 pub(crate) fn util_readlink(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
-    // VFS has no symlinks — just output the canonical path
     let mut canonicalize = false;
     let mut must_exist = false;
     let mut paths = Vec::new();
@@ -882,17 +963,27 @@ pub(crate) fn util_readlink(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
         ctx.output.stderr(b"readlink: missing operand\n");
         return 1;
     }
-    let _ = canonicalize; // always canonicalize in VFS
     let mut status = 0;
     for path in &paths {
         let full = resolve_path(ctx.cwd, path);
-        if must_exist && ctx.fs.stat(&full).is_err() {
-            emit_error(ctx.output, "readlink", path, &"No such file or directory");
-            status = 1;
+        if canonicalize {
+            if must_exist && ctx.fs.stat(&full).is_err() {
+                status = 1;
+                continue;
+            }
+            let msg = format!("{full}\n");
+            ctx.output.stdout(msg.as_bytes());
             continue;
         }
-        ctx.output.stdout(full.as_bytes());
-        ctx.output.stdout(b"\n");
+        // Without canonicalization, print the raw link target. Non-links
+        // produce no output (and a non-zero exit), matching GNU readlink.
+        match ctx.fs.read_link(&full) {
+            Ok(target) => {
+                let msg = format!("{target}\n");
+                ctx.output.stdout(msg.as_bytes());
+            }
+            Err(_) => status = 1,
+        }
     }
     status
 }
@@ -1609,5 +1700,45 @@ mod tests {
         assert_eq!(status, 0);
         assert!(stderr.is_empty());
         assert_eq!(stdout, "hello\nworld\n");
+    }
+
+    /// Run `cat` and return raw stdout bytes so binary inputs survive.
+    fn run_cat_bytes(argv: &[&str], fs: &mut MemoryFs) -> (i32, Vec<u8>) {
+        let mut output = VecOutput::default();
+        let status = {
+            let mut ctx = UtilContext {
+                fs,
+                output: &mut output,
+                cwd: "/",
+                stdin: None,
+                state: None,
+                network: None,
+                clock: None,
+            };
+            util_cat(&mut ctx, argv)
+        };
+        (status, output.stdout)
+    }
+
+    #[test]
+    fn cat_passes_through_a_nul_byte() {
+        let mut fs = MemoryFs::new();
+        let h = fs.open("/nul.bin", OpenOptions::write()).unwrap();
+        fs.write_file(h, b"a\0b").unwrap();
+        fs.close(h);
+        let (status, out) = run_cat_bytes(&["cat", "/nul.bin"], &mut fs);
+        assert_eq!(status, 0);
+        assert_eq!(out, b"a\0b");
+    }
+
+    #[test]
+    fn cat_preserves_a_leading_bom() {
+        let mut fs = MemoryFs::new();
+        let h = fs.open("/bom.txt", OpenOptions::write()).unwrap();
+        fs.write_file(h, b"\xEF\xBB\xBFhi\n").unwrap();
+        fs.close(h);
+        let (status, out) = run_cat_bytes(&["cat", "/bom.txt"], &mut fs);
+        assert_eq!(status, 0);
+        assert_eq!(out, b"\xEF\xBB\xBFhi\n");
     }
 }

@@ -1,0 +1,18 @@
+[test]
+name = "heredoc-quoted-delimiter-literal"
+tags = ["here-doc", "quoting", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["here-doc", "cat", "variable-assignment"]
+
+[input]
+script = "X=expanded\ncat <<'EOF'\n$X\nEOF\ncat <<EOF\n$X\nEOF"
+
+[expect]
+status = 0
+stdout = "$X\nexpanded\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

@@ -1,0 +1,18 @@
+[test]
+name = "brace-group-and-subshell-redirect"
+tags = ["redirection", "brace-group", "subshell", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["redirection", "brace-group", "subshell", "cat"]
+
+[input]
+script = "{ echo hi; } > g.txt\n( echo hi ) > s.txt\ncat g.txt\ncat s.txt"
+
+[expect]
+status = 0
+stdout = "hi\nhi\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

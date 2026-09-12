@@ -2,13 +2,13 @@
 name = "readlink-path"
 tags = ["utility", "P0"]
 tier = "P0"
-requires = ["readlink"]
+requires = ["readlink", "ln"]
 
 [setup]
 files = { "/some/path" = "data" }
 
 [input]
-script = "readlink /some/path"
+script = "ln -s /some/path /link\nreadlink /link"
 
 [expect]
 status = 0

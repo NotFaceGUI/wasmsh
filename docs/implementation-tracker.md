@@ -13,6 +13,7 @@
 | 5 | external 流式管道与取消 | 代码完成，本地 runtime/WASM/Node 通过，浏览器待环境 | 背压、提前结束、超时取消、无限输入与进程回收 |
 | 6 | 集成测试与交付文档 | 代码完成，本地实际 WASM 通过，正式包/云端待验证 | Node/browser/bundler、clock/network/external、隔离/二进制/权限/取消、版本与 SHA256 硬门禁 |
 | 7 | 主任务最终审阅 | 代码修复完成，本地回归通过，云端/浏览器待验证 | 回归、权限边界、错误状态、验证缺口与修复 |
+| 8 | Bash 语义差分硬化 | 代码完成，本地 oracle 真实比对通过 | 建差分 oracle、修复逐项偏差、契约用例、CI oracle job、E2E ETL 验收 |
 
 ## 执行记录
 
@@ -55,3 +56,20 @@
 - M6 浏览器验证（2026-09-11）：用当前源码 release WASM 直接 `wasm-bindgen --target web` 生成 `e2e/standalone/fixture/pkg`（CI 的 browser job 用归档 `web/` 平铺到同一路径），使用本机缓存 Chromium 1187 实际 executable，29/29 Playwright 通过：6 个文件覆盖 worker smoke、clock（同 Run 双采样、回调异常/NaN、`-R`/`-I`/`-d`、SigV4 拒绝）、file-ops、cancel、external 注册/查询/127、network-security 失败闭合，以及本轮新增 `review-fixes.spec.ts`（5 项：确定性 HOME/PWD/PATH 与 `cd`/`~`、`timeout` 状态 125、`command -v`/`type` 发现 utilities、非法规则 init 失败封闭、新旧网络配置冲突报错）和 clock monotonic `$SECONDS` 递增断言。设置 `WASMSH_PLAYWRIGHT_EXECUTABLE` 指向 1187 是本地浏览器版本选择（依赖期望 1208），不是测试降级；`e2e/standalone/build.sh` 现在复用 `tools/standalone/build.sh`，本机缺 `wasm-opt` 时不能直接跑，浏览器本地验证以直接 wasm-bindgen 生成的 loader 完成。
 - M6 未验证项：GitHub Actions/正式 Release 未运行，正式 wasm-pack + Binaryen 117 归档与三平台 matrix 未执行；`--all-features`（OPFS/Emscripten）Ubuntu 构建仍未验证，故仅列 advisory；可信 browser network broker 与 browser 原生 external 仍未实现；M4/M5 列出的云端与跨平台缺口继续有效。审阅同时记录：external 流式协议仍无 run/session id（进程定位依赖宿主 Map 与单调 id），`stream_queue_bytes` 仅传宿主未用于 runtime 侧 PipeBuffer 尺寸，`2>&1`/`|&` 的 stdout/stderr 逐字节交织不保证；这些不阻塞本阶段验收，但应在后续协议版本化时处理。
 - 不自动发布注册表包、创建正式 Release、修改仓库外部权限或推送 main；先完成可审阅的代码和本地验证。构建工作流可在后续获准的远端分支上运行。
+
+## 8. Bash 语义差分硬化（2026-09-12）
+
+用户要求：把沙箱修到与真实 bash 语义一致，并由差分测试守护，不分阶段交付。
+
+本轮提交：本地 `main` 上的 `fix(semantics): bash differential hardening across shell, awk, and utils`（未推送；amend 会改变哈希，故此处按提交主题记录）。
+
+- **C 类（用户未确认项）结论**：两项**都是 bug**。C20 `awk 'BEGIN{s="abc   "; sub(/ +$/,"",s)}'` 只删一个字符——根因是 `posix-regex` 对以 `$` 结尾的模式不做 POSIX 左最长匹配，已在 `regex_posix::find/leftmost_match` 用锚定回扫修正；C21 `awk 'BEGIN{printf "%c",65}'` 输出 `6`——`format_char_spec` 把数字当字符串取首字符，已改为把数字当字符码。另在 oracle 下**新发现**两条静默偏差并修复：`awk -F'\t'` 不解析转义（`decode_awk_escapes`）、`$(( ... $(cmd) ... ))` 忽略命令替换（运行期先解析）；以及 token 间 `\`+换行未作续行（`skip_blanks`）。
+
+- **差分 oracle**：`crates/wasmsh-testkit/src/oracle.rs` 重写为默认启用（`WASMSH_ORACLE=0` 关闭），通过 `WASMSH_ORACLE_BASH` 或 `PATH`/Git-for-Windows 常见位置发现真实 `bash`；脚本在私有临时目录以 `bash -c` 运行；Windows 上设置 `MSYS=winsymlinks:lnk` 以便真实创建符号链接。找不到 shell 的 oracle 用例返回可见 SKIP（`runner.rs`），绝不静默通过；stderr 差异在 `ignore_stderr=false` 时也参与比较。
+- **新增契约用例**：`tests/suite/differential/` 22 个 `oracle.compare = true` 用例，覆盖本轮每条修复；全量套件 627 个 TOML 用例（621 通过、6 个 feature-gate SKIP、0 失败）。`WASMSH_SUITE_FILTER` 可只跑子集。
+- **修复的偏差**（每条先红后绿，并与真实 bash 对照）：`sort -k N -n`/`-k2n`/`-t: -k2 -n`/默认稳定性/`-r`；awk `print`/`printf` 的 `>`/`>>`/`| "cmd"` 重定向、数组按引用传参、`$` 锚点左最长匹配、`printf "%c",N` 数字码、`-F'\t'` 转义；`while read` 管道/heredoc/重定向只迭代一次；`${VAR:-数字}`；无 else 的 `if` 返回 0 且不触发 `set -e`；`$(cmd)` 赋值状态；`{ }`/`( )` 分组重定向；引号 heredoc 分隔符；`\`+换行续行（词内、双引号内、token 间）；`trap ... EXIT` 脚本结束触发；`ln -s`/`cp -s`/`ln -sf`/`readlink` 真实符号链接；`grep -A/-B/-C` 上下文（含 `-A2` 粘连）；`wc -l` 无末尾换行、GNU 列对齐（单文件/多文件/管道/`<` 重定向）；`getopts` 的 `OPTARG`/`OPTIND`/聚簇/`-bval`/`--`/`:` 静默模式；`tar -C`；`sh file`/`sh -c` 子 shell 语义；算术展开内的 `$(...)`。
+- **回归与非空洞守卫**：`crates/wasmsh-fs` 新增 6 个符号链接单测；`wasmsh-parse` 新增 heredoc/续行单测；`wasmsh-utils` 新增 CRLF/BOM/NUL/超长行/Unicode/空文件等边界单测。
+- **CI**：`.github/workflows/ci.yml` 新增 `oracle` job（ubuntu 有 bash），先断言 `command -v bash`，再以 `WASMSH_ORACLE=1` 跑差分套件；`ci-pass` 已把 `oracle` 纳入必需依赖。
+- **端到端验收**：`e2e/etl/{gen,run,verify}.sh` 多文件离线 ETL（nginx 日志 + 脏 CSV + JSONL → 规范化留痕 → 不依赖 `join` 的 awk 对账三表 → region 聚合 + 日志统计 → jq summary.json → Markdown 日报 → tar + sha256sum MANIFEST）。`crates/wasmsh-testkit/tests/etl_acceptance.rs` 在单一沙箱会话内跑两次：`set -euo pipefail` 生效、`PIPESTATUS` 正确、`verify.sh` 用另一种算法重算不变量并通过、两次运行 MANIFEST 内容哈希逐字节一致（幂等），并且故意破坏 `matched.tsv` 后 `verify.sh` 必须失败；denominator 为 0 时明确判失败。
+- **本地证据（2026-09-12）**：`cargo test --workspace --locked` 1565 通过、0 失败；`cargo test -p wasmsh-testkit --test suite_runner --locked` 621/627 通过（6 个 pre-existing feature-gate SKIP）；`cargo clippy --workspace --all-targets --locked -- -D warnings` 干净；`WASMSH_ORACLE=1` 下 22 个差分用例全部与真实 bash 逐字节一致。
+- **仍未支持/已知偏差**（诚实清单，见 `SUPPORTED.md`）：`sleep` 立即返回、`nproc` 固定值、`timeout` 对进程内命令不真正计时、`ulimit` 只读、`stat`/`date` 为子集；locale 固定 UTF-8/C；`ls -l` 的 owner/group/时间固定；工作树 CRLF 脚本按字面处理。`timeout`、`sleep` 桩、`nproc` 桩均已在文档标注，不再宣称完整 bash 兼容。

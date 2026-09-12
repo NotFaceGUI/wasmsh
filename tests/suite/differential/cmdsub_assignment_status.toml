@@ -1,0 +1,18 @@
+[test]
+name = "command-substitution-assignment-status"
+tags = ["expansion", "command-substitution", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["command-substitution", "variable-assignment", "echo"]
+
+[input]
+script = "x=$(false); echo $?"
+
+[expect]
+status = 0
+stdout = "1\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

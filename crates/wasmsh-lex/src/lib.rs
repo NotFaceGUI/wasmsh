@@ -130,8 +130,20 @@ impl<'src> Lexer<'src> {
     }
 
     fn skip_blanks(&mut self) {
-        while let Some(b' ' | b'\t') = self.peek() {
-            self.pos += 1;
+        loop {
+            match self.peek() {
+                Some(b' ' | b'\t') => self.pos += 1,
+                // A backslash-newline line continuation between tokens is
+                // whitespace: it joins the lines without introducing a word.
+                // Inside a word it is consumed by `consume_backslash`.
+                Some(b'\\') if self.peek_ahead(1) == Some(b'\n') => self.pos += 2,
+                Some(b'\\')
+                    if self.peek_ahead(1) == Some(b'\r') && self.peek_ahead(2) == Some(b'\n') =>
+                {
+                    self.pos += 3;
+                }
+                _ => break,
+            }
         }
     }
 

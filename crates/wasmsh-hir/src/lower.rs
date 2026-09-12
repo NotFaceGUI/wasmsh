@@ -64,27 +64,32 @@ fn lower_command(cmd: &ast::Command) -> HirCommand {
         ast::Command::Simple(sc) => lower_simple_command(sc),
         ast::Command::Subshell(sub) => HirCommand::Subshell(HirBlock {
             body: lower_body(&sub.body),
+            redirections: sub.redirections.iter().map(lower_redirection).collect(),
             span: sub.span,
         }),
         ast::Command::Group(grp) => HirCommand::Group(HirBlock {
             body: lower_body(&grp.body),
+            redirections: grp.redirections.iter().map(lower_redirection).collect(),
             span: grp.span,
         }),
         ast::Command::If(if_cmd) => HirCommand::If(lower_if(if_cmd)),
         ast::Command::While(w) => HirCommand::While(HirLoop {
             condition: lower_body(&w.condition),
             body: lower_body(&w.body),
+            redirections: w.redirections.iter().map(lower_redirection).collect(),
             span: w.span,
         }),
         ast::Command::Until(u) => HirCommand::Until(HirLoop {
             condition: lower_body(&u.condition),
             body: lower_body(&u.body),
+            redirections: u.redirections.iter().map(lower_redirection).collect(),
             span: u.span,
         }),
         ast::Command::For(f) => HirCommand::For(HirFor {
             var_name: f.var_name.clone(),
             words: f.words.clone(),
             body: lower_body(&f.body),
+            redirections: f.redirections.iter().map(lower_redirection).collect(),
             span: f.span,
         }),
         ast::Command::FunctionDef(fd) => HirCommand::FunctionDef(HirFunctionDef {
@@ -103,6 +108,7 @@ fn lower_command(cmd: &ast::Command) -> HirCommand {
                     terminator: item.terminator,
                 })
                 .collect(),
+            redirections: c.redirections.iter().map(lower_redirection).collect(),
             span: c.span,
         }),
         ast::Command::DoubleBracket(db) => HirCommand::DoubleBracket(HirDoubleBracket {
@@ -114,6 +120,7 @@ fn lower_command(cmd: &ast::Command) -> HirCommand {
             cond: af.cond.clone(),
             step: af.step.clone(),
             body: lower_body(&af.body),
+            redirections: af.redirections.iter().map(lower_redirection).collect(),
             span: af.span,
         }),
         ast::Command::ArithCommand(ac) => HirCommand::ArithCommand(HirArithCommand {
@@ -180,6 +187,7 @@ fn lower_if(if_cmd: &ast::IfCommand) -> HirIf {
             })
             .collect(),
         else_body: if_cmd.else_body.as_ref().map(|b| lower_body(b)),
+        redirections: if_cmd.redirections.iter().map(lower_redirection).collect(),
         span: if_cmd.span,
     }
 }

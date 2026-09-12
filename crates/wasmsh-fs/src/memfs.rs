@@ -29,6 +29,8 @@ const MAX_INODES: usize = 100_000;
 enum FsNode {
     File(Arc<[u8]>),
     Dir,
+    /// Symbolic link; the value is the raw target (absolute or relative).
+    Symlink(String),
 }
 
 enum OpenFileSource {
@@ -230,11 +232,41 @@ impl MemoryFsInner {
             crate::DEFAULT_FILE_MODE
         })
     }
+
+    /// Follow symlinks in a normalized path, returning the final normalized
+    /// target. Dangling links resolve to the (nonexistent) target path so
+    /// that a subsequent create writes through the link.
+    fn resolve_normalized(&self, norm: &str) -> Result<String, FsError> {
+        let mut current = norm.to_string();
+        for _ in 0..MAX_SYMLINK_DEPTH {
+            match self.nodes.get(&current) {
+                Some(FsNode::Symlink(target)) => {
+                    current = if target.starts_with('/') {
+                        crate::normalize_path(target)
+                    } else {
+                        let base = current.rsplit_once('/').map_or("", |(b, _)| b);
+                        let joined = if base.is_empty() {
+                            format!("/{target}")
+                        } else {
+                            format!("{base}/{target}")
+                        };
+                        crate::normalize_path(&joined)
+                    };
+                }
+                _ => return Ok(current),
+            }
+        }
+        Err(FsError::Io("too many levels of symbolic links".into()))
+    }
 }
+
+/// Maximum number of symbolic links followed in one path resolution.
+const MAX_SYMLINK_DEPTH: usize = 40;
 
 impl Vfs for MemoryFs {
     fn open(&mut self, path: &str, opts: OpenOptions) -> Result<FileHandle, FsError> {
         let norm = crate::normalize_path(path);
+        let norm = self.inner.borrow().resolve_normalized(&norm)?;
         let mut inner = self.inner.borrow_mut();
 
         if opts.read && !opts.write && !opts.append && !opts.create && !opts.truncate {
@@ -256,6 +288,11 @@ impl Vfs for MemoryFs {
         match inner.nodes.get(&norm) {
             Some(FsNode::Dir) => {
                 return Err(FsError::IsADirectory(norm));
+            }
+            // The path was already resolved above, so a symlink here would be
+            // a self-referential loop.
+            Some(FsNode::Symlink(_)) => {
+                return Err(FsError::Io("too many levels of symbolic links".into()));
             }
             Some(FsNode::File(contents)) => {
                 let mode = inner.mode_of(&norm, false);
@@ -395,11 +432,15 @@ impl Vfs for MemoryFs {
         append: bool,
     ) -> Result<Box<dyn VfsWriteSink>, FsError> {
         let norm = crate::normalize_path(path);
+        let norm = self.inner.borrow().resolve_normalized(&norm)?;
         {
             let mut inner = self.inner.borrow_mut();
             inner.virtual_readers.remove(&norm);
             match inner.nodes.get(&norm) {
                 Some(FsNode::Dir) => return Err(FsError::IsADirectory(norm)),
+                Some(FsNode::Symlink(_)) => {
+                    return Err(FsError::Io("too many levels of symbolic links".into()));
+                }
                 Some(FsNode::File(_)) => {}
                 None => {
                     drop(inner);
@@ -462,28 +503,97 @@ impl Vfs for MemoryFs {
 
     fn stat(&self, path: &str) -> Result<Metadata, FsError> {
         let norm = crate::normalize_path(path);
-        match self.inner.borrow().nodes.get(&norm) {
+        let inner = self.inner.borrow();
+        let resolved = inner.resolve_normalized(&norm)?;
+        match inner.nodes.get(&resolved) {
             Some(FsNode::File(data)) => Ok(Metadata {
                 is_dir: false,
+                is_symlink: false,
                 size: data.len() as u64,
-                mode: self.inner.borrow().mode_of(&norm, false),
+                mode: inner.mode_of(&resolved, false),
             }),
             Some(FsNode::Dir) => Ok(Metadata {
                 is_dir: true,
+                is_symlink: false,
                 size: 0,
-                mode: self.inner.borrow().mode_of(&norm, true),
+                mode: inner.mode_of(&resolved, true),
+            }),
+            // A path that resolves to a symlink means the chain did not
+            // terminate at a regular file or directory (dangling or loop).
+            Some(FsNode::Symlink(_)) | None => Err(FsError::NotFound(resolved)),
+        }
+    }
+
+    fn lstat(&self, path: &str) -> Result<Metadata, FsError> {
+        let norm = crate::normalize_path(path);
+        let inner = self.inner.borrow();
+        match inner.nodes.get(&norm) {
+            Some(FsNode::File(data)) => Ok(Metadata {
+                is_dir: false,
+                is_symlink: false,
+                size: data.len() as u64,
+                mode: inner.mode_of(&norm, false),
+            }),
+            Some(FsNode::Dir) => Ok(Metadata {
+                is_dir: true,
+                is_symlink: false,
+                size: 0,
+                mode: inner.mode_of(&norm, true),
+            }),
+            Some(FsNode::Symlink(target)) => Ok(Metadata {
+                is_dir: false,
+                is_symlink: true,
+                size: target.len() as u64,
+                mode: 0o777,
             }),
             None => Err(FsError::NotFound(norm)),
         }
     }
 
+    fn read_link(&self, path: &str) -> Result<String, FsError> {
+        let norm = crate::normalize_path(path);
+        match self.inner.borrow().nodes.get(&norm) {
+            Some(FsNode::Symlink(target)) => Ok(target.clone()),
+            _ => Err(FsError::NotFound(norm)),
+        }
+    }
+
+    fn symlink(&mut self, target: &str, link_path: &str) -> Result<(), FsError> {
+        let norm = crate::normalize_path(link_path);
+        if self.inner.borrow().nodes.contains_key(&norm) {
+            return Err(FsError::AlreadyExists(norm));
+        }
+        let parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+        let mut parent = String::new();
+        for part in &parts[..parts.len().saturating_sub(1)] {
+            parent.push('/');
+            parent.push_str(part);
+            let mut inner = self.inner.borrow_mut();
+            match inner.nodes.get(&parent) {
+                Some(FsNode::Dir) => {}
+                Some(_) => return Err(FsError::NotADirectory(parent)),
+                None => {
+                    check_inode_room(&inner)?;
+                    inner.nodes.insert(parent.clone(), FsNode::Dir);
+                }
+            }
+        }
+        let mut inner = self.inner.borrow_mut();
+        check_inode_room(&inner)?;
+        inner
+            .nodes
+            .insert(norm, FsNode::Symlink(target.to_string()));
+        Ok(())
+    }
+
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         let norm = crate::normalize_path(path);
         let inner = self.inner.borrow();
+        let norm = inner.resolve_normalized(&norm)?;
         match inner.nodes.get(&norm) {
             Some(FsNode::Dir) => {}
             Some(FsNode::File(_)) => return Err(FsError::NotADirectory(norm)),
-            None => return Err(FsError::NotFound(norm)),
+            Some(FsNode::Symlink(_)) | None => return Err(FsError::NotFound(norm)),
         }
 
         let prefix = if norm == "/" {
@@ -496,9 +606,21 @@ impl Vfs for MemoryFs {
         for (k, v) in &inner.nodes {
             if let Some(rest) = k.strip_prefix(&prefix) {
                 if !rest.contains('/') && !rest.is_empty() {
+                    let (is_dir, is_symlink) = match v {
+                        FsNode::Dir => (true, false),
+                        FsNode::Symlink(_) => {
+                            let followed = inner.resolve_normalized(k).ok();
+                            let target_is_dir = followed
+                                .and_then(|t| inner.nodes.get(&t))
+                                .is_some_and(|n| matches!(n, FsNode::Dir));
+                            (target_is_dir, true)
+                        }
+                        FsNode::File(_) => (false, false),
+                    };
                     entries.push(DirEntry {
                         name: rest.to_string(),
-                        is_dir: matches!(v, FsNode::Dir),
+                        is_dir,
+                        is_symlink,
                     });
                 }
             }
@@ -521,22 +643,34 @@ impl Vfs for MemoryFs {
 
     fn remove_file(&mut self, path: &str) -> Result<(), FsError> {
         let norm = crate::normalize_path(path);
+        // A final symlink is removed as a link, not followed to its target.
+        let is_link = matches!(
+            self.inner.borrow().nodes.get(&norm),
+            Some(FsNode::Symlink(_))
+        );
+        if is_link {
+            let mut inner = self.inner.borrow_mut();
+            inner.nodes.remove(&norm);
+            inner.modes.remove(&norm);
+            return Ok(());
+        }
+        let resolved = self.inner.borrow().resolve_normalized(&norm)?;
         let kind = {
             let inner = self.inner.borrow();
-            inner.nodes.get(&norm).cloned()
+            inner.nodes.get(&resolved).cloned()
         };
         match kind {
-            Some(FsNode::Dir) => Err(FsError::IsADirectory(norm)),
+            Some(FsNode::Dir) => Err(FsError::IsADirectory(resolved)),
             Some(FsNode::File(contents)) => {
                 let size = contents.len();
                 let mut inner = self.inner.borrow_mut();
-                inner.nodes.remove(&norm);
-                inner.modes.remove(&norm);
-                inner.virtual_readers.remove(&norm);
+                inner.nodes.remove(&resolved);
+                inner.modes.remove(&resolved);
+                inner.virtual_readers.remove(&resolved);
                 inner.total_bytes = inner.total_bytes.saturating_sub(size);
                 Ok(())
             }
-            None => Err(FsError::NotFound(norm)),
+            _ => Err(FsError::NotFound(norm)),
         }
     }
 
@@ -545,7 +679,9 @@ impl Vfs for MemoryFs {
         {
             let inner = self.inner.borrow();
             match inner.nodes.get(&norm) {
-                Some(FsNode::File(_)) => return Err(FsError::NotADirectory(norm)),
+                Some(FsNode::File(_) | FsNode::Symlink(_)) => {
+                    return Err(FsError::NotADirectory(norm))
+                }
                 Some(FsNode::Dir) => {}
                 None => return Err(FsError::NotFound(norm)),
             }
@@ -895,5 +1031,64 @@ mod tests {
 
         let h = fs.open("/log.txt", OpenOptions::read()).unwrap();
         assert_eq!(fs.read_file(h).unwrap(), b"line1\nline2\n");
+    }
+
+    #[test]
+    fn symlink_creation_and_read_back() {
+        let mut fs = MemoryFs::new();
+        let h = fs.open("/target.txt", OpenOptions::write()).unwrap();
+        fs.write_file(h, b"data").unwrap();
+        fs.close(h);
+
+        fs.symlink("target.txt", "/link.txt").unwrap();
+        assert_eq!(fs.read_link("/link.txt").unwrap(), "target.txt");
+        // stat follows the link; lstat reports the link itself.
+        assert!(!fs.stat("/link.txt").unwrap().is_symlink);
+        assert!(fs.lstat("/link.txt").unwrap().is_symlink);
+        let h = fs.open("/link.txt", OpenOptions::read()).unwrap();
+        assert_eq!(fs.read_file(h).unwrap(), b"data");
+    }
+
+    #[test]
+    fn symlink_relative_target_resolves_against_link_dir() {
+        let mut fs = MemoryFs::new();
+        fs.create_dir("/sub").unwrap();
+        let h = fs.open("/sub/a.txt", OpenOptions::write()).unwrap();
+        fs.write_file(h, b"x").unwrap();
+        fs.close(h);
+        fs.symlink("a.txt", "/sub/link").unwrap();
+        let h = fs.open("/sub/link", OpenOptions::read()).unwrap();
+        assert_eq!(fs.read_file(h).unwrap(), b"x");
+    }
+
+    #[test]
+    fn dangling_symlink_errors_on_stat_but_not_lstat() {
+        let mut fs = MemoryFs::new();
+        fs.symlink("/missing", "/dangling").unwrap();
+        assert!(fs.stat("/dangling").is_err());
+        assert!(fs.lstat("/dangling").unwrap().is_symlink);
+        // Removing the link works even though its target is gone.
+        fs.remove_file("/dangling").unwrap();
+        assert!(fs.lstat("/dangling").is_err());
+    }
+
+    #[test]
+    fn symlink_to_directory_is_reported_by_read_dir() {
+        let mut fs = MemoryFs::new();
+        fs.create_dir("/real").unwrap();
+        fs.symlink("/real", "/alias").unwrap();
+        let entries = fs.read_dir("/").unwrap();
+        let alias = entries.iter().find(|e| e.name == "alias").unwrap();
+        assert!(alias.is_symlink);
+        assert!(alias.is_dir);
+    }
+
+    #[test]
+    fn symlink_loop_is_rejected() {
+        let mut fs = MemoryFs::new();
+        fs.symlink("/b", "/a").unwrap();
+        fs.symlink("/a", "/b").unwrap();
+        assert!(fs.stat("/a").is_err());
+        assert!(fs.open("/a", OpenOptions::read()).is_err());
     }
 }

@@ -1,5 +1,24 @@
 # Supported Syntax and Commands
 
+## Verification status
+
+This document describes a **verified subset of Bash**, not a complete Bash
+implementation. "Verified" means the behaviour is either:
+
+1. **Differentially tested** — a TOML case under
+   [`tests/suite/differential/`](tests/suite/differential/) runs the same
+   script through wasmsh and a real `bash`, and asserts identical stdout,
+   stderr, and exit status (see `[oracle] compare = true`). These cases run in
+   the `oracle` CI job, where a missing reference shell is a **visible SKIP**,
+   never a silent pass.
+2. **Behaviourally tested** — a declarative case with an explicit expected
+   output or a Rust unit test.
+
+Everything else is either **known divergent** (documented below) or
+**unsupported**. The sandbox does not aim to be a drop-in GNU Bash: it has no
+PTY or job control, several utilities are stubs, and locale handling is fixed
+to UTF-8/C. See [Known divergences and degraded commands](#known-divergences-and-degraded-commands).
+
 ## Fork Delivery Status
 
 The standalone artifact is the primary AI-shell delivery. Its base tier is
@@ -502,6 +521,68 @@ The Pyodide build includes [micropip](https://micropip.pyodide.org/) for install
 - `file:` URIs are rejected
 - `emfs:` installs (from the in-sandbox filesystem) always work
 - Installs are session-local and do not persist
+
+---
+
+## Known divergences and degraded commands
+
+These are known, intentional, or environmental limits. Each is either covered
+by a test that documents the divergence or listed here so it is not mistaken
+for full compatibility.
+
+### Stubs and degraded semantics
+
+| Command | Behaviour | Impact |
+|---------|-----------|--------|
+| `sleep` | Returns immediately; does not delay | Timing-dependent scripts complete instantly. No wall-clock stall is modelled. |
+| `nproc` | Returns a fixed value (see `trivial_ops`) | Parallelism decisions see a constant core count. |
+| `timeout` | Accepted, no real timer is enforced for in-process commands | A command that never terminates is only bounded by the host step budget, not by `timeout`. |
+| `ulimit` | Read-only/no-op reporting | Resource limits are governed by the host, not by `ulimit`. |
+| `stat` | Report format is a compatible subset | Some format specifiers and fields are not implemented. |
+| `date` | Deterministic under the test clock; live clock on native hosts | Format coverage is a subset of GNU `date`. |
+| `&` (background) | Parsed but runs synchronously | No `jobs`/`fg`/`bg`. |
+
+### Environment-dependent differences
+
+- **Locale**: wasmsh sorts and matches under a fixed UTF-8 / `LC_ALL=C`
+  ordering. `LC_ALL=C sort` is differentially tested; other locales are not
+  modelled. Assigning `LC_ALL` does not change collation.
+- **Line endings**: input scripts with CRLF line endings are read literally
+  (the CR is part of the line). Real Bash on Windows/MSYS strips CR in some
+  contexts. Scripts intended for wasmsh should use LF.
+- **Symbolic links on Windows**: real Bash under Git Bash only creates true
+  symlinks when `MSYS=winsymlinks:lnk` is set; the differential oracle sets
+  this so `ln -s` comparisons are meaningful. wasmsh's VFS always models real
+  symlinks.
+- **`ls -l` metadata**: wasmsh renders a fixed owner/group and fixed
+  timestamp (`Jan 1 00:00`) because the VFS has no ownership or mtime. Byte
+  size and link targets match.
+
+### Fixed in the differential-hardening pass
+
+The following previously-silent divergences were found by the oracle and
+fixed; each is now guarded by a case in `tests/suite/differential/`:
+
+- `sort -k N -n`, `-k2n`, and `-t: -k2 -n`
+- `sort` default stability/last-resort ordering and `-r`
+- awk `print`/`printf` redirection (`>`, `>>`, `| "cmd"`)
+- awk array parameters passed by reference
+- awk `$`-anchored regex leftmost-longest matching
+- awk `printf "%c", N` from a numeric code
+- `while read` over a pipe / heredoc / file redirect (single-iteration bug)
+- `${VAR:-N}` when the operand is numeric
+- `if` without `else` returning non-zero (and tripping `set -e`)
+- `$(cmd)` assignment status (`x=$(false); echo $?`)
+- group/subshell redirection `{ ...; } > f`, `( ... ) > f`
+- quoted here-doc delimiters (`<<'EOF'` must not expand)
+- backslash-newline line continuation (unquoted and in double quotes)
+- `trap ... EXIT` firing at script end
+- `ln -s`, `cp -s`, `ln -sf`, and `readlink` for real symlinks
+- `grep -A/-B/-C` context lines, including glued forms (`-A2`)
+- `wc -l` on input without a trailing newline, and GNU column alignment
+- `getopts` with `OPTARG`/`OPTIND`, clustering, attached args, `--`, and `:`
+- `tar -C` directory switching for create and extract
+- `sh file` / `sh -c` running as a child shell (no variable/function leakage)
 
 ---
 

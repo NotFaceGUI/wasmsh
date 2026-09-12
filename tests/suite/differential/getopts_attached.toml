@@ -1,0 +1,18 @@
+[test]
+name = "getopts-clustered-and-attached"
+tags = ["getopts", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["getopts", "echo"]
+
+[input]
+script = "f(){ OPTIND=1; while getopts \"ab:\" o; do echo opt=$o arg=$OPTARG; done; }\nf -abval rest"
+
+[expect]
+status = 0
+stdout = "opt=a arg=\nopt=b arg=val\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

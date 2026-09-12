@@ -1,0 +1,18 @@
+[test]
+name = "wc-multi-file-column-alignment"
+tags = ["utility", "wc", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["wc", "printf"]
+
+[input]
+script = "printf 'hello world\n' > hw.txt\nwc hw.txt hw.txt\nwc -l hw.txt hw.txt"
+
+[expect]
+status = 0
+stdout = " 1  2 12 hw.txt\n 1  2 12 hw.txt\n 2  4 24 total\n 1 hw.txt\n 1 hw.txt\n 2 total\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

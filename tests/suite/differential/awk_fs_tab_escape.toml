@@ -1,0 +1,18 @@
+[test]
+name = "awk-fs-tab-escape"
+tags = ["awk", "field-separator", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["awk", "printf"]
+
+[input]
+script = "printf 'a\tb\n' | awk -F'\t' '{print $2}'"
+
+[expect]
+status = 0
+stdout = "b\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

@@ -1,0 +1,18 @@
+[test]
+name = "wc-lines-without-trailing-newline"
+tags = ["utility", "wc", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["wc", "printf"]
+
+[input]
+script = "printf 'abc' > f.txt\nwc -l f.txt\nwc -c f.txt"
+
+[expect]
+status = 0
+stdout = "0 f.txt\n3 f.txt\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

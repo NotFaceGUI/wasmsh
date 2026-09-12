@@ -1,0 +1,18 @@
+[test]
+name = "line-continuation-before-redirect"
+tags = ["lexer", "backslash-escape", "redirection", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["backslash-escape", "redirection", "cat"]
+
+[input]
+script = "printf 'hello\\n' > /in.txt\ncat /in.txt \\\n  > /out.txt\ncat /out.txt"
+
+[expect]
+status = 0
+stdout = "hello\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

@@ -1,0 +1,18 @@
+[test]
+name = "sh-file-is-subshell"
+tags = ["shell", "subshell", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["exit", "echo"]
+
+[input]
+script = "printf 'X=child\necho inside\nexit 5\n' > sub.sh\nsh sub.sh\necho rc=$?\necho X=[$X]"
+
+[expect]
+status = 0
+stdout = "inside\nrc=5\nX=[]\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

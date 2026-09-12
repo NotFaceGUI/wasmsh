@@ -111,6 +111,8 @@ pub struct ArithForCommand {
     pub step: SmolStr,
     /// The loop body.
     pub body: Vec<CompleteCommand>,
+    /// Trailing redirections applied to the whole loop.
+    pub redirections: Vec<Redirection>,
     /// Source span.
     pub span: Span,
 }
@@ -153,6 +155,8 @@ pub struct DoubleBracketCommand {
 pub struct SubshellCommand {
     /// The commands inside the subshell.
     pub body: Vec<CompleteCommand>,
+    /// Trailing redirections applied to the subshell (e.g. `( ... ) > f`).
+    pub redirections: Vec<Redirection>,
     /// Source span.
     pub span: Span,
 }
@@ -162,6 +166,8 @@ pub struct SubshellCommand {
 pub struct GroupCommand {
     /// The commands inside the brace group.
     pub body: Vec<CompleteCommand>,
+    /// Trailing redirections applied to the group (e.g. `{ ...; } > f`).
+    pub redirections: Vec<Redirection>,
     /// Source span.
     pub span: Span,
 }
@@ -177,6 +183,8 @@ pub struct IfCommand {
     pub elifs: Vec<ElifClause>,
     /// Optional `else` body.
     pub else_body: Option<Vec<CompleteCommand>>,
+    /// Trailing redirections applied to the whole `if` (e.g. `... fi > f`).
+    pub redirections: Vec<Redirection>,
     /// Source span.
     pub span: Span,
 }
@@ -197,6 +205,8 @@ pub struct WhileCommand {
     pub condition: Vec<CompleteCommand>,
     /// The loop body.
     pub body: Vec<CompleteCommand>,
+    /// Trailing redirections applied to the whole loop.
+    pub redirections: Vec<Redirection>,
     /// Source span.
     pub span: Span,
 }
@@ -208,6 +218,8 @@ pub struct UntilCommand {
     pub condition: Vec<CompleteCommand>,
     /// The loop body.
     pub body: Vec<CompleteCommand>,
+    /// Trailing redirections applied to the whole loop.
+    pub redirections: Vec<Redirection>,
     /// Source span.
     pub span: Span,
 }
@@ -221,6 +233,8 @@ pub struct ForCommand {
     pub words: Option<Vec<Word>>,
     /// The loop body.
     pub body: Vec<CompleteCommand>,
+    /// Trailing redirections applied to the whole loop.
+    pub redirections: Vec<Redirection>,
     /// Source span.
     pub span: Span,
 }
@@ -232,6 +246,8 @@ pub struct CaseCommand {
     pub word: Word,
     /// The list of pattern arms.
     pub items: Vec<CaseItem>,
+    /// Trailing redirections applied to the whole `case`.
+    pub redirections: Vec<Redirection>,
     /// Source span.
     pub span: Span,
 }
@@ -374,6 +390,9 @@ pub enum RedirectionOp {
 pub struct HereDocBody {
     /// The literal here-doc text (after delimiter stripping).
     pub content: SmolStr,
+    /// Whether the body should undergo parameter/command/arithmetic
+    /// expansion. False when the delimiter word was quoted (`<<'EOF'`).
+    pub expand: bool,
     /// Source span of the here-doc body.
     pub span: Span,
 }

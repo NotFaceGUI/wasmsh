@@ -1,0 +1,18 @@
+[test]
+name = "sort-locale-c-deterministic"
+tags = ["utility", "sort", "locale", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["sort", "printf"]
+
+[input]
+script = "printf 'b\nA\na\nB\n' | LC_ALL=C sort"
+
+[expect]
+status = 0
+stdout = "A\nB\na\nb\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

@@ -424,19 +424,24 @@ pub(crate) fn util_tar(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
         return 1;
     };
 
-    let base_dir = flags.change_dir.unwrap_or(ctx.cwd);
+    // `-C` is interpreted relative to the shell's cwd, so resolve it before
+    // joining member names against it.
+    let base_dir = match flags.change_dir {
+        Some(dir) => resolve_path(ctx.cwd, dir),
+        None => ctx.cwd.to_string(),
+    };
 
     if flags.create {
         tar_create(
             ctx,
             archive_path,
             args,
-            base_dir,
+            &base_dir,
             flags.gzipped,
             flags.verbose,
         )
     } else if flags.extract {
-        tar_extract(ctx, archive_path, base_dir, flags.gzipped, flags.verbose)
+        tar_extract(ctx, archive_path, &base_dir, flags.gzipped, flags.verbose)
     } else if flags.list {
         tar_list(ctx, archive_path, flags.gzipped)
     } else {

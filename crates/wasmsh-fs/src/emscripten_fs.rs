@@ -429,6 +429,7 @@ impl Vfs for EmscriptenFs {
         if self.virtual_readers.contains_key(path) {
             return Ok(Metadata {
                 is_dir: false,
+                is_symlink: false,
                 size: 0,
                 mode: crate::DEFAULT_FILE_MODE,
             });
@@ -440,10 +441,55 @@ impl Vfs for EmscriptenFs {
         }
         Ok(Metadata {
             is_dir: (st.st_mode & libc::S_IFMT) == libc::S_IFDIR,
+            is_symlink: false,
             size: st.st_size as u64,
             #[allow(clippy::unnecessary_cast)]
             mode: (st.st_mode as u32) & crate::MODE_PERM_MASK,
         })
+    }
+
+    fn lstat(&self, path: &str) -> Result<Metadata, FsError> {
+        if self.virtual_readers.contains_key(path) {
+            return self.stat(path);
+        }
+        let cpath = to_cstring(path)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::lstat(cpath.as_ptr(), &mut st) } != 0 {
+            return Err(FsError::NotFound(path.to_string()));
+        }
+        Ok(Metadata {
+            is_dir: (st.st_mode & libc::S_IFMT) == libc::S_IFDIR,
+            is_symlink: (st.st_mode & libc::S_IFMT) == libc::S_IFLNK,
+            size: st.st_size as u64,
+            #[allow(clippy::unnecessary_cast)]
+            mode: (st.st_mode as u32) & crate::MODE_PERM_MASK,
+        })
+    }
+
+    fn read_link(&self, path: &str) -> Result<String, FsError> {
+        let cpath = to_cstring(path)?;
+        let mut buf = vec![0u8; 4096];
+        let n = unsafe {
+            libc::readlink(
+                cpath.as_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return Err(FsError::NotFound(path.to_string()));
+        }
+        buf.truncate(n as usize);
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    fn symlink(&mut self, target: &str, link_path: &str) -> Result<(), FsError> {
+        let ctarget = to_cstring(target)?;
+        let clink = to_cstring(link_path)?;
+        if unsafe { libc::symlink(ctarget.as_ptr(), clink.as_ptr()) } != 0 {
+            return Err(FsError::Io(format!("symlink failed: {link_path}")));
+        }
+        Ok(())
     }
 
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), FsError> {
@@ -482,7 +528,12 @@ impl Vfs for EmscriptenFs {
                 continue;
             }
             let is_dir = unsafe { (*ent).d_type } == libc::DT_DIR;
-            entries.push(DirEntry { name, is_dir });
+            let is_symlink = unsafe { (*ent).d_type } == libc::DT_LNK;
+            entries.push(DirEntry {
+                name,
+                is_dir,
+                is_symlink,
+            });
         }
         unsafe { libc::closedir(dp) };
         Ok(entries)

@@ -17,4 +17,6 @@ trap -l | grep '15 TERM'
 
 [expect]
 status = 0
-stdout = "trap -- $'echo cleanup' EXIT\ntrap -- '' ERR\ntrap -- $'echo term' TERM\n0 EXIT\nDEBUG\n15 TERM\n"
+# The EXIT trap runs when the script ends, so its `cleanup` output follows
+# the listing commands.
+stdout = "trap -- $'echo cleanup' EXIT\ntrap -- '' ERR\ntrap -- $'echo term' TERM\n0 EXIT\nDEBUG\n15 TERM\ncleanup\n"

@@ -1,0 +1,18 @@
+[test]
+name = "wc-pipe-column-padding"
+tags = ["utility", "wc", "pipeline", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["wc", "echo", "pipeline"]
+
+[input]
+script = "echo hello world | wc"
+
+[expect]
+status = 0
+stdout = "      1       2      12\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

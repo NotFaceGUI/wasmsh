@@ -148,6 +148,12 @@ impl FdTable {
         std::mem::replace(&mut self.stdin, InputTarget::Inherit)
     }
 
+    /// Clone the current stdin target (used to inspect its kind without
+    /// consuming it).
+    pub(crate) fn stdin_clone(&self) -> InputTarget {
+        self.stdin.clone()
+    }
+
     pub(crate) fn set_input(&mut self, target: InputTarget) {
         self.stdin = target;
     }
@@ -210,6 +216,11 @@ impl ExecIo {
 
     pub(crate) fn take_stdin(&mut self) -> InputTarget {
         self.fds.take_stdin()
+    }
+
+    /// Clone of the current stdin target, for inspecting its kind.
+    pub(crate) fn stdin_target_kind(&self) -> InputTarget {
+        self.fds.stdin_clone()
     }
 
     pub(crate) fn output_target(&self, stdout: bool) -> OutputTarget {

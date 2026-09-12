@@ -1,0 +1,18 @@
+[test]
+name = "arithmetic-command-substitution"
+tags = ["expansion", "arithmetic-expansion", "command-substitution", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["arithmetic-expansion", "command-substitution", "echo"]
+
+[input]
+script = "n=$(echo 5)\necho $(( n - 1 ))\necho $(( 2 + $(echo 3) ))"
+
+[expect]
+status = 0
+stdout = "4\n5\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

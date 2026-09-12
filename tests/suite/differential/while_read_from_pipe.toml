@@ -1,0 +1,18 @@
+[test]
+name = "while-read-from-pipe"
+tags = ["control-flow", "read", "pipeline", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["while", "read", "printf", "pipeline"]
+
+[input]
+script = "printf '1\n2\n3\n' | while read x; do echo got:$x; done"
+
+[expect]
+status = 0
+stdout = "got:1\ngot:2\ngot:3\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

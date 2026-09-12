@@ -44,6 +44,9 @@ const TERMINATOR_WORDS: &[&str] = &["then", "elif", "else", "fi", "do", "done", 
 struct PendingHereDoc {
     delimiter: String,
     strip_tabs: bool,
+    /// Whether the body undergoes parameter/command/arithmetic expansion.
+    /// Quoting any part of the delimiter word suppresses expansion.
+    expand_body: bool,
 }
 
 struct Parser<'src> {
@@ -484,6 +487,20 @@ impl<'src> Parser<'src> {
 
     // ---- Compound commands ----
 
+    /// Collect trailing redirections attached to a compound command
+    /// (e.g. `... done < file`, `{ ...; } > out`).
+    fn parse_trailing_redirections(&mut self) -> Result<Vec<Redirection>, ParseError> {
+        let mut redirections = Vec::new();
+        while self.at_redirection() || self.at_fd_prefix_redirection() {
+            if self.at_fd_prefix_redirection() {
+                redirections.push(self.parse_fd_prefixed_redirection()?);
+            } else {
+                redirections.push(self.parse_redirection()?);
+            }
+        }
+        Ok(redirections)
+    }
+
     fn parse_subshell(&mut self) -> Result<Command, ParseError> {
         let start = self.current.span.start;
         self.advance()?; // consume (
@@ -495,8 +512,10 @@ impl<'src> Parser<'src> {
             });
         }
         self.advance()?; // consume )
+        let redirections = self.parse_trailing_redirections()?;
         Ok(Command::Subshell(SubshellCommand {
             body,
+            redirections,
             span: self.span_from(start),
         }))
     }
@@ -506,8 +525,10 @@ impl<'src> Parser<'src> {
         self.expect_word("{")?;
         let body = self.parse_compound_list()?;
         self.expect_word("}")?;
+        let redirections = self.parse_trailing_redirections()?;
         Ok(Command::Group(GroupCommand {
             body,
+            redirections,
             span: self.span_from(start),
         }))
     }
@@ -539,11 +560,13 @@ impl<'src> Parser<'src> {
         };
 
         self.expect_word("fi")?;
+        let redirections = self.parse_trailing_redirections()?;
         Ok(Command::If(IfCommand {
             condition,
             then_body,
             elifs,
             else_body,
+            redirections,
             span: self.span_from(start),
         }))
     }
@@ -555,9 +578,11 @@ impl<'src> Parser<'src> {
         self.expect_word("do")?;
         let body = self.parse_compound_list()?;
         self.expect_word("done")?;
+        let redirections = self.parse_trailing_redirections()?;
         Ok(Command::While(WhileCommand {
             condition,
             body,
+            redirections,
             span: self.span_from(start),
         }))
     }
@@ -569,9 +594,11 @@ impl<'src> Parser<'src> {
         self.expect_word("do")?;
         let body = self.parse_compound_list()?;
         self.expect_word("done")?;
+        let redirections = self.parse_trailing_redirections()?;
         Ok(Command::Until(UntilCommand {
             condition,
             body,
+            redirections,
             span: self.span_from(start),
         }))
     }
@@ -599,11 +626,13 @@ impl<'src> Parser<'src> {
         self.expect_word("do")?;
         let body = self.parse_compound_list()?;
         self.expect_word("done")?;
+        let redirections = self.parse_trailing_redirections()?;
 
         Ok(Command::For(ForCommand {
             var_name,
             words,
             body,
+            redirections,
             span: self.span_from(start),
         }))
     }
@@ -682,19 +711,7 @@ impl<'src> Parser<'src> {
         self.expect_word("done")?;
 
         // Collect trailing redirections (e.g., `done <<< "input"`)
-        let mut redirections = Vec::new();
-        while self.at_redirection() || self.at_fd_prefix_redirection() {
-            if self.at_fd_prefix_redirection() {
-                let fd_text = self.current_text();
-                let fd: u32 = fd_text.parse().unwrap_or(0);
-                self.advance()?;
-                let mut redir = self.parse_redirection()?;
-                redir.fd = Some(fd);
-                redirections.push(redir);
-            } else {
-                redirections.push(self.parse_redirection()?);
-            }
-        }
+        let redirections = self.parse_trailing_redirections()?;
 
         Ok(Command::Select(SelectCommand {
             var_name,
@@ -744,12 +761,14 @@ impl<'src> Parser<'src> {
         self.expect_word("do")?;
         let body = self.parse_compound_list()?;
         self.expect_word("done")?;
+        let redirections = self.parse_trailing_redirections()?;
 
         Ok(Command::ArithFor(ArithForCommand {
             init: init.into(),
             cond: cond.into(),
             step: step.into(),
             body,
+            redirections,
             span: self.span_from(start),
         }))
     }
@@ -834,9 +853,11 @@ impl<'src> Parser<'src> {
         }
 
         self.expect_word("esac")?;
+        let redirections = self.parse_trailing_redirections()?;
         Ok(Command::Case(CaseCommand {
             word,
             items,
+            redirections,
             span: self.span_from(start),
         }))
     }
@@ -1224,6 +1245,7 @@ impl<'src> Parser<'src> {
             self.pending_heredocs.push(PendingHereDoc {
                 delimiter: delim,
                 strip_tabs: op == RedirectionOp::HereDocStrip,
+                expand_body: !heredoc_delimiter_is_quoted(self.source, &target),
             });
         }
 
@@ -1256,7 +1278,12 @@ impl<'src> Parser<'src> {
                 let (line_start, line_end, line) = self.heredoc_line(scan_pos);
                 let check_line = self.heredoc_check_line(line, hd.strip_tabs);
                 if check_line == hd.delimiter {
-                    bodies.push(self.build_heredoc_body(body_start, line_start, hd.strip_tabs));
+                    bodies.push(self.build_heredoc_body(
+                        body_start,
+                        line_start,
+                        hd.strip_tabs,
+                        hd.expand_body,
+                    ));
                     scan_pos = self.advance_heredoc_scan(line_end);
                     break;
                 }
@@ -1306,6 +1333,7 @@ impl<'src> Parser<'src> {
         body_start: usize,
         line_start: usize,
         strip_tabs: bool,
+        expand: bool,
     ) -> HereDocBody {
         let raw_body = &self.source[body_start..line_start];
         let content = if strip_tabs {
@@ -1320,6 +1348,7 @@ impl<'src> Parser<'src> {
         };
         HereDocBody {
             content: content.into(),
+            expand,
             span: Span {
                 start: body_start as u32,
                 end: line_start as u32,
@@ -1359,15 +1388,27 @@ fn assign_heredoc_bodies_pipeline(
 }
 
 fn assign_heredoc_bodies_cmd(cmd: &mut Command, bodies: &mut impl Iterator<Item = HereDocBody>) {
-    if let Command::Simple(sc) = cmd {
-        for redir in &mut sc.redirections {
-            if matches!(
-                redir.op,
-                RedirectionOp::HereDoc | RedirectionOp::HereDocStrip
-            ) && redir.here_doc_body.is_none()
-            {
-                redir.here_doc_body = bodies.next();
-            }
+    let redirections: &mut [Redirection] = match cmd {
+        Command::Simple(sc) => &mut sc.redirections,
+        Command::Subshell(c) => &mut c.redirections,
+        Command::Group(c) => &mut c.redirections,
+        Command::If(c) => &mut c.redirections,
+        Command::While(c) => &mut c.redirections,
+        Command::Until(c) => &mut c.redirections,
+        Command::For(c) => &mut c.redirections,
+        Command::ArithFor(c) => &mut c.redirections,
+        Command::Case(c) => &mut c.redirections,
+        Command::Select(c) => &mut c.redirections,
+        // `Command` is #[non_exhaustive]; other variants carry no heredocs here.
+        _ => return,
+    };
+    for redir in redirections {
+        if matches!(
+            redir.op,
+            RedirectionOp::HereDoc | RedirectionOp::HereDocStrip
+        ) && redir.here_doc_body.is_none()
+        {
+            redir.here_doc_body = bodies.next();
         }
     }
 }
@@ -1389,6 +1430,24 @@ fn heredoc_delimiter(word: &Word) -> String {
         }
     }
     result
+}
+
+/// Whether any part of the here-doc delimiter word was quoted, which
+/// suppresses expansion of the here-doc body.
+fn heredoc_delimiter_is_quoted(source: &str, word: &Word) -> bool {
+    // Quoting leaves a non-literal part (`'EOF'` → SingleQuoted), or an
+    // escaped character in the literal (`\EOF` → `\`). Inspecting the raw
+    // source span covers both without relying on how the word parser split it.
+    if word
+        .parts
+        .iter()
+        .any(|part| !matches!(part, WordPart::Literal(_)))
+    {
+        return true;
+    }
+    source
+        .get(word.span.start as usize..word.span.end as usize)
+        .is_some_and(|text| text.contains('\'') || text.contains('"'))
 }
 
 fn is_assignment_text(text: &str) -> bool {
@@ -1469,6 +1528,50 @@ mod tests {
             WordPart::Literal(text) => text.as_str(),
             other => panic!("expected literal word part, got {other:?}"),
         }
+    }
+
+    // ---- Simple commands (from prompt 02) ----
+
+    #[test]
+    fn heredoc_unquoted_delimiter_expands() {
+        let cmd = first_command("cat <<EOF\n$X\nEOF\n");
+        let Command::Simple(sc) = cmd else {
+            panic!("expected simple command");
+        };
+        let body = sc.redirections[0].here_doc_body.as_ref().unwrap();
+        assert!(body.expand, "unquoted delimiter must expand the body");
+        assert_eq!(body.content.as_str(), "$X\n");
+    }
+
+    #[test]
+    fn heredoc_single_quoted_delimiter_is_literal() {
+        let cmd = first_command("cat <<'EOF'\n$X\nEOF\n");
+        let Command::Simple(sc) = cmd else {
+            panic!("expected simple command");
+        };
+        let body = sc.redirections[0].here_doc_body.as_ref().unwrap();
+        assert!(!body.expand, "quoted delimiter must not expand the body");
+        assert_eq!(body.content.as_str(), "$X\n");
+    }
+
+    #[test]
+    fn heredoc_double_quoted_delimiter_is_literal() {
+        let cmd = first_command("cat <<\"EOF\"\n$X\nEOF\n");
+        let Command::Simple(sc) = cmd else {
+            panic!("expected simple command");
+        };
+        let body = sc.redirections[0].here_doc_body.as_ref().unwrap();
+        assert!(!body.expand);
+    }
+
+    #[test]
+    fn heredoc_attached_to_loop_body() {
+        let cmd = first_command("while read x; do echo $x; done <<EOF\n1\nEOF\n");
+        let Command::While(w) = cmd else {
+            panic!("expected while command, got {cmd:?}");
+        };
+        let body = w.redirections[0].here_doc_body.as_ref().unwrap();
+        assert!(body.expand);
     }
 
     // ---- Simple commands (from prompt 02) ----

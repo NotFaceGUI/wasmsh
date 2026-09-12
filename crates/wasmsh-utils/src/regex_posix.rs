@@ -80,24 +80,74 @@ impl Regex {
 
     /// Return `true` if the regex matches anywhere in `subject`.
     pub(crate) fn is_match(&self, subject: &str) -> bool {
-        if self.empty {
-            // POSIX: the empty regex matches at every position.
-            // `grep ""` is a common way to count lines.
-            return true;
-        }
-        let _ = subject;
-        !self.inner.matches(subject.as_bytes(), Some(1)).is_empty()
+        self.find(subject).is_some()
     }
 
-    /// Find the first match in `subject`, returning the byte offset range
-    /// of the full match (group 0).
+    /// Find the first (leftmost-longest) match in `subject`, returning the
+    /// byte offset range of the full match (group 0).
+    ///
+    /// The underlying engine does not implement POSIX leftmost-longest
+    /// semantics for patterns ending in an anchor (e.g. `X+$` against
+    /// `abcXXX` reports a one-char match at the end instead of the longest
+    /// match starting at the first `X`). We correct that here: start from the
+    /// engine's candidate, and if it does not begin at offset 0, scan earlier
+    /// offsets with an anchored match to find the true leftmost start.
     pub(crate) fn find(&self, subject: &str) -> Option<(usize, usize)> {
+        let (_, rel_start, rel_end) = self.leftmost_match(subject, 0)?;
+        Some((rel_start, rel_end))
+    }
+
+    /// Leftmost-longest match at or after byte offset `cursor`.
+    ///
+    /// Captures and the returned range are relative to `cursor`; `^` is only
+    /// allowed to match at absolute offset 0.
+    fn leftmost_match(
+        &self,
+        subject: &str,
+        cursor: usize,
+    ) -> Option<(Box<[Option<(usize, usize)>]>, usize, usize)> {
         if self.empty {
-            return Some((0, 0));
+            return Some((vec![Some((0, 0))].into_boxed_slice(), 0, 0));
         }
-        let matches = self.inner.matches(subject.as_bytes(), Some(1));
-        let first = matches.into_iter().next()?;
-        first.first().copied().flatten()
+        let input = &subject.as_bytes()[cursor..];
+        if let Some(caps) = self.inner.matches(input, Some(1)).into_iter().next() {
+            if let Some((rel_start, rel_end)) = caps[0] {
+                if rel_start == 0 {
+                    return Some((caps, rel_start, rel_end));
+                }
+                if let Some(found) = self.anchored_search(input, rel_start) {
+                    return Some(found);
+                }
+                return Some((caps, rel_start, rel_end));
+            }
+        }
+        self.anchored_search(input, input.len())
+    }
+
+    /// Search starts `0..=limit` for an anchored match, returning the first.
+    /// Runs with `no_start` for non-zero offsets so a pattern `^` cannot match
+    /// at the start of the slice. Returned offsets are absolute within
+    /// `input`.
+    fn anchored_search(
+        &self,
+        input: &[u8],
+        limit: usize,
+    ) -> Option<(Box<[Option<(usize, usize)>]>, usize, usize)> {
+        // `matches_exact` matches at position 0 of its argument, so we try
+        // each start offset explicitly and shift the result back to absolute
+        // coordinates. Capturing groups other than 0 are not needed for the
+        // leftmost-search correction, so rewrite group 0 only.
+        let no_start = self.inner.clone().no_start(true);
+        for start in 0..=limit.min(input.len()) {
+            let matcher = if start == 0 { &self.inner } else { &no_start };
+            if let Some(mut caps) = matcher.matches_exact(&input[start..]) {
+                if let Some((rel_start, rel_end)) = caps[0] {
+                    caps[0] = Some((start + rel_start, start + rel_end));
+                    return Some((caps, start + rel_start, start + rel_end));
+                }
+            }
+        }
+        None
     }
 
     /// Return all non-overlapping match ranges (byte offsets) in `subject`.
@@ -111,24 +161,16 @@ impl Regex {
         }
         let mut out = Vec::new();
         let mut cursor = 0usize;
-        loop {
-            if cursor > subject.len() {
-                break;
-            }
-            let remaining = &subject.as_bytes()[cursor..];
-            let matches = self.inner.matches(remaining, Some(1));
-            let Some(caps) = matches.into_iter().next() else {
-                break;
-            };
-            let Some(Some((rel_start, rel_end))) = caps.first().copied() else {
+        while cursor <= subject.len() {
+            let Some((_, rel_start, rel_end)) = self.leftmost_match(subject, cursor) else {
                 break;
             };
             out.push((cursor + rel_start, cursor + rel_end));
-            cursor += if rel_end == rel_start {
-                rel_end + 1
-            } else {
-                rel_end
-            };
+            let advance = advance_past_match(rel_start, rel_end);
+            if advance == 0 {
+                break;
+            }
+            cursor += advance;
         }
         out
     }
@@ -223,10 +265,7 @@ impl Regex {
         subject: &str,
         cursor: usize,
     ) -> Option<(Vec<Option<(usize, usize)>>, usize, usize)> {
-        let remaining = &subject.as_bytes()[cursor..];
-        let matches = self.inner.matches(remaining, Some(1));
-        let caps = matches.into_iter().next()?;
-        let (rel_start, rel_end) = caps.first().copied().flatten()?;
+        let (caps, rel_start, rel_end) = self.leftmost_match(subject, cursor)?;
         Some((caps.to_vec(), rel_start, rel_end))
     }
 }

@@ -106,6 +106,7 @@ pub struct HirArithFor {
     pub cond: SmolStr,
     pub step: SmolStr,
     pub body: Vec<HirCompleteCommand>,
+    pub redirections: Vec<HirRedirection>,
     pub span: Span,
 }
 
@@ -175,6 +176,7 @@ pub struct HirIf {
     pub then_body: Vec<HirCompleteCommand>,
     pub elifs: Vec<HirElif>,
     pub else_body: Option<Vec<HirCompleteCommand>>,
+    pub redirections: Vec<HirRedirection>,
     pub span: Span,
 }
 
@@ -192,6 +194,7 @@ pub struct HirElif {
 pub struct HirLoop {
     pub condition: Vec<HirCompleteCommand>,
     pub body: Vec<HirCompleteCommand>,
+    pub redirections: Vec<HirRedirection>,
     pub span: Span,
 }
 
@@ -201,6 +204,7 @@ pub struct HirFor {
     pub var_name: SmolStr,
     pub words: Option<Vec<Word>>,
     pub body: Vec<HirCompleteCommand>,
+    pub redirections: Vec<HirRedirection>,
     pub span: Span,
 }
 
@@ -208,6 +212,7 @@ pub struct HirFor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirBlock {
     pub body: Vec<HirCompleteCommand>,
+    pub redirections: Vec<HirRedirection>,
     pub span: Span,
 }
 
@@ -224,6 +229,7 @@ pub struct HirFunctionDef {
 pub struct HirCase {
     pub word: Word,
     pub items: Vec<HirCaseItem>,
+    pub redirections: Vec<HirRedirection>,
     pub span: Span,
 }
 

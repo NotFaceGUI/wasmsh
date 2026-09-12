@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use wasmsh_fs::{OpenOptions, Vfs};
+
 use crate::helpers::{collect_input_text, collect_path_text, resolve_path};
 use crate::UtilContext;
 
@@ -680,11 +682,22 @@ enum UnaryOp {
     Pos,
 }
 
+/// Output redirection attached to an awk `print`/`printf` statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectKind {
+    /// `> file` — truncate and write.
+    File,
+    /// `>> file` — append.
+    Append,
+    /// `| "cmd"` — pipe to a command.
+    Pipe,
+}
+
 #[derive(Debug, Clone)]
 enum Stmt {
     Expr(Expr),
-    Print(Vec<Expr>, Option<Box<Expr>>),
-    Printf(Vec<Expr>, Option<Box<Expr>>),
+    Print(Vec<Expr>, Option<(RedirectKind, Box<Expr>)>),
+    Printf(Vec<Expr>, Option<(RedirectKind, Box<Expr>)>),
     If(Expr, Vec<Stmt>, Option<Vec<Stmt>>),
     While(Expr, Vec<Stmt>),
     DoWhile(Vec<Stmt>, Expr),
@@ -731,11 +744,22 @@ struct AwkProgram {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Parenthesis nesting depth, used to distinguish a top-level `print`
+    /// redirect `>` from a comparison operator inside parentheses.
+    paren_depth: u32,
+    /// True while parsing the argument list of a `print`/`printf` statement.
+    /// A top-level `>` there is a redirection, not a comparison.
+    in_print_args: bool,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            paren_depth: 0,
+            in_print_args: false,
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -942,23 +966,40 @@ impl Parser {
         let mut args = Vec::new();
         let mut redirect = None;
 
-        if matches!(
-            self.peek(),
-            Token::Semicolon | Token::Newline | Token::RBrace | Token::Eof | Token::Pipe
-        ) {
-            // `print` with no args => print $0
-        } else {
-            args.push(self.parse_expr()?);
-            while *self.peek() == Token::Comma {
-                self.advance();
+        let saved = self.in_print_args;
+        self.in_print_args = true;
+        let parse_result = (|| -> Result<(), String> {
+            if matches!(
+                self.peek(),
+                Token::Semicolon
+                    | Token::Newline
+                    | Token::RBrace
+                    | Token::Eof
+                    | Token::Pipe
+                    | Token::Gt
+                    | Token::Append
+            ) {
+                // `print` with no args => print $0
+            } else {
                 args.push(self.parse_expr()?);
+                while *self.peek() == Token::Comma {
+                    self.advance();
+                    args.push(self.parse_expr()?);
+                }
             }
-        }
+            Ok(())
+        })();
+        self.in_print_args = saved;
+        parse_result?;
 
         // Handle output redirection: > file, >> file, | cmd
         if matches!(self.peek(), Token::Gt | Token::Append | Token::Pipe) {
-            let _redir_tok = self.advance();
-            redirect = Some(Box::new(self.parse_primary()?));
+            let kind = match self.advance() {
+                Token::Gt => RedirectKind::File,
+                Token::Append => RedirectKind::Append,
+                _ => RedirectKind::Pipe,
+            };
+            redirect = Some((kind, Box::new(self.parse_primary()?)));
         }
 
         Ok(Stmt::Print(args, redirect))
@@ -969,15 +1010,26 @@ impl Parser {
         let mut args = Vec::new();
         let mut redirect = None;
 
-        args.push(self.parse_expr()?);
-        while *self.peek() == Token::Comma {
-            self.advance();
+        let saved = self.in_print_args;
+        self.in_print_args = true;
+        let parse_result = (|| -> Result<(), String> {
             args.push(self.parse_expr()?);
-        }
+            while *self.peek() == Token::Comma {
+                self.advance();
+                args.push(self.parse_expr()?);
+            }
+            Ok(())
+        })();
+        self.in_print_args = saved;
+        parse_result?;
 
         if matches!(self.peek(), Token::Gt | Token::Append | Token::Pipe) {
-            let _redir_tok = self.advance();
-            redirect = Some(Box::new(self.parse_primary()?));
+            let kind = match self.advance() {
+                Token::Gt => RedirectKind::File,
+                Token::Append => RedirectKind::Append,
+                _ => RedirectKind::Pipe,
+            };
+            redirect = Some((kind, Box::new(self.parse_primary()?)));
         }
 
         Ok(Stmt::Printf(args, redirect))
@@ -1218,6 +1270,9 @@ impl Parser {
             Token::Eq => BinOp::Eq,
             Token::Ne => BinOp::Ne,
             Token::Lt => BinOp::Lt,
+            // At the top level of a `print`/`printf` argument list, `>` starts
+            // a redirection; inside parentheses it is still a comparison.
+            Token::Gt if self.in_print_args && self.paren_depth == 0 => return Ok(lhs),
             Token::Gt => BinOp::Gt,
             Token::Le => BinOp::Le,
             Token::Ge => BinOp::Ge,
@@ -1381,7 +1436,10 @@ impl Parser {
 
     fn parse_grouped_expr(&mut self) -> Result<Expr, String> {
         self.advance();
-        let expr = self.parse_expr()?;
+        self.paren_depth += 1;
+        let expr = self.parse_expr();
+        self.paren_depth -= 1;
+        let expr = expr?;
         self.expect(&Token::RParen)?;
         Ok(expr)
     }
@@ -1392,7 +1450,10 @@ impl Parser {
             return Ok(Expr::Var(name));
         }
         self.advance();
-        let args = self.parse_call_args()?;
+        self.paren_depth += 1;
+        let args = self.parse_call_args();
+        self.paren_depth -= 1;
+        let args = args?;
         self.expect(&Token::RParen)?;
         Ok(Expr::Call(name, args))
     }
@@ -1429,6 +1490,117 @@ fn regex_match(text: &str, pattern: &str) -> bool {
     match crate::regex_posix::Regex::compile_ere(pattern) {
         Ok(re) => re.is_match(text),
         Err(_) => text.contains(pattern),
+    }
+}
+
+/// Decode the escape sequences gawk recognises in a string literal value such
+/// as `FS` set via `-F`: the value `\t` (two characters) denotes a tab.
+fn decode_awk_escapes(value: &str) -> String {
+    if !value.contains('\\') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('f') => out.push('\x0c'),
+            Some('v') => out.push('\x0b'),
+            Some('a') => out.push('\x07'),
+            Some('b') => out.push('\x08'),
+            Some('\\') | None => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a function parameter is used as an array somewhere in `body`.
+/// gawk decides array-vs-scalar per parameter from how the callee uses it,
+/// so `function f(a){a[1]=9}` receives its argument by reference.
+fn function_param_is_array(body: &[Stmt], param: &str) -> bool {
+    body.iter()
+        .any(|stmt| stmt_uses_param_as_array(stmt, param))
+}
+
+fn stmt_uses_param_as_array(stmt: &Stmt, param: &str) -> bool {
+    match stmt {
+        Stmt::Expr(e) => expr_uses_param_as_array(e, param),
+        Stmt::Print(args, redirect) | Stmt::Printf(args, redirect) => {
+            args.iter().any(|a| expr_uses_param_as_array(a, param))
+                || redirect
+                    .as_ref()
+                    .is_some_and(|(_, e)| expr_uses_param_as_array(e, param))
+        }
+        Stmt::If(cond, then_body, else_body) => {
+            expr_uses_param_as_array(cond, param)
+                || then_body.iter().any(|s| stmt_uses_param_as_array(s, param))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(|s| stmt_uses_param_as_array(s, param)))
+        }
+        Stmt::While(cond, body) | Stmt::DoWhile(body, cond) => {
+            expr_uses_param_as_array(cond, param)
+                || body.iter().any(|s| stmt_uses_param_as_array(s, param))
+        }
+        Stmt::For(init, cond, incr, body) => {
+            init.as_deref()
+                .is_some_and(|s| stmt_uses_param_as_array(s, param))
+                || cond
+                    .as_ref()
+                    .is_some_and(|e| expr_uses_param_as_array(e, param))
+                || incr
+                    .as_deref()
+                    .is_some_and(|s| stmt_uses_param_as_array(s, param))
+                || body.iter().any(|s| stmt_uses_param_as_array(s, param))
+        }
+        Stmt::ForIn(_, arr, body) => {
+            arr == param || body.iter().any(|s| stmt_uses_param_as_array(s, param))
+        }
+        Stmt::Delete(name, idx) => name == param || expr_uses_param_as_array(idx, param),
+        Stmt::Block(body) => body.iter().any(|s| stmt_uses_param_as_array(s, param)),
+        Stmt::Exit(e) | Stmt::Return(e) => e
+            .as_ref()
+            .is_some_and(|e| expr_uses_param_as_array(e, param)),
+        Stmt::Break | Stmt::Continue | Stmt::Next => false,
+    }
+}
+
+fn expr_uses_param_as_array(expr: &Expr, param: &str) -> bool {
+    match expr {
+        Expr::ArrayRef(name, idx) => name == param || expr_uses_param_as_array(idx, param),
+        Expr::InArray(key, arr) => arr == param || expr_uses_param_as_array(key, param),
+        Expr::Assign(lhs, rhs) | Expr::OpAssign(_, lhs, rhs) | Expr::BinOp(_, lhs, rhs) => {
+            expr_uses_param_as_array(lhs, param) || expr_uses_param_as_array(rhs, param)
+        }
+        Expr::UnaryOp(_, e)
+        | Expr::PreIncr(e)
+        | Expr::PreDecr(e)
+        | Expr::PostIncr(e)
+        | Expr::PostDecr(e)
+        | Expr::FieldRef(e)
+        | Expr::MatchOp(_, e, _) => expr_uses_param_as_array(e, param),
+        Expr::Ternary(a, b, c) => {
+            expr_uses_param_as_array(a, param)
+                || expr_uses_param_as_array(b, param)
+                || expr_uses_param_as_array(c, param)
+        }
+        Expr::Concat(a, b) => {
+            expr_uses_param_as_array(a, param) || expr_uses_param_as_array(b, param)
+        }
+        Expr::Call(_, args) => args.iter().any(|a| expr_uses_param_as_array(a, param)),
+        // length(param) counts array elements when param is an array.
+        Expr::Num(_) | Expr::Str(_) | Expr::Regex(_) | Expr::Var(_) => false,
     }
 }
 
@@ -1474,6 +1646,26 @@ struct AwkInterpreter {
     fields: Vec<String>,
     /// Range pattern state: tracking which ranges are active
     range_active: Vec<bool>,
+    /// Buffered `print > file` / `print >> file` output, keyed by path.
+    /// A file is truncated once on first `>` and appended thereafter, which
+    /// matches gawk's single-stream-per-name behaviour.
+    file_outputs: Vec<AwkFileOutput>,
+    /// Buffered `print | "cmd"` output, keyed by command string.
+    command_pipes: Vec<AwkCommandPipe>,
+    /// Function parameters currently bound by reference to a caller array
+    /// (param name → caller variable name).
+    array_aliases: HashMap<String, String>,
+}
+
+struct AwkFileOutput {
+    path: String,
+    append: bool,
+    data: Vec<u8>,
+}
+
+struct AwkCommandPipe {
+    command: String,
+    data: Vec<u8>,
 }
 
 impl AwkInterpreter {
@@ -1498,6 +1690,9 @@ impl AwkInterpreter {
             exit_code: 0,
             fields: Vec::new(),
             range_active: Vec::new(),
+            file_outputs: Vec::new(),
+            command_pipes: Vec::new(),
+            array_aliases: HashMap::new(),
         }
     }
 
@@ -1512,16 +1707,24 @@ impl AwkInterpreter {
             .unwrap_or(AwkValue::Uninitialized)
     }
 
+    /// Resolve a possibly-aliased array name to the caller's array name.
+    fn array_storage_name(&self, name: &str) -> String {
+        self.array_aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
     fn get_fs(&self) -> String {
-        self.get_var("FS").to_str()
+        decode_awk_escapes(&self.get_var("FS").to_str())
     }
 
     fn get_ofs(&self) -> String {
-        self.get_var("OFS").to_str()
+        decode_awk_escapes(&self.get_var("OFS").to_str())
     }
 
     fn get_ors(&self) -> String {
-        self.get_var("ORS").to_str()
+        decode_awk_escapes(&self.get_var("ORS").to_str())
     }
 
     /// Split a record into fields based on FS.
@@ -1536,9 +1739,7 @@ impl AwkInterpreter {
                 .map(String::from)
                 .collect()
         } else {
-            // Treat FS as a regex
-            // Simple implementation: just split on the literal for now,
-            // or if single char, use that
+            // Treat FS as a regex; a single literal already handled above.
             record.split(&fs).map(String::from).collect()
         }
     }
@@ -1616,6 +1817,38 @@ impl AwkInterpreter {
         self.output_buf.extend_from_slice(data);
     }
 
+    /// Route redirected `print`/`printf` output to a file or command pipe.
+    fn write_redirected(&mut self, redirect: &(RedirectKind, Box<Expr>), data: &[u8]) {
+        let target = self.eval_expr(&redirect.1).to_str();
+        match redirect.0 {
+            RedirectKind::File | RedirectKind::Append => {
+                let append = redirect.0 == RedirectKind::Append;
+                if let Some(existing) = self.file_outputs.iter_mut().find(|f| f.path == target) {
+                    // The stream is already open; later redirections append to
+                    // it regardless of whether they used `>` or `>>`.
+                    existing.data.extend_from_slice(data);
+                } else {
+                    self.file_outputs.push(AwkFileOutput {
+                        path: target,
+                        append,
+                        data: data.to_vec(),
+                    });
+                }
+            }
+            RedirectKind::Pipe => {
+                if let Some(existing) = self.command_pipes.iter_mut().find(|p| p.command == target)
+                {
+                    existing.data.extend_from_slice(data);
+                } else {
+                    self.command_pipes.push(AwkCommandPipe {
+                        command: target,
+                        data: data.to_vec(),
+                    });
+                }
+            }
+        }
+    }
+
     // ---- Expression evaluation ----
 
     fn eval_expr(&mut self, expr: &Expr) -> AwkValue {
@@ -1658,8 +1891,9 @@ impl AwkInterpreter {
 
     fn eval_array_ref(&mut self, name: &str, idx_expr: &Expr) -> AwkValue {
         let key = self.eval_expr(idx_expr).to_str();
+        let storage = self.array_storage_name(name);
         self.arrays
-            .get(name)
+            .get(&storage)
             .and_then(|m| m.get(&key))
             .cloned()
             .unwrap_or(AwkValue::Uninitialized)
@@ -1729,7 +1963,11 @@ impl AwkInterpreter {
 
     fn eval_in_array_expr(&mut self, key_expr: &Expr, arr: &str) -> AwkValue {
         let key = self.eval_expr(key_expr).to_str();
-        let has = self.arrays.get(arr).is_some_and(|m| m.contains_key(&key));
+        let storage = self.array_storage_name(arr);
+        let has = self
+            .arrays
+            .get(&storage)
+            .is_some_and(|m| m.contains_key(&key));
         AwkValue::Num(bool_to_num(has))
     }
 
@@ -1751,10 +1989,8 @@ impl AwkInterpreter {
 
     fn assign_to_array(&mut self, name: &str, idx_expr: &Expr, val: AwkValue) {
         let key = self.eval_expr(idx_expr).to_str();
-        self.arrays
-            .entry(name.to_string())
-            .or_default()
-            .insert(key, val);
+        let storage = self.array_storage_name(name);
+        self.arrays.entry(storage).or_default().insert(key, val);
     }
 
     fn apply_binop(&self, op: BinOp, l: &AwkValue, r: &AwkValue) -> AwkValue {
@@ -1850,6 +2086,14 @@ impl AwkInterpreter {
     }
 
     fn call_length_builtin(&mut self, args: &[Expr]) -> AwkValue {
+        // `length(arr)` counts array elements when the argument is an array.
+        if let Some(Expr::Var(name)) = args.first() {
+            let storage = self.array_storage_name(name);
+            if let Some(arr) = self.arrays.get(&storage) {
+                #[allow(clippy::cast_precision_loss)]
+                return AwkValue::Num(arr.len() as f64);
+            }
+        }
         let s = self.eval_builtin_str_arg(args);
         #[allow(clippy::cast_precision_loss)]
         {
@@ -1944,8 +2188,9 @@ impl AwkInterpreter {
         } else {
             s.split(&sep).collect()
         };
-        self.arrays.insert(arr_name.clone(), HashMap::new());
-        let arr = self.arrays.get_mut(&arr_name).unwrap();
+        let storage = self.array_storage_name(&arr_name);
+        self.arrays.insert(storage.clone(), HashMap::new());
+        let arr = self.arrays.get_mut(&storage).unwrap();
         for (i, part) in parts.iter().enumerate() {
             arr.insert(format!("{}", i + 1), AwkValue::Str((*part).to_string()));
         }
@@ -2074,22 +2319,48 @@ impl AwkInterpreter {
         }
         // Try user-defined function
         if let Some(func) = self.functions.get(name).cloned() {
-            let arg_vals: Vec<AwkValue> = args.iter().map(|a| self.eval_expr(a)).collect();
-            self.call_user_function(&func, &arg_vals)
+            self.call_user_function(&func, args)
         } else {
             AwkValue::Uninitialized
         }
     }
 
-    fn call_user_function(&mut self, func: &AwkFunction, args: &[AwkValue]) -> AwkValue {
-        // Save current variables that match parameter names
-        let mut saved = Vec::new();
+    fn call_user_function(&mut self, func: &AwkFunction, args: &[Expr]) -> AwkValue {
+        // gawk passes arrays by reference and scalars by value. A parameter
+        // is an array reference when the caller supplies a bare variable and
+        // either the variable is already an array or the function uses the
+        // parameter as an array; otherwise evaluate it to a scalar value.
+        let mut bindings: Vec<(String, AwkValue)> = Vec::new();
+        let mut aliases: Vec<(String, String)> = Vec::new();
         for (i, param) in func.params.iter().enumerate() {
-            let old = self.vars.remove(param);
-            saved.push((param.clone(), old));
-            let val = args.get(i).cloned().unwrap_or(AwkValue::Uninitialized);
-            self.set_var(param, val);
+            let arg = args.get(i);
+            if let Some(Expr::Var(caller_name)) = arg {
+                let storage = self.array_storage_name(caller_name);
+                if self.arrays.contains_key(&storage) || function_param_is_array(&func.body, param)
+                {
+                    aliases.push((param.clone(), caller_name.clone()));
+                    continue;
+                }
+            }
+            let val = arg.map_or(AwkValue::Uninitialized, |a| self.eval_expr(a));
+            bindings.push((param.clone(), val));
         }
+
+        // Save current variables that match parameter names.
+        let mut saved = Vec::new();
+        for (param, val) in &bindings {
+            let old = self.vars.insert(param.clone(), val.clone());
+            saved.push((param.clone(), old));
+        }
+        let saved_aliases: Vec<(String, Option<String>)> = aliases
+            .iter()
+            .map(|(param, target)| {
+                (
+                    param.clone(),
+                    self.array_aliases.insert(param.clone(), target.clone()),
+                )
+            })
+            .collect();
 
         // Execute body
         let mut result = AwkValue::Uninitialized;
@@ -2107,12 +2378,22 @@ impl AwkInterpreter {
             }
         }
 
-        // Restore saved variables
+        // Restore saved variables and alias bindings.
         for (name, old) in saved {
             if let Some(v) = old {
                 self.set_var(&name, v);
             } else {
                 self.vars.remove(&name);
+            }
+        }
+        for (param, previous) in saved_aliases {
+            match previous {
+                Some(prev) => {
+                    self.array_aliases.insert(param, prev);
+                }
+                None => {
+                    self.array_aliases.remove(&param);
+                }
             }
         }
 
@@ -2309,9 +2590,10 @@ impl AwkInterpreter {
     }
 
     fn exec_for_in(&mut self, var: &str, arr_name: &str, body: &[Stmt]) -> ControlFlow {
+        let storage = self.array_storage_name(arr_name);
         let mut keys: Vec<String> = self
             .arrays
-            .get(arr_name)
+            .get(&storage)
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
         // gawk PROCINFO["sorted_in"] support: sort array traversal order
@@ -2348,40 +2630,49 @@ impl AwkInterpreter {
         ControlFlow::None
     }
 
-    fn exec_print(&mut self, args: &[Expr]) -> ControlFlow {
+    fn exec_print(
+        &mut self,
+        args: &[Expr],
+        redirect: Option<&(RedirectKind, Box<Expr>)>,
+    ) -> ControlFlow {
+        let mut buf = Vec::new();
         if args.is_empty() {
-            self.print_record();
+            self.render_record(&mut buf);
         } else {
-            self.print_args(args);
+            self.render_args(args, &mut buf);
+        }
+        match redirect {
+            Some(r) => self.write_redirected(r, &buf),
+            None => self.write_output(&buf),
         }
         ControlFlow::None
     }
 
-    fn print_record(&mut self) {
+    fn render_record(&mut self, out: &mut Vec<u8>) {
         let s = self.get_field(0).to_str();
         let ors = self.get_ors();
-        self.write_output(s.as_bytes());
-        self.write_output(ors.as_bytes());
+        out.extend_from_slice(s.as_bytes());
+        out.extend_from_slice(ors.as_bytes());
     }
 
-    fn print_args(&mut self, args: &[Expr]) {
+    fn render_args(&mut self, args: &[Expr], out: &mut Vec<u8>) {
         let ofs = self.get_ofs();
         let ors = self.get_ors();
         for (i, arg) in args.iter().enumerate() {
             if i > 0 {
-                self.write_output(ofs.as_bytes());
+                out.extend_from_slice(ofs.as_bytes());
             }
             let val = self.eval_expr(arg);
-            self.write_output(val.to_str().as_bytes());
+            out.extend_from_slice(val.to_str().as_bytes());
         }
-        self.write_output(ors.as_bytes());
+        out.extend_from_slice(ors.as_bytes());
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt) -> ControlFlow {
         match stmt {
             Stmt::Expr(expr) => self.exec_expr_stmt(expr),
-            Stmt::Print(args, _redirect) => self.exec_print(args),
-            Stmt::Printf(args, _redirect) => self.exec_printf(args),
+            Stmt::Print(args, redirect) => self.exec_print(args, redirect.as_ref()),
+            Stmt::Printf(args, redirect) => self.exec_printf(args, redirect.as_ref()),
             Stmt::If(cond, then_body, else_body) => {
                 self.exec_if(cond, then_body, else_body.as_ref())
             }
@@ -2406,14 +2697,21 @@ impl AwkInterpreter {
         ControlFlow::None
     }
 
-    fn exec_printf(&mut self, args: &[Expr]) -> ControlFlow {
+    fn exec_printf(
+        &mut self,
+        args: &[Expr],
+        redirect: Option<&(RedirectKind, Box<Expr>)>,
+    ) -> ControlFlow {
         if args.is_empty() {
             return ControlFlow::None;
         }
         let fmt = self.eval_expr(&args[0]).to_str();
         let arg_vals: Vec<AwkValue> = args[1..].iter().map(|a| self.eval_expr(a)).collect();
         let s = self.format_string(&fmt, &arg_vals);
-        self.write_output(s.as_bytes());
+        match redirect {
+            Some(r) => self.write_redirected(r, s.as_bytes()),
+            None => self.write_output(s.as_bytes()),
+        }
         ControlFlow::None
     }
 
@@ -2449,7 +2747,8 @@ impl AwkInterpreter {
 
     fn exec_delete(&mut self, name: &str, idx_expr: &Expr) -> ControlFlow {
         let key = self.eval_expr(idx_expr).to_str();
-        if let Some(arr) = self.arrays.get_mut(name) {
+        let storage = self.array_storage_name(name);
+        if let Some(arr) = self.arrays.get_mut(&storage) {
             arr.remove(&key);
         }
         ControlFlow::None
@@ -2820,8 +3119,26 @@ fn format_str_spec(
 }
 
 fn format_char_spec(width: usize, flags: &FormatFlags, arg: &AwkValue) -> String {
-    let s = arg.to_str();
-    let c = s.chars().next().map_or(String::new(), |c| c.to_string());
+    // gawk: a numeric argument is a character code (`%c`, 65 → "A"); a string
+    // argument contributes its first character.
+    let c = match arg {
+        AwkValue::Num(n) => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let code = *n as i64;
+            if (0..=0x10_FFFF).contains(&code) {
+                char::from_u32(code as u32)
+                    .map(|ch| ch.to_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        }
+        other => other
+            .to_str()
+            .chars()
+            .next()
+            .map_or(String::new(), |c| c.to_string()),
+    };
     pad_string(&c, width, flags.left_align, ' ')
 }
 
@@ -3192,7 +3509,36 @@ pub(crate) fn util_awk(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
     if !interp.stderr_buf.is_empty() {
         ctx.output.stderr(&interp.stderr_buf);
     }
+    flush_awk_redirects(ctx, &interp);
     exit_code
+}
+
+/// Write buffered awk file redirections to the VFS and deliver command pipes.
+fn flush_awk_redirects(ctx: &mut UtilContext<'_>, interp: &AwkInterpreter) {
+    for file in &interp.file_outputs {
+        let full = resolve_path(ctx.cwd, &file.path);
+        let opts = if file.append {
+            OpenOptions::append()
+        } else {
+            OpenOptions::write()
+        };
+        match ctx.fs.open(&full, opts) {
+            Ok(handle) => {
+                if let Err(err) = ctx.fs.write_file(handle, &file.data) {
+                    ctx.output
+                        .stderr(format!("awk: cannot write to {}: {err}\n", file.path).as_bytes());
+                }
+                ctx.fs.close(handle);
+            }
+            Err(err) => {
+                ctx.output
+                    .stderr(format!("awk: cannot open {}: {err}\n", file.path).as_bytes());
+            }
+        }
+    }
+    for pipe in &interp.command_pipes {
+        ctx.output.command_pipe(&pipe.command, &pipe.data);
+    }
 }
 
 #[cfg(test)]
@@ -4577,5 +4923,60 @@ END { print count }
         let (status, out, _) = run_awk(prog, "");
         assert_eq!(status, 0);
         assert_eq!(out, "1 2 3 10 \n");
+    }
+
+    #[test]
+    fn anchored_substitution_uses_longest_leftmost_match() {
+        let (status, out, _) = run_awk(
+            "BEGIN{s=\"abcXXX\"; sub(/X+$/,\"Y\",s); print \"[\" s \"]\"}",
+            "",
+        );
+        assert_eq!(status, 0);
+        assert_eq!(out, "[abcY]\n");
+    }
+
+    #[test]
+    fn printf_char_from_numeric_code() {
+        let (status, out, _) = run_awk("BEGIN{printf \"%c\\n\",65}", "");
+        assert_eq!(status, 0);
+        assert_eq!(out, "A\n");
+    }
+
+    #[test]
+    fn array_argument_is_passed_by_reference() {
+        let (status, out, _) = run_awk("function f(a){a[1]=9} BEGIN{f(x); print length(x)}", "");
+        assert_eq!(status, 0);
+        assert_eq!(out, "1\n");
+    }
+
+    #[test]
+    fn print_redirect_writes_file_not_stdout() {
+        let mut fs = MemoryFs::new();
+        let mut output = VecOutput::default();
+        let status = {
+            let mut ctx = UtilContext {
+                fs: &mut fs,
+                output: &mut output,
+                cwd: "/",
+                stdin: None,
+                state: None,
+                network: None,
+                clock: None,
+            };
+            util_awk(&mut ctx, &["awk", "BEGIN{print \"hi\" > \"/out.txt\"}"])
+        };
+        assert_eq!(status, 0);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+        let read = fs.open("/out.txt", OpenOptions::read()).unwrap();
+        assert_eq!(fs.read_file(read).unwrap(), b"hi\n");
+    }
+
+    #[test]
+    fn awk_handles_nul_and_long_input() {
+        let long = "y".repeat(50_000);
+        let input = format!("x\n{long}\n");
+        let (status, out, _) = run_awk("END{print NR}", &input);
+        assert_eq!(status, 0);
+        assert_eq!(out, "2\n");
     }
 }

@@ -44,6 +44,23 @@ jobs:
       - name: Doc tests
         run: cargo test --doc --workspace --all-features --locked
 
+  oracle:
+    name: bash differential oracle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+      - name: Verify the reference shell is present
+        run: |
+          set -euo pipefail
+          command -v bash
+          bash --version | head -1
+      - name: Differential suite against real bash
+        env:
+          WASMSH_ORACLE: "1"
+        run: cargo test -p wasmsh-testkit --test suite_runner --locked -- --nocapture
+
   clippy:
     name: clippy native
     runs-on: ubuntu-24.04
@@ -88,7 +105,7 @@ jobs:
   ci-pass:
     name: CI passed
     if: always()
-    needs: [fmt, test, clippy, wasm-check]
+    needs: [fmt, test, oracle, clippy, wasm-check]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -1,0 +1,18 @@
+[test]
+name = "awk-append-redirect-file"
+tags = ["awk", "redirection", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["awk", "cat"]
+
+[input]
+script = "awk 'BEGIN{print \"a\" > \"f\"; print \"b\" >> \"f\"}'\ncat f"
+
+[expect]
+status = 0
+stdout = "a\nb\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

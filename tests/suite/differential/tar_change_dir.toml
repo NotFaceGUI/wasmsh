@@ -1,0 +1,18 @@
+[test]
+name = "tar-change-dir-create-extract"
+tags = ["utility", "tar", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["tar", "mkdir", "cat"]
+
+[input]
+script = "mkdir tc\necho hello > tc/sub\ntar -cf t.tar -C tc sub\ntar -tf t.tar\nmkdir dest\ntar -xf t.tar -C dest\ncat dest/sub"
+
+[expect]
+status = 0
+stdout = "sub\nhello\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

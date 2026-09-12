@@ -1,0 +1,18 @@
+[test]
+name = "sort-key-numeric-glued"
+tags = ["utility", "sort", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["sort", "printf"]
+
+[input]
+script = "printf 'x 30\ny 100\nz 2\n' | sort -k2n"
+
+[expect]
+status = 0
+stdout = "z 2\nx 30\ny 100\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

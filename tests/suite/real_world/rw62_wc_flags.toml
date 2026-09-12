@@ -13,5 +13,6 @@ printf 'a\nb\nc\n' | wc -lw
 """
 
 [expect]
-stdout = "3\n2\n6\n3 3\n"
+# GNU wc pads a multi-column result from a pipe to a seven-character field.
+stdout = "3\n2\n6\n      3       3\n"
 status = 0

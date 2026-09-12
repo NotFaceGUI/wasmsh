@@ -63,6 +63,9 @@ pub enum FsError {
     /// The operation is not permitted.
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+    /// The filesystem backend does not support this operation.
+    #[error("not supported: {0}")]
+    NotSupported(String),
     /// A low-level I/O error.
     #[error("io error: {0}")]
     Io(String),
@@ -73,6 +76,8 @@ pub enum FsError {
 pub struct Metadata {
     /// True if this entry is a directory.
     pub is_dir: bool,
+    /// True if this entry is a symbolic link (reported by `lstat`).
+    pub is_symlink: bool,
     /// Size of the entry in bytes.
     pub size: u64,
     /// POSIX permission bits (the low 9 of `st_mode`).
@@ -122,6 +127,8 @@ pub struct DirEntry {
     pub name: String,
     /// True if this entry is a directory.
     pub is_dir: bool,
+    /// True if this entry is a symbolic link.
+    pub is_symlink: bool,
 }
 
 /// Open options for file operations.
@@ -206,8 +213,23 @@ pub trait Vfs {
     fn install_stream_reader(&mut self, path: &str, reader: Box<dyn Read>) -> Result<(), FsError>;
     /// Close an open file handle.
     fn close(&mut self, handle: FileHandle);
-    /// Return metadata for the entry at `path`.
+    /// Return metadata for the entry at `path`, following symlinks.
     fn stat(&self, path: &str) -> Result<Metadata, FsError>;
+    /// Return metadata for the entry at `path` without following a final
+    /// symlink (`lstat`). Backends without symlinks may use the `stat`
+    /// default by overriding `symlink`/`read_link` to error.
+    fn lstat(&self, path: &str) -> Result<Metadata, FsError> {
+        self.stat(path)
+    }
+    /// Read the target of the symlink at `path`.
+    fn read_link(&self, path: &str) -> Result<String, FsError> {
+        Err(FsError::NotSupported(format!("symlink: {path}")))
+    }
+    /// Create a symbolic link at `link_path` pointing to `target`.
+    fn symlink(&mut self, target: &str, link_path: &str) -> Result<(), FsError> {
+        let _ = (target, link_path);
+        Err(FsError::NotSupported("symlink".into()))
+    }
     /// List the entries in a directory.
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError>;
     /// Create a directory at `path`.

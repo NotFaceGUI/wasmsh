@@ -1,0 +1,18 @@
+[test]
+name = "line-continuation-double-quoted"
+tags = ["lexer", "backslash-escape", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["backslash-escape", "double-quoting", "echo"]
+
+[input]
+script = "echo \"one \\\ntwo\""
+
+[expect]
+status = 0
+stdout = "one two\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

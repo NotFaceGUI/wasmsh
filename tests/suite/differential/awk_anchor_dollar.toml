@@ -1,0 +1,18 @@
+[test]
+name = "awk-regex-dollar-anchor-longest"
+tags = ["awk", "regex", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["awk"]
+
+[input]
+script = "awk 'BEGIN{s=\"abcXXX\"; sub(/X+$/,\"Y\",s); print \"[\" s \"]\"}'\nawk 'BEGIN{s=\"abc   \"; sub(/ +$/,\"\",s); print \"[\" s \"]\"}'"
+
+[expect]
+status = 0
+stdout = "[abcY]\n[abc]\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

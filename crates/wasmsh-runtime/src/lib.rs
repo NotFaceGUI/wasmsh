@@ -153,6 +153,9 @@ struct ExecState {
     nested_shell_depth: u32,
     /// Nested output capture scopes for pipelines and substitutions.
     output_captures: Vec<OutputCapture>,
+    /// Snapshot of the EXIT trap handler at the start of the current run, used
+    /// to decide whether a normally-completing script installed one.
+    exit_trap_at_run_start: Option<String>,
 }
 
 impl ExecState {
@@ -170,6 +173,7 @@ impl ExecState {
             trap_depth: 0,
             nested_shell_depth: 0,
             output_captures: Vec::new(),
+            exit_trap_at_run_start: None,
         }
     }
 
@@ -364,6 +368,7 @@ impl wasmsh_builtins::OutputSink for RuntimeBuiltinSink<'_> {
 
 struct RuntimeUtilSink<'a> {
     router: &'a mut RuntimeOutputRouter<'a>,
+    command_pipes: &'a RefCell<Vec<(String, Vec<u8>)>>,
 }
 
 impl wasmsh_utils::UtilOutput for RuntimeUtilSink<'_> {
@@ -374,6 +379,12 @@ impl wasmsh_utils::UtilOutput for RuntimeUtilSink<'_> {
     fn stderr(&mut self, data: &[u8]) {
         self.router.write_stderr(data);
     }
+
+    fn command_pipe(&mut self, command: &str, data: &[u8]) {
+        self.command_pipes
+            .borrow_mut()
+            .push((command.to_string(), data.to_vec()));
+    }
 }
 
 fn resolve_path_from_cwd(cwd: &str, path: &str) -> String {
@@ -382,6 +393,79 @@ fn resolve_path_from_cwd(cwd: &str, path: &str) -> String {
     } else {
         wasmsh_fs::normalize_path(&format!("{cwd}/{path}"))
     }
+}
+
+/// Scan `$(...)` starting just past the opening `(`, returning
+/// `(end_index, inner)` where `end_index` is past the closing `)`.
+fn scan_command_subst(bytes: &[u8], open: usize) -> Option<(usize, &str)> {
+    let mut depth = 1usize;
+    let mut i = open;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            } else if b == b'\\' && q == b'"' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => quote = Some(b),
+            b'\\' => i += 1,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((i + 1, std::str::from_utf8(&bytes[open..i]).ok()?));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Scan a `` `...` `` substitution starting after the opening backtick.
+fn scan_backtick(bytes: &[u8], open: usize) -> Option<(usize, &str)> {
+    let mut i = open;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'`' {
+            return Some((i + 1, std::str::from_utf8(&bytes[open..i]).ok()?));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Scan a nested `$(( ... ))` starting at the `$`, returning the end index.
+fn scan_arith_double_paren(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = start + 2; // past `$(`
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    if bytes.get(i + 1) == Some(&b')') {
+                        return Some(i + 2);
+                    }
+                    return None;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 struct PipeReader {
@@ -2311,23 +2395,58 @@ impl<R> WcStreamReader<R> {
             return;
         }
         self.finalized = true;
+        // `wc -l` counts newlines; an unterminated final line is not a line.
         if self.saw_input && !self.ended_with_newline {
-            self.lines += 1;
             self.max_line_length = self.max_line_length.max(self.current_line_length);
         }
 
+        let columns = usize::from(self.flags.lines)
+            + usize::from(self.flags.words)
+            + usize::from(self.flags.bytes)
+            + usize::from(self.flags.max_line_length);
+        // A pipe's size is unknown, so GNU wc pads a multi-column result to a
+        // fixed seven-character field.
+        let width = if columns > 1 {
+            let mut digits = 1usize;
+            let mut consider = |v: usize| {
+                let mut value = v;
+                let mut n = 1usize;
+                while value >= 10 {
+                    value /= 10;
+                    n += 1;
+                }
+                digits = digits.max(n);
+            };
+            if self.flags.lines {
+                consider(self.lines);
+            }
+            if self.flags.words {
+                consider(self.words);
+            }
+            if self.flags.bytes {
+                consider(self.bytes);
+            }
+            if self.flags.max_line_length {
+                consider(self.max_line_length);
+            }
+            digits.max(7)
+        } else {
+            1
+        };
+
+        let fmt = |n: usize| format!("{n:>width$}");
         let mut parts = Vec::new();
         if self.flags.lines {
-            parts.push(self.lines.to_string());
+            parts.push(fmt(self.lines));
         }
         if self.flags.words {
-            parts.push(self.words.to_string());
+            parts.push(fmt(self.words));
         }
         if self.flags.bytes {
-            parts.push(self.bytes.to_string());
+            parts.push(fmt(self.bytes));
         }
         if self.flags.max_line_length {
-            parts.push(self.max_line_length.to_string());
+            parts.push(fmt(self.max_line_length));
         }
         let mut output = parts.join(" ");
         output.push('\n');
@@ -3473,13 +3592,19 @@ impl VmExecutor for RuntimeVmExecutor<'_> {
                     router: &mut router,
                 };
                 {
-                    let mut ctx = wasmsh_builtins::BuiltinContext {
-                        state: &mut vm.state,
-                        output: &mut sink,
-                        fs: Some(fs),
-                        stdin,
+                    let status = {
+                        let mut ctx = wasmsh_builtins::BuiltinContext {
+                            state: &mut vm.state,
+                            output: &mut sink,
+                            fs: Some(fs),
+                            stdin,
+                        };
+                        builtin_fn(&mut ctx, &argv_refs)
                     };
-                    builtin_fn(&mut ctx, &argv_refs)
+                    if name == "read" {
+                        install_read_remainder(&mut vm.state, current_exec_io);
+                    }
+                    status
                 }
             },
         );
@@ -3725,6 +3850,10 @@ pub struct WorkerRuntime {
     pending_streaming_pipeline: Option<PendingStreamingPipeline>,
     /// Signals queued for the next progressive poll.
     pending_signals: VecDeque<&'static RuntimeSignalSpec>,
+    /// Exit status of the most recent command substitution executed while
+    /// expanding an assignment value. Consumed by the assignment statement to
+    /// report the substitution's status (bash: `x=$(false); echo $?` → 1).
+    last_subst_status: Option<i32>,
 }
 
 /// Action to take for a character during array element parsing.
@@ -3955,6 +4084,7 @@ impl WorkerRuntime {
             active_run: None,
             pending_streaming_pipeline: None,
             pending_signals: VecDeque::new(),
+            last_subst_status: None,
         }
     }
 
@@ -4307,6 +4437,8 @@ impl WorkerRuntime {
         };
 
         self.exec.reset();
+        self.exec.exit_trap_at_run_start =
+            self.vm.state.get_var("_TRAP_EXIT").map(|v| v.to_string());
         self.current_exec_io = None;
         self.proc_subst_out_scopes.clear();
         self.proc_subst_in_scopes.clear();
@@ -4377,8 +4509,10 @@ impl WorkerRuntime {
         if finished || self.exec.exit_requested.is_some() || self.exec.resource_exhausted {
             self.cancel_pending_streaming_pipeline();
             self.ensure_stop_reason();
+            let ended_normally =
+                self.exec.exit_requested.is_none() && !self.exec.resource_exhausted;
             let mut events = pending_signal_events;
-            self.run_exit_trap_if_needed(&mut events);
+            self.run_exit_trap_if_needed(&mut events, ended_normally);
             self.drain_io_events(&mut events);
             self.drain_diagnostic_events(&mut events);
             let exit_status = self.current_run_exit_status();
@@ -4527,7 +4661,8 @@ impl WorkerRuntime {
 
     fn finish_idle_signal_exit(&mut self) -> Vec<WorkerEvent> {
         let mut events = Vec::new();
-        self.run_exit_trap_if_needed(&mut events);
+        // A signal is an abnormal termination, so the EXIT trap always fires.
+        self.run_exit_trap_if_needed(&mut events, false);
         self.drain_io_events(&mut events);
         self.drain_diagnostic_events(&mut events);
         let exit_status = self.current_run_exit_status();
@@ -5149,10 +5284,11 @@ impl WorkerRuntime {
 
     fn vm_supported_word_part(part: &WordPart) -> bool {
         match part {
-            WordPart::Literal(_)
-            | WordPart::SingleQuoted(_)
-            | WordPart::Parameter(_)
-            | WordPart::Arithmetic(_) => true,
+            WordPart::Literal(_) | WordPart::SingleQuoted(_) | WordPart::Parameter(_) => true,
+            // The VM's arithmetic evaluator has no runtime access, so an
+            // arithmetic expression containing a command substitution must be
+            // handled by the full interpreter (which resolves it first).
+            WordPart::Arithmetic(expr) => !expr.contains("$(") && !expr.contains('`'),
             WordPart::DoubleQuoted(parts) => parts.iter().all(Self::vm_supported_word_part),
             WordPart::CommandSubstitution(_)
             | WordPart::ProcessSubstIn(_)
@@ -5257,16 +5393,32 @@ impl WorkerRuntime {
         events
     }
 
-    fn run_exit_trap_if_needed(&mut self, events: &mut Vec<WorkerEvent>) {
-        let Some(exit_code) = self.exec.exit_requested else {
-            return;
-        };
-        let Some(handler_str) = self.trap_handler("_TRAP_EXIT", "_TRAP_IGNORE_EXIT") else {
-            return;
-        };
+    /// Run the `EXIT` trap. `script_ended_normally` is true when the top-level
+    /// script simply ran off its end rather than calling `exit`/being
+    /// signalled. In that case the trap only fires if it was installed or
+    /// changed during this run, so a persistent runtime session does not
+    /// re-fire an inherited trap at the end of every `Run`.
+    fn run_exit_trap_if_needed(
+        &mut self,
+        events: &mut Vec<WorkerEvent>,
+        script_ended_normally: bool,
+    ) {
         if self.exec.trap_depth > 0 {
             return;
         }
+        let Some(handler_str) = self.trap_handler("_TRAP_EXIT", "_TRAP_IGNORE_EXIT") else {
+            return;
+        };
+        if script_ended_normally
+            && self.exec.exit_trap_at_run_start.as_deref() == Some(handler_str.as_str())
+        {
+            return;
+        }
+        // The trap runs on explicit `exit` and on normal end-of-script.
+        let exit_code = self
+            .exec
+            .exit_requested
+            .unwrap_or(self.vm.state.last_status);
         self.exec.trap_depth += 1;
         self.exec.exit_requested = None;
         self.vm.state.last_status = exit_code;
@@ -7051,6 +7203,24 @@ impl WorkerRuntime {
         patterns: &mut Vec<String>,
     ) -> Option<StreamingGrepStep> {
         let arg = args[i].as_str();
+        // Glued numeric value: `-A2`, `-B10`, `-C3`, `-m5`.
+        if arg.len() > 2 {
+            let (letter, rest) = arg.split_at(2);
+            if matches!(letter, "-A" | "-B" | "-C" | "-m") {
+                let n: usize = rest.parse().ok()?;
+                match letter {
+                    "-A" => flags.after_context = n,
+                    "-B" => flags.before_context = n,
+                    "-C" => {
+                        flags.before_context = n;
+                        flags.after_context = n;
+                    }
+                    "-m" => flags.max_count = Some(n),
+                    _ => unreachable!(),
+                }
+                return Some(StreamingGrepStep::Advance(1));
+            }
+        }
         let has_next = i + 1 < args.len();
         if !has_next {
             return Some(StreamingGrepStep::NotMatched);
@@ -7463,10 +7633,12 @@ impl WorkerRuntime {
     fn execute_inner_capture_stdout(&mut self, input: &str) -> Vec<u8> {
         let events = self.execute_isolated_input_events(input, None);
         let mut stdout = Vec::new();
+        let mut exit_status = None;
         for event in events {
             match event {
                 WorkerEvent::Stdout(data) => stdout.extend_from_slice(&data),
                 WorkerEvent::Stderr(data) => self.write_stderr(&data),
+                WorkerEvent::Exit(status) => exit_status = Some(status),
                 WorkerEvent::Diagnostic(level, msg) => self.vm.emit_diagnostic(
                     convert_diag_level(level),
                     wasmsh_vm::DiagCategory::Runtime,
@@ -7474,6 +7646,9 @@ impl WorkerRuntime {
                 ),
                 _ => {}
             }
+        }
+        if let Some(status) = exit_status {
+            self.last_subst_status = Some(status);
         }
         stdout
     }
@@ -7503,6 +7678,7 @@ impl WorkerRuntime {
         let (mut inner_events, captured) = self.with_output_capture(true, true, |runtime| {
             runtime.with_nested_shell_scope(|nested| nested.execute_input_inner(input))
         });
+        let inner_status = self.vm.state.last_status;
         let inner_resource_exhausted = self.exec.resource_exhausted;
         let inner_diagnostics = self
             .vm
@@ -7541,6 +7717,9 @@ impl WorkerRuntime {
         let mut events = Self::seed_isolated_events_from_capture(captured);
         Self::merge_isolated_inner_events(&mut events, inner_events.drain(..));
         events.extend(inner_diagnostics);
+        // Record the isolated scope's final status so a command substitution
+        // can report it even though the shell state is restored afterwards.
+        self.last_subst_status = Some(inner_status);
         events
     }
 
@@ -7838,8 +8017,19 @@ impl WorkerRuntime {
         &mut self,
         cmd_name: &str,
     ) -> Result<Option<wasmsh_utils::UtilStdin<'static>>, ()> {
+        // A regular-file redirect has a known size; expose it so `wc` can
+        // match GNU's width choice for seekable input.
+        let size_hint = match self.current_exec_io.as_ref().map(ExecIo::stdin_target_kind) {
+            Some(InputTarget::File { path, .. }) if !path.starts_with("/tmp/_wasmsh_pipe_") => {
+                self.fs.stat(&path).ok().map(|m| m.size)
+            }
+            _ => None,
+        };
         let reader = self.take_pending_input_reader(cmd_name)?;
-        Ok(reader.map(wasmsh_utils::UtilStdin::from_reader))
+        Ok(reader.map(|reader| match size_hint {
+            Some(size) => wasmsh_utils::UtilStdin::from_sized_reader(reader, size),
+            None => wasmsh_utils::UtilStdin::from_reader(reader),
+        }))
     }
 
     fn take_external_stdin(
@@ -7891,6 +8081,7 @@ impl WorkerRuntime {
             active_run: None,
             pending_streaming_pipeline: None,
             pending_signals: VecDeque::new(),
+            last_subst_status: None,
         })
     }
 
@@ -8371,6 +8562,12 @@ impl WorkerRuntime {
                         WordPart::ProcessSubstOut(inner) => {
                             WordPart::Literal(self.execute_process_subst_out(inner))
                         }
+                        // `$(( ... $(cmd) ... ))`: arithmetic is evaluated by
+                        // the expansion layer, which has no runtime access, so
+                        // resolve nested substitutions here first.
+                        WordPart::Arithmetic(expr) => {
+                            WordPart::Arithmetic(self.resolve_arith_command_subst(expr).into())
+                        }
                         WordPart::DoubleQuoted(inner_parts) => {
                             let resolved: Vec<WordPart> = inner_parts
                                 .iter()
@@ -8384,6 +8581,9 @@ impl WorkerRuntime {
                                     WordPart::ProcessSubstOut(inner) => {
                                         WordPart::Literal(self.execute_process_subst_out(inner))
                                     }
+                                    WordPart::Arithmetic(expr) => WordPart::Arithmetic(
+                                        self.resolve_arith_command_subst(expr).into(),
+                                    ),
                                     other => other.clone(),
                                 })
                                 .collect();
@@ -8398,6 +8598,47 @@ impl WorkerRuntime {
                 }
             })
             .collect()
+    }
+
+    /// Replace `$(...)` and `` `...` `` command substitutions inside an
+    /// arithmetic expression with their output.
+    fn resolve_arith_command_subst(&mut self, expr: &str) -> String {
+        if !expr.contains('$') && !expr.contains('`') {
+            return expr.to_string();
+        }
+        let bytes = expr.as_bytes();
+        let mut out = String::with_capacity(expr.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'$'
+                && bytes.get(i + 1) == Some(&b'(')
+                && bytes.get(i + 2) == Some(&b'(')
+            {
+                // Nested `$(( ))` is left intact for the arithmetic evaluator.
+                if let Some(end) = scan_arith_double_paren(bytes, i) {
+                    out.push_str(&expr[i..end]);
+                    i = end;
+                    continue;
+                }
+            }
+            if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                if let Some((end, inner)) = scan_command_subst(bytes, i + 2) {
+                    out.push_str(&self.execute_subst(inner));
+                    i = end;
+                    continue;
+                }
+            }
+            if bytes[i] == b'`' {
+                if let Some((end, inner)) = scan_backtick(bytes, i + 1) {
+                    out.push_str(&self.execute_subst(inner));
+                    i = end;
+                    continue;
+                }
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out
     }
 
     fn execute_command(&mut self, cmd: &HirCommand) {
@@ -8421,24 +8662,54 @@ impl WorkerRuntime {
         match cmd {
             HirCommand::Exec(exec) => self.execute_exec(exec),
             HirCommand::Assign(assign) => {
+                self.last_subst_status = None;
                 for a in &assign.assignments {
                     self.execute_assignment(&a.name, a.value.as_ref());
                 }
                 let stdout_before = self.current_stdout_len();
                 self.apply_redirections(&assign.redirections, stdout_before);
-                self.vm.state.last_status = 0;
+                // A pure assignment reports the exit status of the last
+                // command substitution in its value (bash: `x=$(false)` → 1).
+                self.vm.state.last_status = self.last_subst_status.take().unwrap_or(0);
             }
-            HirCommand::If(if_cmd) => self.execute_if(if_cmd),
-            HirCommand::While(loop_cmd) => self.execute_while_loop(loop_cmd),
-            HirCommand::Until(loop_cmd) => self.execute_until_loop(loop_cmd),
-            HirCommand::For(for_cmd) => self.execute_for_loop(for_cmd),
-            HirCommand::Group(block) => self.execute_body(&block.body),
+            HirCommand::If(if_cmd) => {
+                let redirs = if_cmd.redirections.clone();
+                self.execute_compound_with_redirections(&redirs, |rt| rt.execute_if(if_cmd));
+            }
+            HirCommand::While(loop_cmd) => {
+                let redirs = loop_cmd.redirections.clone();
+                self.execute_compound_with_redirections(&redirs, |rt| {
+                    rt.execute_while_loop(loop_cmd);
+                });
+            }
+            HirCommand::Until(loop_cmd) => {
+                let redirs = loop_cmd.redirections.clone();
+                self.execute_compound_with_redirections(&redirs, |rt| {
+                    rt.execute_until_loop(loop_cmd);
+                });
+            }
+            HirCommand::For(for_cmd) => {
+                let redirs = for_cmd.redirections.clone();
+                self.execute_compound_with_redirections(&redirs, |rt| rt.execute_for_loop(for_cmd));
+            }
+            HirCommand::Group(block) => {
+                let redirs = block.redirections.clone();
+                self.execute_compound_with_redirections(&redirs, |rt| {
+                    rt.execute_body(&block.body);
+                });
+            }
             HirCommand::Subshell(block) => {
-                self.vm.state.env.push_scope();
-                self.execute_body(&block.body);
-                self.vm.state.env.pop_scope();
+                let redirs = block.redirections.clone();
+                self.execute_compound_with_redirections(&redirs, |rt| {
+                    rt.vm.state.env.push_scope();
+                    rt.execute_body(&block.body);
+                    rt.vm.state.env.pop_scope();
+                });
             }
-            HirCommand::Case(case_cmd) => self.execute_case(case_cmd),
+            HirCommand::Case(case_cmd) => {
+                let redirs = case_cmd.redirections.clone();
+                self.execute_compound_with_redirections(&redirs, |rt| rt.execute_case(case_cmd));
+            }
             HirCommand::FunctionDef(fd) => {
                 self.functions
                     .insert(fd.name.to_string(), (*fd.body).clone());
@@ -8457,10 +8728,29 @@ impl WorkerRuntime {
                 let result = wasmsh_expand::eval_arithmetic(&ac.expr, &mut self.vm.state);
                 self.vm.state.last_status = i32::from(result == 0);
             }
-            HirCommand::ArithFor(af) => self.execute_arith_for(af),
+            HirCommand::ArithFor(af) => {
+                let redirs = af.redirections.clone();
+                self.execute_compound_with_redirections(&redirs, |rt| rt.execute_arith_for(af));
+            }
             HirCommand::Select(sel) => self.execute_select(sel),
             _ => {}
         }
+    }
+
+    /// Apply a compound command's trailing redirections for the duration of `f`.
+    fn execute_compound_with_redirections(
+        &mut self,
+        redirections: &[HirRedirection],
+        f: impl FnOnce(&mut Self),
+    ) {
+        if redirections.is_empty() {
+            f(self);
+            return;
+        }
+        let Ok(exec_io) = self.prepare_exec_io(redirections) else {
+            return;
+        };
+        self.with_exec_io_scope(exec_io, f);
     }
 
     /// Execute a simple command (`HirCommand::Exec`).
@@ -8551,8 +8841,12 @@ impl WorkerRuntime {
 
     fn collect_stdin_heredoc(&mut self, redir: &HirRedirection) {
         if let Some(body) = &redir.here_doc_body {
-            let expanded = wasmsh_expand::expand_string(&body.content, &mut self.vm.state);
-            self.set_pending_input_bytes(expanded.into_bytes());
+            let content = if body.expand {
+                wasmsh_expand::expand_string(&body.content, &mut self.vm.state)
+            } else {
+                body.content.to_string()
+            };
+            self.set_pending_input_bytes(content.into_bytes());
         }
     }
 
@@ -8992,12 +9286,11 @@ impl WorkerRuntime {
                     .iter()
                     .map(|s| smol_str::SmolStr::from(s.as_str()))
                     .collect();
-                self.with_nested_shell_scope(|runtime| {
-                    let sub_events = runtime.execute_input_inner(script);
-                    runtime.merge_sub_events_with_diagnostics(sub_events);
-                });
+                let events = self.execute_isolated_input_events(script, None);
+                let child_status = self.last_subst_status;
                 self.vm.state.positional = old_positional;
                 self.vm.state.script_name = old_script_name;
+                self.apply_isolated_script_events(events, child_status);
             }
             return;
         }
@@ -9018,7 +9311,8 @@ impl WorkerRuntime {
         self.fs.close(h);
         let content = String::from_utf8_lossy(&data).to_string();
 
-        // Set $0 to the script path, positional parameters from argv[2..]
+        // `sh file` runs in a child shell: `exit` ends the child only, and
+        // variables/functions do not leak back into the caller.
         let old_positional = std::mem::take(&mut self.vm.state.positional);
         let old_script_name = self.vm.state.script_name.take();
         self.vm.state.script_name = Some(smol_str::SmolStr::from(argv[1].as_str()));
@@ -9031,13 +9325,33 @@ impl WorkerRuntime {
             .state
             .source_stack
             .push(smol_str::SmolStr::from(path.as_str()));
-        let sub_events =
-            self.with_nested_shell_scope(|runtime| runtime.execute_input_inner(&content));
+        let events = self.execute_isolated_input_events(&content, None);
+        let child_status = self.last_subst_status;
         self.vm.state.source_stack.pop();
-        self.merge_sub_events_with_diagnostics(sub_events);
 
         self.vm.state.positional = old_positional;
         self.vm.state.script_name = old_script_name;
+        self.apply_isolated_script_events(events, child_status);
+    }
+
+    /// Deliver the events of an isolated child-shell run to the parent: merge
+    /// stdout/stderr and adopt the child's exit status without letting its
+    /// `exit` terminate the parent.
+    fn apply_isolated_script_events(
+        &mut self,
+        events: Vec<WorkerEvent>,
+        child_status: Option<i32>,
+    ) {
+        let mut status = child_status;
+        for event in &events {
+            if let WorkerEvent::Exit(code) = event {
+                status = Some(*code);
+            }
+        }
+        self.merge_sub_events_with_diagnostics(events);
+        if let Some(code) = status {
+            self.vm.state.last_status = code;
+        }
     }
 
     /// Detect a shell shebang at the start of a file.
@@ -9258,6 +9572,9 @@ impl WorkerRuntime {
             };
             builtin_fn(&mut ctx, &argv_refs)
         };
+        if cmd_name == "read" {
+            install_read_remainder(&mut self.vm.state, &mut self.current_exec_io);
+        }
         self.vm.state.last_status = status;
     }
 
@@ -9386,6 +9703,7 @@ impl WorkerRuntime {
         };
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         let cwd = self.vm.state.cwd.clone();
+        let command_pipes = RefCell::new(Vec::<(String, Vec<u8>)>::new());
         let status = {
             let mut router = RuntimeOutputRouter {
                 exec: &mut self.exec,
@@ -9399,6 +9717,7 @@ impl WorkerRuntime {
             };
             let mut output = RuntimeUtilSink {
                 router: &mut router,
+                command_pipes: &command_pipes,
             };
             let mut ctx = UtilContext {
                 fs: &mut self.fs,
@@ -9412,6 +9731,14 @@ impl WorkerRuntime {
             util_fn(&mut ctx, &argv_refs)
         };
         self.vm.state.last_status = status;
+
+        // Deliver awk-style `print | "cmd"` pipes: run each command with the
+        // buffered text as its stdin, exactly once, after the utility returns.
+        for (command, data) in command_pipes.into_inner() {
+            let events =
+                self.execute_isolated_input_events(&command, Some(InputTarget::Bytes(data)));
+            self.merge_sub_events_with_diagnostics(events);
+        }
     }
 
     /// Execute an `if` command.
@@ -9436,11 +9763,17 @@ impl WorkerRuntime {
         }
         if let Some(else_body) = &if_cmd.else_body {
             self.execute_body(else_body);
+        } else {
+            // POSIX: when no condition is true and there is no `else`, the
+            // exit status of the `if` compound command is zero.
+            self.vm.state.last_status = 0;
         }
     }
 
     /// Execute a `while` loop.
     fn execute_while_loop(&mut self, loop_cmd: &wasmsh_hir::HirLoop) {
+        let mut ran_body = false;
+        let mut last_body_status = 0;
         loop {
             if self.check_resource_limits() {
                 break;
@@ -9453,14 +9786,21 @@ impl WorkerRuntime {
                 break;
             }
             self.execute_body(&loop_cmd.body);
+            ran_body = true;
+            last_body_status = self.vm.state.last_status;
             if self.handle_loop_control() {
                 break;
             }
         }
+        // POSIX: the loop's exit status is the last body command's status, or
+        // zero if the body never ran.
+        self.vm.state.last_status = if ran_body { last_body_status } else { 0 };
     }
 
     /// Execute an `until` loop.
     fn execute_until_loop(&mut self, loop_cmd: &wasmsh_hir::HirLoop) {
+        let mut ran_body = false;
+        let mut last_body_status = 0;
         loop {
             if self.check_resource_limits() {
                 break;
@@ -9473,10 +9813,13 @@ impl WorkerRuntime {
                 break;
             }
             self.execute_body(&loop_cmd.body);
+            ran_body = true;
+            last_body_status = self.vm.state.last_status;
             if self.handle_loop_control() {
                 break;
             }
         }
+        self.vm.state.last_status = if ran_body { last_body_status } else { 0 };
     }
 
     /// Handle loop control flow (break/continue/exit). Returns true if the loop should break.
@@ -9494,12 +9837,16 @@ impl WorkerRuntime {
     /// Execute a `for` loop.
     fn execute_for_loop(&mut self, for_cmd: &wasmsh_hir::HirFor) {
         let words = self.expand_for_words(for_cmd.words.as_deref());
+        let mut ran_body = false;
+        let mut last_body_status = 0;
         for word in words {
             if self.check_resource_limits() {
                 break;
             }
             self.vm.state.set_var(for_cmd.var_name.clone(), word.into());
             self.execute_body(&for_cmd.body);
+            ran_body = true;
+            last_body_status = self.vm.state.last_status;
             if self.exec.break_depth > 0 {
                 self.exec.break_depth -= 1;
                 break;
@@ -9512,6 +9859,8 @@ impl WorkerRuntime {
                 break;
             }
         }
+        // An empty `for` list leaves the exit status at zero.
+        self.vm.state.last_status = if ran_body { last_body_status } else { 0 };
     }
 
     /// Expand word list for `for` and `select` commands.
@@ -9586,6 +9935,8 @@ impl WorkerRuntime {
         if !af.init.is_empty() {
             wasmsh_expand::eval_arithmetic(&af.init, &mut self.vm.state);
         }
+        let mut ran_body = false;
+        let mut last_body_status = 0;
         loop {
             if self.check_resource_limits() {
                 break;
@@ -9597,6 +9948,8 @@ impl WorkerRuntime {
                 }
             }
             self.execute_body(&af.body);
+            ran_body = true;
+            last_body_status = self.vm.state.last_status;
             if self.handle_loop_control() {
                 break;
             }
@@ -9604,6 +9957,7 @@ impl WorkerRuntime {
                 wasmsh_expand::eval_arithmetic(&af.step, &mut self.vm.state);
             }
         }
+        self.vm.state.last_status = if ran_body { last_body_status } else { 0 };
     }
 
     /// Execute a `select` command.
@@ -11333,10 +11687,14 @@ impl WorkerRuntime {
 
     fn apply_heredoc_redir(&mut self, redir: &HirRedirection, exec_io: &mut ExecIo) {
         if let Some(body) = &redir.here_doc_body {
-            let expanded = wasmsh_expand::expand_string(&body.content, &mut self.vm.state);
+            let content = if body.expand {
+                wasmsh_expand::expand_string(&body.content, &mut self.vm.state)
+            } else {
+                body.content.to_string()
+            };
             exec_io
                 .fds_mut()
-                .set_input(InputTarget::Bytes(expanded.into_bytes()));
+                .set_input(InputTarget::Bytes(content.into_bytes()));
         }
     }
 
@@ -11575,6 +11933,20 @@ impl WorkerRuntime {
         self.vm.state.last_status = 1;
         true
     }
+}
+
+/// Move the `read` builtin's unconsumed stdin tail back into the active fd
+/// table so later `read` calls in the same shell scope resume it. Streaming
+/// readers cannot be un-read, so `read` buffers the whole source and leaves
+/// the tail in `_STDIN_REMAINING`.
+fn install_read_remainder(state: &mut ShellState, current_exec_io: &mut Option<ExecIo>) {
+    let Some(rem) = state.get_var("_STDIN_REMAINING") else {
+        return;
+    };
+    current_exec_io
+        .get_or_insert_with(ExecIo::default)
+        .fds_mut()
+        .set_input(InputTarget::Bytes(rem.as_bytes().to_vec()));
 }
 
 fn default_clock_provider() -> Rc<dyn ClockProvider> {

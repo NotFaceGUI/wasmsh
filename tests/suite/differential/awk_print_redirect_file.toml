@@ -1,0 +1,18 @@
+[test]
+name = "awk-print-redirect-file"
+tags = ["awk", "redirection", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["awk", "cat"]
+
+[input]
+script = "awk 'BEGIN{print \"hello\" > \"out.txt\"}'\ncat out.txt"
+
+[expect]
+status = 0
+stdout = "hello\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

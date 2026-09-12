@@ -1053,6 +1053,10 @@ fn set_parse_option(ctx: &mut BuiltinContext<'_>, args: &[&str], i: &mut usize, 
 }
 
 /// `getopts` — parse positional parameters for options.
+///
+/// Supports clustered options (`-ab`), attached arguments (`-bval`),
+/// separate arguments (`-b val`), `--` termination, and the leading `:`
+/// silent mode. `OPTARG`/`OPTIND` follow bash semantics.
 fn builtin_getopts(ctx: &mut BuiltinContext<'_>, argv: &[&str]) -> i32 {
     if argv.len() < 3 {
         ctx.output
@@ -1061,34 +1065,186 @@ fn builtin_getopts(ctx: &mut BuiltinContext<'_>, argv: &[&str]) -> i32 {
     }
     let optstring = argv[1];
     let var_name = argv[2];
-    let optind: usize = ctx
-        .state
-        .get_var("OPTIND")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
 
-    if optind > ctx.state.positional.len() {
-        return 1; // no more options
-    }
-
-    let arg = &ctx.state.positional[optind - 1];
-    if !arg.starts_with('-') || arg == "-" {
-        return 1; // not an option
-    }
-
-    let opt_char = arg.chars().nth(1).unwrap_or('?');
-    if optstring.contains(opt_char) {
-        ctx.state
-            .set_var(SmolStr::from(var_name), SmolStr::from(&arg[1..2]));
+    let explicit_args: Vec<String> = if argv.len() > 3 {
+        argv[3..].iter().map(|s| (*s).to_string()).collect()
     } else {
         ctx.state
+            .positional
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+    let args: Vec<&str> = explicit_args.iter().map(String::as_str).collect();
+
+    let silent = optstring.starts_with(':');
+    let optind = ctx
+        .state
+        .get_var("OPTIND")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+
+    // Resume the current cluster only if OPTIND was not changed by the user.
+    let stored_ind = ctx
+        .state
+        .get_var("_GETOPTS_OPTIND")
+        .and_then(|v| v.parse::<usize>().ok());
+    let mut offset = if stored_ind == Some(optind) {
+        ctx.state
+            .get_var("_GETOPTS_OFFSET")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    let mut optind = optind;
+
+    let result = loop {
+        if optind > args.len() {
+            break None;
+        }
+        let arg = args[optind - 1];
+        if offset <= 1 {
+            if arg == "--" {
+                optind += 1;
+                break None;
+            }
+            if !arg.starts_with('-') || arg == "-" {
+                break None;
+            }
+        }
+        let chars: Vec<char> = arg.chars().collect();
+        if offset >= chars.len() {
+            optind += 1;
+            offset = 1;
+            continue;
+        }
+        break Some(chars);
+    };
+
+    let Some(chars) = result else {
+        ctx.state.set_var(
+            SmolStr::from("OPTIND"),
+            SmolStr::from(optind.to_string().as_str()),
+        );
+        clear_getopts_state(ctx.state);
+        return 1;
+    };
+
+    let c = chars[offset];
+    let spec: Vec<char> = optstring.chars().collect();
+    let found = spec.iter().position(|&s| s == c);
+    let requires_arg = found.is_some_and(|idx| spec.get(idx + 1) == Some(&':'));
+    let consumed_this_arg = offset + 1 >= chars.len();
+
+    if found.is_none() {
+        // Unknown option.
+        if !silent {
+            let shell = ctx
+                .state
+                .script_name
+                .clone()
+                .unwrap_or_else(|| SmolStr::from("wasmsh"));
+            ctx.output
+                .stderr(format!("{shell}: illegal option -- {c}\n").as_bytes());
+            ctx.state.unset_var("OPTARG").ok();
+        } else {
+            ctx.state.set_var(
+                SmolStr::from("OPTARG"),
+                SmolStr::from(c.to_string().as_str()),
+            );
+        }
+        ctx.state
             .set_var(SmolStr::from(var_name), SmolStr::from("?"));
+        if consumed_this_arg {
+            optind += 1;
+            offset = 1;
+        } else {
+            offset += 1;
+        }
+    } else if requires_arg {
+        let rest: String = chars[offset + 1..].iter().collect();
+        if !rest.is_empty() {
+            ctx.state
+                .set_var(SmolStr::from("OPTARG"), SmolStr::from(rest.as_str()));
+            optind += 1;
+            offset = 1;
+        } else if optind < args.len() {
+            ctx.state
+                .set_var(SmolStr::from("OPTARG"), SmolStr::from(args[optind]));
+            optind += 2;
+            offset = 1;
+        } else {
+            // Missing required argument.
+            if silent {
+                ctx.state.set_var(
+                    SmolStr::from("OPTARG"),
+                    SmolStr::from(c.to_string().as_str()),
+                );
+                ctx.state
+                    .set_var(SmolStr::from(var_name), SmolStr::from(":"));
+            } else {
+                let shell = ctx
+                    .state
+                    .script_name
+                    .clone()
+                    .unwrap_or_else(|| SmolStr::from("wasmsh"));
+                ctx.output
+                    .stderr(format!("{shell}: option requires an argument -- {c}\n").as_bytes());
+                ctx.state.unset_var("OPTARG").ok();
+                ctx.state
+                    .set_var(SmolStr::from(var_name), SmolStr::from("?"));
+            }
+            optind += 1;
+            ctx.state.set_var(
+                SmolStr::from("OPTIND"),
+                SmolStr::from(optind.to_string().as_str()),
+            );
+            ctx.state.set_var(
+                SmolStr::from("_GETOPTS_OPTIND"),
+                SmolStr::from(optind.to_string().as_str()),
+            );
+            ctx.state
+                .set_var(SmolStr::from("_GETOPTS_OFFSET"), SmolStr::from("1"));
+            return 0;
+        }
+        ctx.state.set_var(
+            SmolStr::from(var_name),
+            SmolStr::from(c.to_string().as_str()),
+        );
+    } else {
+        ctx.state.set_var(
+            SmolStr::from(var_name),
+            SmolStr::from(c.to_string().as_str()),
+        );
+        ctx.state.unset_var("OPTARG").ok();
+        if consumed_this_arg {
+            optind += 1;
+            offset = 1;
+        } else {
+            offset += 1;
+        }
     }
+
     ctx.state.set_var(
         SmolStr::from("OPTIND"),
-        SmolStr::from((optind + 1).to_string().as_str()),
+        SmolStr::from(optind.to_string().as_str()),
+    );
+    ctx.state.set_var(
+        SmolStr::from("_GETOPTS_OPTIND"),
+        SmolStr::from(optind.to_string().as_str()),
+    );
+    ctx.state.set_var(
+        SmolStr::from("_GETOPTS_OFFSET"),
+        SmolStr::from(offset.to_string().as_str()),
     );
     0
+}
+
+fn clear_getopts_state(state: &mut ShellState) {
+    state.unset_var("_GETOPTS_OPTIND").ok();
+    state.unset_var("_GETOPTS_OFFSET").ok();
 }
 
 /// Parsed options for the `read` builtin.
@@ -1169,17 +1325,19 @@ fn builtin_read(ctx: &mut BuiltinContext<'_>, argv: &[&str]) -> i32 {
     }
     emit_read_prompt(ctx, opts.prompt);
     let var_names = read_var_names(&opts);
-    let Some((line, remaining)) = read_input(ctx, &opts) else {
+    let Some((line, remaining, found_delimiter)) = read_input(ctx, &opts) else {
         return 1;
     };
 
     store_read_remaining(ctx, &remaining);
     if let Some(arr_name) = opts.array_name {
         read_into_array(ctx.state, &line, arr_name);
-        return 0;
+    } else {
+        read_assign_vars(ctx.state, &line, &var_names);
     }
-    read_assign_vars(ctx.state, &line, &var_names);
-    0
+    // A line terminated by the delimiter succeeds; EOF without a delimiter
+    // still assigns the partial line but reports failure (bash semantics).
+    i32::from(!found_delimiter)
 }
 
 fn emit_read_prompt(ctx: &mut BuiltinContext<'_>, prompt: Option<&str>) {
@@ -1202,7 +1360,9 @@ fn store_read_remaining(ctx: &mut BuiltinContext<'_>, remaining: &str) {
 }
 
 /// Obtain input text for `read` from stdin or the `_STDIN_REMAINING` variable.
-fn read_input(ctx: &mut BuiltinContext<'_>, opts: &ReadOpts<'_>) -> Option<(String, String)> {
+/// The bool in the returned tuple is true when the record ended at the
+/// configured delimiter (rather than at end-of-input).
+fn read_input(ctx: &mut BuiltinContext<'_>, opts: &ReadOpts<'_>) -> Option<(String, String, bool)> {
     if let Some(mut stdin) = ctx.stdin.take() {
         return read_input_from_stdin(ctx, &mut stdin, opts).ok();
     }
@@ -1222,11 +1382,13 @@ fn read_input_from_stdin(
     ctx: &mut BuiltinContext<'_>,
     stdin: &mut BuiltinStdin<'_>,
     opts: &ReadOpts<'_>,
-) -> Result<(String, String), ()> {
+) -> Result<(String, String, bool), ()> {
+    // A streaming reader cannot be pushed back, so consume the remaining
+    // input once and hand the unconsumed tail to the caller. Subsequent
+    // `read` calls in the same shell scope resume from that tail, which is
+    // what makes `while read x; do ...; done < file` iterate.
     let mut data = Vec::new();
-    let delimiter = opts.delimiter as u8;
-    let mut buf = [0u8; 1];
-
+    let mut buf = [0u8; 4096];
     loop {
         let n = match stdin.read_chunk(&mut buf) {
             Ok(n) => n,
@@ -1239,48 +1401,41 @@ fn read_input_from_stdin(
         if n == 0 {
             break;
         }
-        if read_stdin_consume_byte(&mut data, buf[0], delimiter, opts) {
-            break;
-        }
+        data.extend_from_slice(&buf[..n]);
     }
 
-    Ok((String::from_utf8_lossy(&data).to_string(), String::new()))
+    let text = String::from_utf8_lossy(&data).to_string();
+    let (line, remaining, found) = read_split_input(&text, opts);
+    // No data and no delimiter: end-of-input with nothing read.
+    if !found && line.is_empty() && remaining.is_empty() {
+        ctx.state
+            .set_var(SmolStr::from("_STDIN_REMAINING"), SmolStr::from(""));
+        return Ok((String::new(), String::new(), false));
+    }
+    Ok((line, remaining, found))
 }
 
-/// Process a single byte read from stdin.  Returns `true` when the caller
-/// should stop reading (delimiter hit or character limit reached).
-fn read_stdin_consume_byte(
-    data: &mut Vec<u8>,
-    byte: u8,
-    delimiter: u8,
-    opts: &ReadOpts<'_>,
-) -> bool {
+/// Split input into (`current_line`, `remaining`, `found_delimiter`) according
+/// to `read` options (-N, -n, delimiter). `found_delimiter` is false when the
+/// record ended at end-of-input rather than at the delimiter, which is what
+/// makes `read` return non-zero while still assigning the partial line.
+fn read_split_input(input_text: &str, opts: &ReadOpts<'_>) -> (String, String, bool) {
     if let Some(n) = opts.exact_nchars {
-        if data.len() < n {
-            data.push(byte);
-        }
-        return data.len() >= n;
-    }
-    if byte == delimiter {
-        return true;
-    }
-    data.push(byte);
-    opts.nchars.is_some_and(|n| data.len() >= n)
-}
-
-/// Split input into (`current_line`, remaining) according to `read` options (-N, -n, delimiter).
-fn read_split_input(input_text: &str, opts: &ReadOpts<'_>) -> (String, String) {
-    if let Some(n) = opts.exact_nchars {
-        return read_split_exact(input_text, n);
+        let (line, rest) = read_split_exact(input_text, n);
+        let found = line.chars().count() >= n;
+        return (line, rest, found);
     }
     if let Some(n) = opts.nchars {
         return read_split_nchars(input_text, n, opts.delimiter);
     }
     // Normal line-based read using delimiter
-    let mut parts = input_text.splitn(2, opts.delimiter);
-    let first = parts.next().unwrap_or("").to_string();
-    let rest = parts.next().unwrap_or("").to_string();
-    (first, rest)
+    if let Some(pos) = input_text.find(opts.delimiter) {
+        let line = input_text[..pos].to_string();
+        let rest = input_text[pos + opts.delimiter.len_utf8()..].to_string();
+        (line, rest, true)
+    } else {
+        (input_text.to_string(), String::new(), false)
+    }
 }
 
 /// Split for `-N` (exact N characters, no delimiter stop).
@@ -1296,11 +1451,16 @@ fn read_split_exact(input_text: &str, n: usize) -> (String, String) {
 }
 
 /// Split for `-n` (at most N characters, stop at delimiter too).
-fn read_split_nchars(input_text: &str, n: usize, delimiter: char) -> (String, String) {
+fn read_split_nchars(input_text: &str, n: usize, delimiter: char) -> (String, String, bool) {
     let mut chars = String::new();
     let mut rest_start = 0;
+    let mut reached_delimiter = false;
     for ch in input_text.chars() {
-        if chars.len() >= n || ch == delimiter {
+        if chars.len() >= n {
+            break;
+        }
+        if ch == delimiter {
+            reached_delimiter = true;
             break;
         }
         chars.push(ch);
@@ -1317,7 +1477,8 @@ fn read_split_nchars(input_text: &str, n: usize, delimiter: char) -> (String, St
     } else {
         ""
     };
-    (chars, rest.to_string())
+    let found = reached_delimiter || chars.chars().count() >= n;
+    (chars, rest.to_string(), found)
 }
 
 /// Split a line by IFS and store fields into an indexed array.

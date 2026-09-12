@@ -404,7 +404,8 @@ pub(crate) fn util_wc(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
 
     if file_args.is_empty() {
         if let Some(mut stdin) = ctx.stdin.take() {
-            return match wc_emit_reader(ctx.output, &mut stdin, None, &flags, "wc") {
+            let size_known = stdin.size_hint().is_some();
+            return match wc_emit_reader(ctx.output, &mut stdin, None, &flags, "wc", size_known) {
                 Ok(_) => 0,
                 Err(code) => code,
             };
@@ -412,30 +413,118 @@ pub(crate) fn util_wc(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
         ctx.output.stderr(b"wc: missing operand\n");
         return 1;
     }
+
+    // GNU wc computes one column width from the largest displayed count
+    // (including the total row), so a small single-file count is unpadded
+    // while a multi-file total widens every column. Collect first, then emit.
+    let mut rows: Vec<(Option<&str>, (usize, usize, usize, usize))> = Vec::new();
     let mut status = 0;
-    let mut total_lines: usize = 0;
-    let mut total_words: usize = 0;
-    let mut total_bytes: usize = 0;
+    let mut totals = (0usize, 0usize, 0usize, 0usize);
     for path in &file_args {
         let full = resolve_path(ctx.cwd, path);
         match open_reader_for_path(ctx, &full, path, "wc") {
-            Ok(mut reader) => {
-                match wc_emit_reader(ctx.output, reader.as_mut(), Some(path), &flags, "wc") {
-                    Ok((lines, words, bytes, _max_line_length)) => {
-                        total_lines += lines;
-                        total_words += words;
-                        total_bytes += bytes;
-                    }
-                    Err(_) => status = 1,
+            Ok(mut reader) => match wc_measure_reader(&mut reader, ctx.output, "wc") {
+                Ok(stats) => {
+                    totals.0 += stats.0;
+                    totals.1 += stats.1;
+                    totals.2 += stats.2;
+                    rows.push((Some(*path), stats));
                 }
-            }
+                Err(_) => status = 1,
+            },
             Err(_) => status = 1,
         }
     }
-    if file_args.len() > 1 {
-        wc_emit_totals(ctx, total_lines, total_words, total_bytes, &flags);
+
+    let show_total = file_args.len() > 1;
+    // GNU wc sizes the shared column field from the total input size when
+    // reading several files, so `wc -l a b` is padded to the digit width of
+    // the combined byte count, not that of the line total. The largest
+    // displayed value can still be wider.
+    let width = wc_column_width(&flags, &rows, totals, show_total);
+    for (path, stats) in &rows {
+        wc_emit_row_with_width(ctx.output, *path, &flags, stats, width);
+    }
+    if show_total {
+        wc_emit_totals(ctx, totals.0, totals.1, totals.2, &flags, width);
     }
     status
+}
+
+/// Measure a reader without emitting anything.
+fn wc_measure_reader(
+    reader: &mut dyn Read,
+    output: &mut dyn UtilOutput,
+    cmd: &str,
+) -> Result<(usize, usize, usize, usize), i32> {
+    let mut stats = WcStats::default();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                stats.saw_input = true;
+                stats.bytes += read;
+                for &byte in &buffer[..read] {
+                    stats.update(byte);
+                }
+            }
+            Err(err) => return Err(report_stdin_read_error(output, cmd, &err)),
+        }
+    }
+    stats.finalize();
+    Ok((stats.lines, stats.words, stats.bytes, stats.max_line_length))
+}
+
+fn wc_digits(n: usize) -> usize {
+    let mut value = n;
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn wc_column_width(
+    flags: &WcFlags,
+    rows: &[(Option<&str>, (usize, usize, usize, usize))],
+    totals: (usize, usize, usize, usize),
+    show_total: bool,
+) -> usize {
+    // For a single operand there is no total row, so the width is just the
+    // widest displayed count. With multiple operands GNU wc pads to the
+    // digit width of the combined input size (which the total byte count
+    // equals for files it fully read).
+    let mut width = 1usize;
+    let mut consider = |v: usize| width = width.max(wc_digits(v));
+    for (_, stats) in rows {
+        if flags.lines {
+            consider(stats.0);
+        }
+        if flags.words {
+            consider(stats.1);
+        }
+        if flags.bytes {
+            consider(stats.2);
+        }
+        if flags.max_line_length {
+            consider(stats.3);
+        }
+    }
+    if show_total {
+        consider(totals.2);
+        if flags.lines {
+            consider(totals.0);
+        }
+        if flags.words {
+            consider(totals.1);
+        }
+        if flags.bytes {
+            consider(totals.2);
+        }
+    }
+    width
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -524,19 +613,23 @@ impl WcStats {
     }
 
     fn finalize(&mut self) {
+        // `wc -l` counts newline characters, so a final line without a
+        // trailing newline is not counted (GNU behaviour). It still counts
+        // toward the max line length for `-L`.
         if self.saw_input && !self.ended_with_newline {
-            self.lines += 1;
             self.max_line_length = self.max_line_length.max(self.current_line_length);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wc_emit_reader(
     output: &mut dyn UtilOutput,
     reader: &mut dyn Read,
     path: Option<&str>,
     flags: &WcFlags,
     cmd: &str,
+    size_known: bool,
 ) -> Result<(usize, usize, usize, usize), i32> {
     let mut stats = WcStats::default();
     let mut buffer = [0u8; 4096];
@@ -558,34 +651,72 @@ fn wc_emit_reader(
     }
 
     stats.finalize();
-    wc_emit_row(output, path, flags, &stats);
+    wc_emit_row(output, path, flags, &stats, size_known);
     Ok((stats.lines, stats.words, stats.bytes, stats.max_line_length))
 }
 
-fn wc_emit_row(output: &mut dyn UtilOutput, path: Option<&str>, flags: &WcFlags, stats: &WcStats) {
-    let padded = path.is_some();
-    let fmt = |n: usize| {
-        if padded {
-            format!("{n:>7}")
-        } else {
-            n.to_string()
-        }
-    };
-    let mut parts = Vec::new();
+fn wc_emit_row(
+    output: &mut dyn UtilOutput,
+    path: Option<&str>,
+    flags: &WcFlags,
+    stats: &WcStats,
+    size_known: bool,
+) {
+    let values = (stats.lines, stats.words, stats.bytes, stats.max_line_length);
+    let mut max_digits = 1usize;
     if flags.lines {
-        parts.push(fmt(stats.lines));
+        max_digits = max_digits.max(wc_digits(stats.lines));
     }
     if flags.words {
-        parts.push(fmt(stats.words));
+        max_digits = max_digits.max(wc_digits(stats.words));
     }
     if flags.bytes {
-        parts.push(fmt(stats.bytes));
+        max_digits = max_digits.max(wc_digits(stats.bytes));
     }
     if flags.max_line_length {
-        parts.push(fmt(stats.max_line_length));
+        max_digits = max_digits.max(wc_digits(stats.max_line_length));
     }
-    let sep = if padded { "" } else { " " };
-    let mut out = parts.join(sep);
+    // GNU wc pads each column to a fixed seven-character field when the
+    // input size is unknown and more than one column is printed (so a
+    // pipeline's numbers stay aligned). A regular file — including a `<`
+    // redirect — has a known size, so its width follows the data.
+    let width = if !size_known && wc_column_count(flags) > 1 {
+        max_digits.max(7)
+    } else {
+        max_digits
+    };
+    wc_emit_row_with_width(output, path, flags, &values, width);
+}
+
+fn wc_column_count(flags: &WcFlags) -> usize {
+    usize::from(flags.lines)
+        + usize::from(flags.words)
+        + usize::from(flags.bytes)
+        + usize::from(flags.max_line_length)
+}
+
+fn wc_emit_row_with_width(
+    output: &mut dyn UtilOutput,
+    path: Option<&str>,
+    flags: &WcFlags,
+    stats: &(usize, usize, usize, usize),
+    width: usize,
+) {
+    let fmt = |n: usize| format!("{n:>width$}");
+    let mut parts = Vec::new();
+    if flags.lines {
+        parts.push(fmt(stats.0));
+    }
+    if flags.words {
+        parts.push(fmt(stats.1));
+    }
+    if flags.bytes {
+        parts.push(fmt(stats.2));
+    }
+    if flags.max_line_length {
+        parts.push(fmt(stats.3));
+    }
+    let mut out = parts.join(" ");
     if let Some(path) = path {
         out.push(' ');
         out.push_str(path);
@@ -600,21 +731,22 @@ fn wc_emit_totals(
     words: usize,
     bytes: usize,
     flags: &WcFlags,
+    width: usize,
 ) {
     let mut parts = Vec::new();
     if flags.lines {
-        parts.push(format!("{lines:>7}"));
+        parts.push(format!("{lines:>width$}"));
     }
     if flags.words {
-        parts.push(format!("{words:>7}"));
+        parts.push(format!("{words:>width$}"));
     }
     if flags.bytes {
-        parts.push(format!("{bytes:>7}"));
+        parts.push(format!("{bytes:>width$}"));
     }
     if flags.max_line_length {
-        parts.push(format!("{:>7}", 0)); // total max-line not meaningful
+        parts.push(format!("{:>width$}", 0)); // total max-line not meaningful
     }
-    let mut out = parts.join("");
+    let mut out = parts.join(" ");
     out.push_str(" total\n");
     ctx.output.stdout(out.as_bytes());
 }
@@ -718,8 +850,28 @@ fn parse_grep_long_option(arg: &str, flags: &mut GrepFlags) -> bool {
 /// Apply a short option that takes a value (`-e`, `-f`, `-A`, `-B`, `-C`, `-m`).
 /// Returns `Some(consumed)` to advance the iterator, or `None` if this arg is
 /// not a valued short option.
+///
+/// Both separated (`-A 2`) and glued (`-A2`) forms are accepted.
 fn parse_grep_valued_short_option(argv: &[&str], i: usize, flags: &mut GrepFlags) -> Option<usize> {
     let arg = argv[i];
+    // Glued numeric value: `-A2`, `-B10`, `-C3`, `-m5`.
+    if arg.len() > 2 {
+        let (letter, rest) = arg.split_at(2);
+        if matches!(letter, "-A" | "-B" | "-C" | "-m") {
+            let n: usize = rest.parse().ok()?;
+            match letter {
+                "-A" => flags.after_context = n,
+                "-B" => flags.before_context = n,
+                "-C" => {
+                    flags.before_context = n;
+                    flags.after_context = n;
+                }
+                "-m" => flags.max_count = Some(n),
+                _ => unreachable!(),
+            }
+            return Some(1);
+        }
+    }
     let next = argv.get(i + 1).copied()?;
     match arg {
         "-e" => {
@@ -1801,8 +1953,61 @@ struct SortFlags {
     human_numeric: bool,
     version_sort: bool,
     key_field: Option<usize>,
+    key_end_field: Option<usize>,
     separator: Option<char>,
     output_file: Option<String>,
+}
+
+/// Parse one key field spec (`F[.C][OPTS]`) into its field number and the
+/// trailing modifier letters. Returns `None` when no leading number is present.
+fn parse_key_field_spec(part: &str) -> (Option<usize>, String) {
+    let digits_len = part
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(part.len());
+    let field = part[..digits_len].parse::<usize>().ok();
+    let mut rest = &part[digits_len..];
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let n = after_dot
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after_dot.len());
+        rest = &after_dot[n..];
+    }
+    (field, rest.to_string())
+}
+
+/// Apply sort option letters (from a clustered flag or a key modifier) to
+/// `flags`. `k`/`t`/`o` consume arguments and are handled by the caller.
+fn apply_sort_option(flags: &mut SortFlags, c: char) {
+    match c {
+        'n' => flags.numeric = true,
+        'r' => flags.reverse = true,
+        'u' => flags.unique = true,
+        'f' => flags.ignore_case = true,
+        's' => flags.stable = true,
+        'b' => flags.ignore_leading_blanks = true,
+        'c' => flags.check = true,
+        'h' => flags.human_numeric = true,
+        'V' => flags.version_sort = true,
+        // 'm', 'z', 'M', 'd', 'g', 'i' etc. — accepted, no special handling
+        _ => {}
+    }
+}
+
+fn parse_sort_key(flags: &mut SortFlags, spec: &str) {
+    let mut parts = spec.splitn(2, ',');
+    let (start, start_mods) = parse_key_field_spec(parts.next().unwrap_or(""));
+    let end_spec = parts.next();
+    flags.key_field = start;
+    if let Some(end_spec) = end_spec {
+        let (end, end_mods) = parse_key_field_spec(end_spec);
+        flags.key_end_field = end;
+        for c in end_mods.chars() {
+            apply_sort_option(flags, c);
+        }
+    }
+    for c in start_mods.chars() {
+        apply_sort_option(flags, c);
+    }
 }
 
 fn parse_sort_flags<'a>(argv: &'a [&'a str]) -> (SortFlags, Vec<&'a str>) {
@@ -1817,74 +2022,125 @@ fn parse_sort_flags<'a>(argv: &'a [&'a str]) -> (SortFlags, Vec<&'a str>) {
         human_numeric: false,
         version_sort: false,
         key_field: None,
+        key_end_field: None,
         separator: None,
         output_file: None,
     };
     let mut file_args = Vec::new();
+    let mut positional_only = false;
     let mut i = 1;
     while i < argv.len() {
         let arg = argv[i];
-        if arg == "-k" && i + 1 < argv.len() {
-            // Parse key spec: "-k 2" or "-k 2,3"
-            let spec = argv[i + 1];
-            let field: &str = spec.split(',').next().unwrap_or(spec);
-            let field: &str = field.split('.').next().unwrap_or(field);
-            flags.key_field = field.parse().ok();
-            i += 2;
-        } else if arg == "-t" && i + 1 < argv.len() {
-            flags.separator = argv[i + 1].chars().next();
-            i += 2;
-        } else if arg == "-o" && i + 1 < argv.len() {
-            flags.output_file = Some(argv[i + 1].to_string());
-            i += 2;
-        } else if arg.starts_with('-') && arg.len() > 1 && arg != "--" {
-            for c in arg[1..].chars() {
-                match c {
-                    'n' => flags.numeric = true,
-                    'r' => flags.reverse = true,
-                    'u' => flags.unique = true,
-                    'f' => flags.ignore_case = true,
-                    's' => flags.stable = true,
-                    'b' => flags.ignore_leading_blanks = true,
-                    'c' => flags.check = true,
-                    'h' => flags.human_numeric = true,
-                    'V' => flags.version_sort = true,
-                    // 'm', 'z' etc. — accept, no special handling
-                    _ => {}
+        if positional_only || !arg.starts_with('-') || arg == "-" {
+            file_args.push(arg);
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            i += 1;
+            continue;
+        }
+
+        let chars: Vec<char> = arg.chars().collect();
+        let mut j = 1;
+        while j < chars.len() {
+            let c = chars[j];
+            match c {
+                'k' | 't' | 'o' => {
+                    // Option takes an argument: the rest of this cluster if
+                    // non-empty, otherwise the next argv element.
+                    let rest: String = chars[j + 1..].iter().collect();
+                    let value = if !rest.is_empty() {
+                        rest
+                    } else if i + 1 < argv.len() {
+                        i += 1;
+                        argv[i].to_string()
+                    } else {
+                        String::new()
+                    };
+                    match c {
+                        'k' => parse_sort_key(&mut flags, &value),
+                        't' => flags.separator = value.chars().next(),
+                        'o' => flags.output_file = Some(value),
+                        _ => unreachable!(),
+                    }
+                    j = chars.len();
+                }
+                other => {
+                    apply_sort_option(&mut flags, other);
+                    j += 1;
                 }
             }
-            i += 1;
-        } else {
-            if arg == "--" {
-                i += 1;
-            }
-            file_args.extend(argv[i..].iter().filter(|a| !a.starts_with('-')).copied());
-            break;
         }
+        i += 1;
     }
     (flags, file_args)
 }
 
-fn sort_extract_key<'a>(line: &'a str, flags: &SortFlags) -> &'a str {
-    if let Some(field_num) = flags.key_field {
-        if field_num == 0 {
-            return line;
+/// Byte spans of each field on a line. With an explicit separator, empty
+/// fields are preserved (like GNU `sort -t`); otherwise fields are maximal
+/// runs of non-whitespace.
+fn sort_field_spans(line: &str, sep: Option<char>) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    if let Some(c) = sep {
+        let mut start = 0;
+        for (idx, ch) in line.char_indices() {
+            if ch == c {
+                spans.push((start, idx));
+                start = idx + ch.len_utf8();
+            }
         }
-        let parts: Vec<&str> = if let Some(sep) = flags.separator {
-            line.split(sep).collect()
-        } else {
-            line.split_whitespace().collect()
-        };
-        if field_num <= parts.len() {
-            return parts[field_num - 1];
-        }
-        ""
+        spans.push((start, line.len()));
     } else {
-        line
+        let mut start: Option<usize> = None;
+        for (idx, ch) in line.char_indices() {
+            if ch.is_whitespace() {
+                if let Some(s) = start.take() {
+                    spans.push((s, idx));
+                }
+            } else if start.is_none() {
+                start = Some(idx);
+            }
+        }
+        if let Some(s) = start {
+            spans.push((s, line.len()));
+        }
     }
+    spans
+}
+
+fn sort_extract_key<'a>(line: &'a str, flags: &SortFlags) -> &'a str {
+    let Some(field_num) = flags.key_field else {
+        return line;
+    };
+    if field_num == 0 {
+        return line;
+    }
+    let spans = sort_field_spans(line, flags.separator);
+    if field_num > spans.len() {
+        return "";
+    }
+    let start = spans[field_num - 1].0;
+    let end = match flags.key_end_field {
+        Some(end_field) if end_field >= field_num && end_field <= spans.len() => {
+            spans[end_field - 1].1
+        }
+        _ => line.len(),
+    };
+    &line[start..end.max(start).min(line.len())]
 }
 
 fn sort_compare(a: &str, b: &str, flags: &SortFlags) -> std::cmp::Ordering {
+    let ord = sort_compare_keys(a, b, flags);
+    if flags.reverse {
+        ord.reverse()
+    } else {
+        ord
+    }
+}
+
+fn sort_compare_keys(a: &str, b: &str, flags: &SortFlags) -> std::cmp::Ordering {
     let ka = sort_extract_key(a, flags);
     let kb = sort_extract_key(b, flags);
     let ka = if flags.ignore_leading_blanks {
@@ -1898,7 +2154,7 @@ fn sort_compare(a: &str, b: &str, flags: &SortFlags) -> std::cmp::Ordering {
         kb
     };
 
-    if flags.numeric || flags.human_numeric {
+    let key_ord = if flags.numeric || flags.human_numeric {
         let na = parse_leading_number(ka.trim());
         let nb = parse_leading_number(kb.trim());
         na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
@@ -1908,6 +2164,18 @@ fn sort_compare(a: &str, b: &str, flags: &SortFlags) -> std::cmp::Ordering {
         ka.to_lowercase().cmp(&kb.to_lowercase())
     } else {
         ka.cmp(kb)
+    };
+
+    if key_ord != std::cmp::Ordering::Equal {
+        return key_ord;
+    }
+
+    // GNU sort's default "last-resort" comparison falls back to the whole
+    // line when keys tie; `-s` disables that so input order is preserved.
+    if flags.stable {
+        std::cmp::Ordering::Equal
+    } else {
+        a.cmp(b)
     }
 }
 
@@ -1984,14 +2252,11 @@ pub(crate) fn util_sort(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
         return 0;
     }
 
-    if flags.stable {
-        lines.sort_by(|a, b| sort_compare(a, b, &flags));
-    } else {
-        lines.sort_unstable_by(|a, b| sort_compare(a, b, &flags));
-    }
-    if flags.reverse {
-        lines.reverse();
-    }
+    // GNU sort is always stable; `-s` only disables the last-resort whole-line
+    // comparison, which `sort_compare` handles. `-r` reverses the entire
+    // comparison (including the last-resort tiebreak), so it is applied inside
+    // `sort_compare` rather than by reversing the sorted vector.
+    lines.sort_by(|a, b| sort_compare(a, b, &flags));
     if flags.unique {
         lines.dedup_by(|a, b| {
             if flags.ignore_case {
@@ -3880,7 +4145,9 @@ mod tests {
         let mut fs = make_fs_with_file("/wc.txt", b"aa\nbb\ncc\n");
         let (status, out, err) = run(util_wc, &["wc", "-l", "/wc.txt"], &mut fs);
         assert_eq!(status, 0, "{err}");
-        assert_eq!(out, "      3 /wc.txt\n");
+        // GNU `wc -l file` right-aligns to the widest displayed value, which
+        // for a single one-digit count means no padding.
+        assert_eq!(out, "3 /wc.txt\n");
     }
 
     #[test]
@@ -3928,5 +4195,98 @@ mod tests {
         let (status, out, err) = run(util_sed, &["sed", "-n", "$p", "/sed.txt"], &mut fs);
         assert_eq!(status, 0, "{err}");
         assert_eq!(out, "last\n");
+    }
+
+    // ---- Edge-case inputs (CRLF, BOM, NUL, long lines, Unicode) ----
+
+    #[test]
+    fn wc_line_count_ignores_missing_final_newline() {
+        let mut fs = make_fs_with_file("/nl.txt", b"a\nb\nc");
+        let (status, out, err) = run(util_wc, &["wc", "-l", "/nl.txt"], &mut fs);
+        assert_eq!(status, 0, "{err}");
+        assert_eq!(out, "2 /nl.txt\n");
+    }
+
+    #[test]
+    fn wc_empty_file_is_zero() {
+        let mut fs = make_fs_with_file("/empty.txt", b"");
+        let (status, out, err) = run(util_wc, &["wc", "-l", "/empty.txt"], &mut fs);
+        assert_eq!(status, 0, "{err}");
+        assert_eq!(out, "0 /empty.txt\n");
+    }
+
+    #[test]
+    fn wc_counts_crlf_lines_as_newlines() {
+        // CRLF still contains one LF per line; the CR is a regular byte.
+        let mut fs = make_fs_with_file("/crlf.txt", b"a\r\nb\r\n");
+        let (status, out, err) = run(util_wc, &["wc", "-l", "/crlf.txt"], &mut fs);
+        assert_eq!(status, 0, "{err}");
+        assert_eq!(out, "2 /crlf.txt\n");
+    }
+
+    #[test]
+    fn wc_counts_utf8_bytes_not_chars_for_c() {
+        let mut fs = make_fs_with_file("/u.txt", "héllo\n".as_bytes());
+        let (status, out, err) = run(util_wc, &["wc", "-c", "/u.txt"], &mut fs);
+        assert_eq!(status, 0, "{err}");
+        // 'é' is two bytes in UTF-8, plus the newline.
+        assert_eq!(out, "7 /u.txt\n");
+    }
+
+    #[test]
+    fn wc_survives_a_very_long_line() {
+        let long_line = "x".repeat(200_000);
+        let mut content = long_line.clone().into_bytes();
+        content.push(b'\n');
+        let mut fs = make_fs_with_file("/long.txt", &content);
+        let (status, out, err) = run(util_wc, &["wc", "-lL", "/long.txt"], &mut fs);
+        assert_eq!(status, 0, "{err}");
+        assert_eq!(out, "     1 200000 /long.txt\n");
+    }
+
+    #[test]
+    fn sed_handles_a_utf8_line() {
+        let mut fs = make_fs_with_file("/u.txt", "café\n".as_bytes());
+        let (status, out, err) = run(util_sed, &["sed", "s/café/tea/", "/u.txt"], &mut fs);
+        assert_eq!(status, 0, "{err}");
+        assert_eq!(out, "tea\n");
+    }
+
+    #[test]
+    fn grep_context_glued_flag_matches_separate_form() {
+        let mut fs = make_fs_with_file("/ctx.txt", b"a\nb\nMATCH\nc\nd\n");
+        let (s1, glued, e1) = run(util_grep, &["grep", "-A2", "MATCH", "/ctx.txt"], &mut fs);
+        let (s2, separate, e2) = run(
+            util_grep,
+            &["grep", "-A", "2", "MATCH", "/ctx.txt"],
+            &mut fs,
+        );
+        assert_eq!((s1, s2), (0, 0), "{e1}{e2}");
+        assert_eq!(glued, separate);
+        assert_eq!(glued, "MATCH\nc\nd\n");
+    }
+
+    #[test]
+    fn sort_key_numeric_sorts_by_field_value() {
+        let mut fs = make_fs_with_file("/s.txt", b"x 3\ny 1\nz 2\n");
+        let (status, out, err) = run(util_sort, &["sort", "-k2", "-n", "/s.txt"], &mut fs);
+        assert_eq!(status, 0, "{err}");
+        assert_eq!(out, "y 1\nz 2\nx 3\n");
+    }
+
+    #[test]
+    fn sort_reverse_orders_descending() {
+        let mut fs = make_fs_with_file("/s.txt", b"a\nc\nb\n");
+        let (status, out, err) = run(util_sort, &["sort", "-r", "/s.txt"], &mut fs);
+        assert_eq!(status, 0, "{err}");
+        assert_eq!(out, "c\nb\na\n");
+    }
+
+    #[test]
+    fn sort_empty_file_produces_no_output() {
+        let mut fs = make_fs_with_file("/s.txt", b"");
+        let (status, out, err) = run(util_sort, &["sort", "/s.txt"], &mut fs);
+        assert_eq!(status, 0, "{err}");
+        assert_eq!(out, "");
     }
 }

@@ -1,0 +1,18 @@
+[test]
+name = "if-without-else-does-not-trip-errexit"
+tags = ["control-flow", "if", "errexit", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["if", "errexit", "echo"]
+
+[input]
+script = "set -e\nif false; then :; fi\necho continued"
+
+[expect]
+status = 0
+stdout = "continued\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

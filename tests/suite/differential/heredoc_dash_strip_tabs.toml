@@ -1,0 +1,18 @@
+[test]
+name = "heredoc-dash-strips-leading-tabs"
+tags = ["here-doc", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["here-doc", "cat"]
+
+[input]
+script = "cat <<-'EOF'\n\tline\n\tEOF"
+
+[expect]
+status = 0
+stdout = "line\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

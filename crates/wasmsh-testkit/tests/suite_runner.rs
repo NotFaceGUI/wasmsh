@@ -18,6 +18,15 @@ fn suite_dir() -> PathBuf {
 fn run_all_suite_cases() {
     let dir = suite_dir();
     let cases = runner::discover_cases(&dir);
+    let filter = std::env::var("WASMSH_SUITE_FILTER").ok();
+    let cases: Vec<_> = cases
+        .into_iter()
+        .filter(|p| {
+            filter
+                .as_ref()
+                .is_none_or(|needle| p.to_string_lossy().contains(needle.as_str()))
+        })
+        .collect();
 
     if cases.is_empty() {
         eprintln!("WARNING: no TOML test cases found in {}", dir.display());

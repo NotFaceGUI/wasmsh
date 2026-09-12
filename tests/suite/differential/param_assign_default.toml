@@ -1,0 +1,18 @@
+[test]
+name = "param-assign-default-numeric"
+tags = ["expansion", "parameter-assign-default", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["parameter-assign-default", "echo"]
+
+[input]
+script = "echo [${UNSET:=3}]\necho after=[$UNSET]"
+
+[expect]
+status = 0
+stdout = "[3]\nafter=[3]\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

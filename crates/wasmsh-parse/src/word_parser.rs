@@ -75,10 +75,19 @@ fn parse_double_quoted_part(
 
 fn parse_escaped_literal(bytes: &[u8], pos: &mut usize, lit: &mut String) {
     *pos += 1;
-    if *pos < bytes.len() {
-        lit.push(bytes[*pos] as char);
-        *pos += 1;
+    if *pos >= bytes.len() {
+        return;
     }
+    // `\<newline>` is a line continuation: both characters are removed and
+    // the word continues on the next line. A CR before the newline is an
+    // ordinary escaped character (bash keeps it), so only bare `\<LF>` is
+    // special-cased.
+    if bytes[*pos] == b'\n' {
+        *pos += 1;
+        return;
+    }
+    lit.push(bytes[*pos] as char);
+    *pos += 1;
 }
 
 fn parse_dollar_part(
@@ -118,7 +127,13 @@ fn dq_backslash(bytes: &[u8], pos: &mut usize, lit: &mut String) {
         return;
     }
     let c = bytes[*pos];
-    if matches!(c, b'$' | b'`' | b'"' | b'\\' | b'\n') {
+    // Backslash-newline is a line continuation even inside double quotes:
+    // both characters are removed.
+    if c == b'\n' {
+        *pos += 1;
+        return;
+    }
+    if matches!(c, b'$' | b'`' | b'"' | b'\\') {
         lit.push(c as char);
     } else {
         lit.push('\\');
@@ -675,5 +690,30 @@ mod tests {
             parse_word_parts("prefix$'\\n'suffix"),
             vec![lit("prefix"), lit("\n"), lit("suffix")]
         );
+    }
+
+    #[test]
+    fn backslash_newline_is_removed() {
+        // `\<newline>` joins the lines with no intervening character.
+        assert_eq!(parse_word_parts("one \\\ntwo"), vec![lit("one two")]);
+    }
+
+    #[test]
+    fn backslash_newline_in_double_quotes_is_removed() {
+        assert_eq!(
+            parse_word_parts("\"one \\\ntwo\""),
+            vec![WordPart::DoubleQuoted(vec![lit("one two")])]
+        );
+    }
+
+    #[test]
+    fn escaped_carriage_return_is_kept() {
+        // A CR before the newline is an ordinary escaped char in bash.
+        assert_eq!(parse_word_parts("one \\\rtwo"), vec![lit("one \rtwo")]);
+    }
+
+    #[test]
+    fn backslash_newline_mid_word() {
+        assert_eq!(parse_word_parts("ab\\\ncd"), vec![lit("abcd")]);
     }
 }

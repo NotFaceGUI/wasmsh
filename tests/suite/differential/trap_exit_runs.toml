@@ -1,0 +1,18 @@
+[test]
+name = "trap-exit-runs-at-end"
+tags = ["trap", "trap-exit", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["trap", "trap-exit", "echo"]
+
+[input]
+script = "trap 'echo bye' EXIT\necho hello"
+
+[expect]
+status = 0
+stdout = "hello\nbye\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

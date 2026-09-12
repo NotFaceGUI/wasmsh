@@ -1,0 +1,18 @@
+[test]
+name = "grep-glued-context-flag"
+tags = ["utility", "grep", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["grep", "printf"]
+
+[input]
+script = "printf 'a\nb\nMATCH\nc\nd\n' | grep -A2 MATCH"
+
+[expect]
+status = 0
+stdout = "MATCH\nc\nd\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

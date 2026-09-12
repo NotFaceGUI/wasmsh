@@ -1,0 +1,18 @@
+[test]
+name = "awk-array-pass-by-reference"
+tags = ["awk", "function", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["awk"]
+
+[input]
+script = "awk 'function f(a){a[1]=9} BEGIN{f(x); print length(x)}'"
+
+[expect]
+status = 0
+stdout = "1\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

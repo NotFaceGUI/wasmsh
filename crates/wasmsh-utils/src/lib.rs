@@ -44,6 +44,12 @@ mod yaml_ops;
 pub trait UtilOutput {
     fn stdout(&mut self, data: &[u8]);
     fn stderr(&mut self, data: &[u8]);
+    /// Deliver data written through an awk-style `print | "cmd"` output pipe.
+    ///
+    /// Embedders that cannot spawn commands may leave this as the default
+    /// no-op; the runtime overrides it to execute the pipeline command with
+    /// the buffered data as its stdin.
+    fn command_pipe(&mut self, _command: &str, _data: &[u8]) {}
 }
 
 /// Collected output for testing.
@@ -71,6 +77,10 @@ impl VecOutput {
 
 pub struct UtilStdin<'a> {
     reader: Box<dyn Read + 'a>,
+    /// Known total size in bytes when stdin is a regular file redirect.
+    /// `None` for pipes and other non-seekable sources. GNU `wc` uses this to
+    /// choose a fixed seven-character field only when the size is unknown.
+    size_hint: Option<u64>,
 }
 
 impl std::fmt::Debug for UtilStdin<'_> {
@@ -84,6 +94,7 @@ impl<'a> UtilStdin<'a> {
     pub fn from_bytes(data: &'a [u8]) -> Self {
         Self {
             reader: Box::new(Cursor::new(data)),
+            size_hint: None,
         }
     }
 
@@ -94,7 +105,26 @@ impl<'a> UtilStdin<'a> {
     {
         Self {
             reader: Box::new(reader),
+            size_hint: None,
         }
+    }
+
+    /// Wrap a reader whose total size is known (a regular-file redirect).
+    #[must_use]
+    pub fn from_sized_reader<R>(reader: R, size: u64) -> Self
+    where
+        R: Read + 'a,
+    {
+        Self {
+            reader: Box::new(reader),
+            size_hint: Some(size),
+        }
+    }
+
+    /// Total input size when known, or `None` for streams of unknown length.
+    #[must_use]
+    pub fn size_hint(&self) -> Option<u64> {
+        self.size_hint
     }
 
     pub fn read_chunk(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {

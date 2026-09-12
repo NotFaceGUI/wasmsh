@@ -401,9 +401,15 @@ fn try_expand_substring(name: &str, state: &ShellState, out: &mut String) -> boo
     };
     let var_name = &name[..colon_pos];
     let rest = &name[colon_pos + 1..];
-    // Check it's a numeric offset, not an operator like :-, :+, :=, :?
-    let is_numeric = rest.starts_with(|c: char| c.is_ascii_digit())
-        || (rest.starts_with('-') && rest.len() > 1 && rest.as_bytes()[1].is_ascii_digit());
+    // `${var:-2}` is the default-value operator with operand `2`, not a
+    // negative-offset substring: a `-`/`=`/`+`/`?` immediately after the
+    // colon always introduces an operator. Bash only reads a negative
+    // substring offset when it is separated by whitespace (`${var: -2}`).
+    if rest.starts_with(['-', '=', '+', '?']) {
+        return false;
+    }
+    // Check it's a numeric offset (arithmetic expressions are not supported).
+    let is_numeric = rest.starts_with(|c: char| c.is_ascii_digit());
     if !is_numeric {
         return false;
     }

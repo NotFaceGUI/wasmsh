@@ -1,0 +1,18 @@
+[test]
+name = "ln-symbolic-link"
+tags = ["utility", "ln", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["ln", "readlink", "cat"]
+
+[input]
+script = "echo data > target.txt\nln -s target.txt link.txt\nreadlink link.txt\ncat link.txt"
+
+[expect]
+status = 0
+stdout = "target.txt\ndata\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

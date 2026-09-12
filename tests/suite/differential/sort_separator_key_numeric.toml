@@ -1,0 +1,18 @@
+[test]
+name = "sort-separator-key-numeric"
+tags = ["utility", "sort", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["sort", "printf"]
+
+[input]
+script = "printf 'x:3\ny:1\nz:2\n' | sort -t: -k2 -n"
+
+[expect]
+status = 0
+stdout = "y:1\nz:2\nx:3\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

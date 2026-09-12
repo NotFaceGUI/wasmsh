@@ -1,0 +1,18 @@
+[test]
+name = "if-without-else-status"
+tags = ["control-flow", "if", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["if", "echo"]
+
+[input]
+script = "if false; then :; fi\necho rc=$?"
+
+[expect]
+status = 0
+stdout = "rc=0\n"
+
+[oracle]
+compare = true
+shells = ["bash"]
