@@ -98,3 +98,11 @@
 - **文档**：`SUPPORTED.md` 新增 "Fixed in the sandbox-hardening pass" 与 "Remaining known divergences"，明确 `timeout`/`sleep`/`nproc` 桩、缺 `join`/`od`、`jq/yq --version`、数组负长度切片等仍存差异。
 - **本地证据（本轮）**：`cargo test --workspace --locked` 全绿；TOML 套件 631 通过、5 个 feature-gate SKIP、0 失败（含 54 个 `differential/` 用例全部与真实 bash 逐字节一致）；`cargo clippy --workspace --all-targets --locked` 干净；`cargo fmt --all` 已跑。独立 `sh-audit` 差分 harness：修复前 16 MATCH / 2 CRASH，修复后 29 MATCH / 0 CRASH，深层嵌套输入全部变为优雅错误且会话可继续使用。
 - **仍未做**：`join`/`od` 未实现；`jq`/`yq --version` 仍被当过滤器；`timeout`/`sleep`/`nproc` 仍为桩；数组负长度切片 `${a[@]:1:-1}` 与 bash 的报错行为不同；`readonly` 赋值为命令级失败而非脚本级 abort（bash 自身在 `;` 与换行下不一致）。以上均在 `SUPPORTED.md` 记录。
+
+## 10. v0.9.1 发布（2026-09-12）
+
+- **版本**：`tools/bump-version.sh 0.9.1` 同步全部 manifest（Cargo workspace + 内部 pin、pyodide crates、npm/python 包、`langchain-wasmsh` 两个适配包、Helm `appVersion`）。锁文件仅移动 workspace 成员自身版本，`wasm-bindgen` 等第三方 pin 未变，与 `versions.env` 固定的 `wasm-bindgen-cli` 保持一致。
+- **提交**：`4bad0b4` `fix(sandbox): bound parser recursion and close silent-semantics divergences` + `5730aa5` `chore(release): bump version to 0.9.1`，推送 `main` 后打 tag `v0.9.1`。
+- **发布结果**：`Standalone Release` run `34681588108` 全绿——Validate release source（2m11s，在 ubuntu-24.04 上跑 workspace 测试 + suite_runner + clippy -D warnings）→ Build release candidate（5m32s）→ Release host consumption ubuntu-24.04 / macos-15 / windows-2025 三平台全过 → Verify release candidate → Upload tested release artifact → **Publish standalone GitHub Release**。Release v0.9.1 已创建，asset：`wasmsh-standalone-0.9.1-5730aa520b4f.tar.gz`（3,860,855 bytes）。
+- **真实 WASM 产物复核**（此前只在原生内核验证，本轮补齐）：下载 Release 资产解包，用 `nodejs/` loader 在同一 `WasmShell` 会话内实测——四种深层嵌套（算术 2000 层、awk 400 层、命令替换 200 层、`if` 200 层）全部返回普通错误，且随后的 `echo SESSION_ALIVE` 正常执行，证明实例不再被 trap 永久毒化；`return` 正确解绑（`a`/`done`）、`$((1/0))` 返回 st=1 并写 stderr、`echo a#b` → `a#b`、`$(( $1 + 1 ))` → 8、`"${a[@]}"` → `[x][y][z]`、反引号 → `[bt]`、`printf 'A\101B\n'` → `AAB`，均在真实 WASM 上确认。
+- **发布产物校验**：`build-manifest.json` version=0.9.1、ref=v0.9.1、commit=5730aa520b4f。
