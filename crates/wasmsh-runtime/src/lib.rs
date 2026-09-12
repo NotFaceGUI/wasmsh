@@ -468,10 +468,19 @@ fn scan_backtick(bytes: &[u8], open: usize) -> Option<(usize, &str)> {
     None
 }
 
-/// Scan a nested `$(( ... ))` starting at the `$`, returning the end index.
+/// Scan a `$(( ... ))` starting at the `$`, returning the index just past the
+/// closing `))`. Both opening parens are consumed before depth tracking begins,
+/// so the expression is scanned with a depth of zero at its start.
 fn scan_arith_double_paren(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    if bytes.get(i) != Some(&b'(') {
+        return None;
+    }
+    i += 1;
+    if bytes.get(i) == Some(&b'(') {
+        i += 1;
+    }
     let mut depth = 0usize;
-    let mut i = start + 2; // past `$(`
     while i < bytes.len() {
         match bytes[i] {
             b'(' => depth += 1,
@@ -5351,14 +5360,13 @@ impl WorkerRuntime {
     fn vm_word_part_requires_full_shell_execution(part: &WordPart) -> bool {
         match part {
             WordPart::Literal(text) => Self::text_has_brace_or_glob_literal(text),
-            WordPart::SingleQuoted(_)
-            | WordPart::DoubleQuoted(_)
-            | WordPart::Parameter(_)
-            | WordPart::Arithmetic(_) => false,
-            WordPart::CommandSubstitution(_)
-            | WordPart::ProcessSubstIn(_)
-            | WordPart::ProcessSubstOut(_)
-            | _ => true,
+            WordPart::SingleQuoted(_) | WordPart::DoubleQuoted(_) => false,
+            // An unquoted parameter or arithmetic expansion is subject to
+            // field splitting and pathname expansion, which the VM subset does
+            // not perform. Its result is only known at run time, so route the
+            // whole command to the full interpreter. Command and process
+            // substitution likewise require runtime access.
+            _ => true,
         }
     }
 
@@ -6620,15 +6628,21 @@ impl WorkerRuntime {
         {
             return None;
         }
-        let tagged: Vec<(String, bool)> = expanded
+        let tagged: Vec<(String, bool, Vec<bool>)> = expanded
             .into_iter()
             .flat_map(|ew| {
                 if ew.was_quoted {
-                    vec![(ew.text, true)]
+                    vec![(ew.text, true, ew.literal)]
                 } else {
+                    // Brace expansion rewrites the text, so its byte offsets no
+                    // longer line up with the quote mask; the produced words are
+                    // unquoted, hence fully glob-active.
                     wasmsh_expand::expand_braces(&ew.text)
                         .into_iter()
-                        .map(|s| (s, false))
+                        .map(|s| {
+                            let len = s.len();
+                            (s, false, vec![false; len])
+                        })
                         .collect()
                 }
             })
@@ -7742,6 +7756,37 @@ impl WorkerRuntime {
         input: &str,
         pending_input: Option<InputTarget>,
     ) -> Vec<WorkerEvent> {
+        self.execute_isolated_input_events_inner(input, pending_input, false)
+    }
+
+    /// Clear `set`-controlled shell options. A new shell process (`sh file`,
+    /// `sh -c`, a shebang script) starts with the defaults; bash does not pass
+    /// `set -e`, `-u`, `-o pipefail`, `-f`, `-C` etc. into a child shell.
+    fn reset_set_options_for_new_shell(&mut self) {
+        for var in [
+            "SHOPT_a",
+            "SHOPT_e",
+            "SHOPT_E",
+            "SHOPT_T",
+            "SHOPT_C",
+            "SHOPT_f",
+            "SHOPT_n",
+            "SHOPT_u",
+            "SHOPT_o_pipefail",
+            "SHOPT_p",
+            "SHOPT_v",
+            "SHOPT_x",
+        ] {
+            let _ = self.vm.state.unset_var(var);
+        }
+    }
+
+    fn execute_isolated_input_events_inner(
+        &mut self,
+        input: &str,
+        pending_input: Option<InputTarget>,
+        new_process: bool,
+    ) -> Vec<WorkerEvent> {
         let saved_state = self.vm.state.clone();
         let saved_functions = self.functions.clone();
         let saved_aliases = self.aliases.clone();
@@ -7759,8 +7804,17 @@ impl WorkerRuntime {
             exec_io.fds_mut().set_input(target);
             exec_io
         });
+        if new_process {
+            self.reset_set_options_for_new_shell();
+        }
         let (mut inner_events, captured) = self.with_output_capture(true, true, |runtime| {
-            runtime.with_nested_shell_scope(|nested| nested.execute_input_inner(input))
+            runtime.with_nested_shell_scope(|nested| {
+                let mut events = nested.execute_input_inner(input);
+                // A child shell (`sh file`, `sh -c`) is a separate process: its
+                // EXIT trap fires when it ends, not when the outer shell does.
+                nested.run_exit_trap_if_needed(&mut events, false);
+                events
+            })
         });
         let inner_status = self.vm.state.last_status;
         let inner_resource_exhausted = self.exec.resource_exhausted;
@@ -8698,9 +8752,15 @@ impl WorkerRuntime {
                 && bytes.get(i + 1) == Some(&b'(')
                 && bytes.get(i + 2) == Some(&b'(')
             {
-                // Nested `$(( ))` is left intact for the arithmetic evaluator.
+                // Keep the `$(( ))` wrapper for the arithmetic evaluator, but
+                // resolve any `$(...)`/backtick inside it first, since the
+                // evaluator itself has no runtime access.
                 if let Some(end) = scan_arith_double_paren(bytes, i) {
-                    out.push_str(&expr[i..end]);
+                    let inner = &expr[i + 3..end - 2];
+                    let resolved = self.resolve_arith_command_subst(inner);
+                    out.push_str("$((");
+                    out.push_str(&resolved);
+                    out.push_str("))");
                     i = end;
                     continue;
                 }
@@ -8785,9 +8845,23 @@ impl WorkerRuntime {
             HirCommand::Subshell(block) => {
                 let redirs = block.redirections.clone();
                 self.execute_compound_with_redirections(&redirs, |rt| {
+                    let saved_exit = rt.exec.exit_requested.take();
+                    // A subshell is a copy of the shell: variables, functions and
+                    // aliases defined inside it do not survive it (bash).
+                    let saved_functions = rt.functions.clone();
+                    let saved_aliases = rt.aliases.clone();
                     rt.vm.state.env.push_scope();
                     rt.execute_body(&block.body);
                     rt.vm.state.env.pop_scope();
+                    rt.functions = saved_functions;
+                    rt.aliases = saved_aliases;
+                    // A fatal condition (nounset, `${x:?}`, excessive recursion)
+                    // or `exit` ends only the subshell; the parent continues with
+                    // the subshell's status (bash: `( exit 3 )` returns 3).
+                    if let Some(code) = rt.exec.exit_requested.take() {
+                        rt.vm.state.last_status = code;
+                    }
+                    rt.exec.exit_requested = saved_exit;
                 });
             }
             HirCommand::Case(case_cmd) => {
@@ -8852,16 +8926,21 @@ impl WorkerRuntime {
             return;
         }
 
-        // Brace and glob expansion must be suppressed for quoted words (POSIX + bash).
-        let tagged: Vec<(String, bool)> = expanded
+        // Brace and glob expansion are applied per character: literal bytes
+        // from quoted parts stay literal while unquoted `*`/`?`/`[` remain
+        // active, so `"$dir"/*.sh` still globs (POSIX + bash).
+        let tagged: Vec<(String, bool, Vec<bool>)> = expanded
             .into_iter()
             .flat_map(|ew| {
                 if ew.was_quoted {
-                    vec![(ew.text, true)]
+                    vec![(ew.text, true, ew.literal)]
                 } else {
                     wasmsh_expand::expand_braces(&ew.text)
                         .into_iter()
-                        .map(|s| (s, false))
+                        .map(|s| {
+                            let len = s.len();
+                            (s, false, vec![false; len])
+                        })
                         .collect()
                 }
             })
@@ -8955,12 +9034,20 @@ impl WorkerRuntime {
     fn collect_stdin_heredoc(&mut self, redir: &HirRedirection) {
         if let Some(body) = &redir.here_doc_body {
             let content = if body.expand {
-                wasmsh_expand::expand_string(&body.content, &mut self.vm.state)
+                self.expand_heredoc_content(&body.content)
             } else {
                 body.content.to_string()
             };
             self.set_pending_input_bytes(content.into_bytes());
         }
+    }
+
+    /// Expand an unquoted here-doc body: `$param`, `${...}`, `$(( ))` (handled
+    /// by the expansion layer) plus `$(...)` and `` `...` `` command
+    /// substitution, which need runtime access and so run first.
+    fn expand_heredoc_content(&mut self, content: &str) -> String {
+        let resolved = self.resolve_arith_command_subst(content);
+        wasmsh_expand::expand_string(&resolved, &mut self.vm.state)
     }
 
     fn collect_stdin_herestring(&mut self, redir: &HirRedirection) {
@@ -9417,7 +9504,7 @@ impl WorkerRuntime {
                     .iter()
                     .map(|s| smol_str::SmolStr::from(s.as_str()))
                     .collect();
-                let events = self.execute_isolated_input_events(script, None);
+                let events = self.execute_isolated_input_events_inner(script, None, true);
                 let child_status = self.last_subst_status;
                 self.vm.state.positional = old_positional;
                 self.vm.state.script_name = old_script_name;
@@ -9456,7 +9543,7 @@ impl WorkerRuntime {
             .state
             .source_stack
             .push(smol_str::SmolStr::from(path.as_str()));
-        let events = self.execute_isolated_input_events(&content, None);
+        let events = self.execute_isolated_input_events_inner(&content, None, true);
         let child_status = self.last_subst_status;
         self.vm.state.source_stack.pop();
 
@@ -9542,8 +9629,14 @@ impl WorkerRuntime {
             .state
             .source_stack
             .push(smol_str::SmolStr::from(path.as_str()));
+        let saved_exec = self.exec.clone();
+        self.reset_set_options_for_new_shell();
         let sub_events =
             self.with_nested_shell_scope(|runtime| runtime.execute_input_inner(&content));
+        let child_exit = self.exec.exit_requested.take();
+        let child_status = child_exit.unwrap_or(self.vm.state.last_status);
+        self.exec = saved_exec;
+        self.vm.state.last_status = child_status;
         self.vm.state.source_stack.pop();
         self.merge_sub_events_with_diagnostics(sub_events);
 
@@ -11516,10 +11609,16 @@ impl WorkerRuntime {
     /// Supports: basic glob (`*`, `?`, `[...]`), globstar (`**`), nullglob,
     /// dotglob, and extglob patterns.
     /// When `set -f` (noglob) is active, glob expansion is skipped entirely.
-    /// Expand globs in argv, skipping entries tagged as quoted.
-    fn expand_globs_tagged(&mut self, argv: Vec<(String, bool)>) -> Vec<String> {
+    /// Expand globs in argv, honoring per-character quoting.
+    ///
+    /// Each entry carries `(text, whole-word-quoted, per-byte-literal-mask)`.
+    /// A word is a glob candidate only when it has active (unquoted) metacharacters;
+    /// otherwise it is passed through literally. The mask is what lets
+    /// `"$dir"/*.sh` glob while `"$dir"/*.sh` stays literal: only the mask-true
+    /// bytes are protected and the remaining `*`/`?`/`[` stay active.
+    fn expand_globs_tagged(&mut self, argv: Vec<(String, bool, Vec<bool>)>) -> Vec<String> {
         if self.vm.state.get_var("SHOPT_f").as_deref() == Some("1") {
-            return argv.into_iter().map(|(s, _)| s).collect();
+            return argv.into_iter().map(|(s, _, _)| s).collect();
         }
         let nullglob = self.get_shopt_value("nullglob");
         let dotglob = self.get_shopt_value("dotglob");
@@ -11527,15 +11626,82 @@ impl WorkerRuntime {
         let extglob = self.get_shopt_value("extglob");
 
         let mut result = Vec::new();
-        for (arg, quoted) in argv {
-            if quoted {
-                result.push(arg);
+        for (arg, quoted, literal) in argv {
+            if literal.len() != arg.len() {
+                // No usable mask: fall back to whole-word quoting.
+                if quoted {
+                    result.push(arg);
+                } else {
+                    result.extend(self.expand_glob_arg(arg, nullglob, dotglob, globstar, extglob));
+                }
+            } else if literal.iter().any(|&b| b) {
+                result
+                    .extend(self.expand_masked_glob_arg(arg, &literal, nullglob, dotglob, extglob));
             } else {
                 result.extend(self.expand_glob_arg(arg, nullglob, dotglob, globstar, extglob));
             }
         }
         result.truncate(Self::MAX_GLOB_RESULTS);
         result
+    }
+
+    /// Expand a word with a mixed quoting mask (some bytes protected).
+    ///
+    /// Only the pattern segment after the last unquoted `/` participates, and
+    /// protected metacharacters are escaped so the matcher treats them literally.
+    fn expand_masked_glob_arg(
+        &self,
+        arg: String,
+        literal: &[bool],
+        nullglob: bool,
+        dotglob: bool,
+        extglob: bool,
+    ) -> Vec<String> {
+        if literal.len() != arg.len() {
+            return vec![arg];
+        }
+        let bytes = arg.as_bytes();
+        let active_glob = |s: &[u8], mask: &[bool]| {
+            s.iter().enumerate().any(|(i, b)| {
+                !mask.get(i).copied().unwrap_or(false) && matches!(*b, b'*' | b'?' | b'[')
+            })
+        };
+        if !active_glob(bytes, literal) {
+            return vec![arg];
+        }
+        let Some(slash) = arg.rfind('/') else {
+            // A bare filename with no directory component: search the CWD.
+            let pattern = Self::escape_masked_metachars(&arg, literal);
+            let dir = self.vm.state.cwd.clone();
+            let matches = self.read_glob_matches(&dir, &pattern, None, dotglob, extglob);
+            return self.finalize_glob_matches(arg, matches, nullglob);
+        };
+        if active_glob(&bytes[..slash], &literal[..slash]) {
+            // A glob in a leading directory segment is not supported with a
+            // mixed mask; leave the word untouched rather than mis-expand it.
+            return vec![arg];
+        }
+        let prefix = &arg[..=slash];
+        let pattern_raw = &arg[slash + 1..];
+        let pattern_mask = &literal[slash + 1..];
+        let pattern = Self::escape_masked_metachars(pattern_raw, pattern_mask);
+        let dir = self.resolve_cwd_path(prefix);
+        let matches = self.read_glob_matches(&dir, &pattern, Some(prefix), dotglob, extglob);
+        self.finalize_glob_matches(arg, matches, nullglob)
+    }
+
+    /// Escape glob metacharacters that came from quoted text so the matcher
+    /// treats them literally. A protected backslash is doubled.
+    fn escape_masked_metachars(pattern: &str, mask: &[bool]) -> String {
+        let mut out = String::with_capacity(pattern.len());
+        for (i, b) in pattern.bytes().enumerate() {
+            let protected = mask.get(i).copied().unwrap_or(false);
+            if protected && matches!(b, b'*' | b'?' | b'[' | b'\\') {
+                out.push('\\');
+            }
+            out.push(b as char);
+        }
+        out
     }
 
     fn expand_globs(&mut self, argv: Vec<String>) -> Vec<String> {
@@ -11961,7 +12127,7 @@ impl WorkerRuntime {
     fn apply_heredoc_redir(&mut self, redir: &HirRedirection, exec_io: &mut ExecIo) {
         if let Some(body) = &redir.here_doc_body {
             let content = if body.expand {
-                wasmsh_expand::expand_string(&body.content, &mut self.vm.state)
+                self.expand_heredoc_content(&body.content)
             } else {
                 body.content.to_string()
             };

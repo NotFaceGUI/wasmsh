@@ -1,0 +1,30 @@
+[test]
+name = "glob-expansion-honours-per-character-quoting"
+tags = ["globbing", "quoting", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["pathname-expansion", "echo", "printf"]
+
+# Pathname expansion is decided per character, not per word: a quoted variable
+# prefix must not disable globbing for an unquoted `*` that follows it, and an
+# unquoted parameter whose value contains `*` must still glob.
+[input]
+script = """
+printf 'x\\n' > ga.sh
+printf 'y\\n' > gb.sh
+d=.
+echo A "$d"/*.sh
+echo B "$d"/g?.sh
+p='/tmp/nope/*.sh'
+echo C "$p"
+echo D "$d"/ga.sh
+"""
+
+[expect]
+status = 0
+stdout = "A ./ga.sh ./gb.sh\nB ./ga.sh ./gb.sh\nC /tmp/nope/*.sh\nD ./ga.sh\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

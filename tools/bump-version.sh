@@ -10,7 +10,9 @@ set -euo pipefail
 #   - crates/wasmsh-pyodide-probe/Cargo.toml (excluded from workspace)
 #   - crates/wasmsh-pyodide/Cargo.toml (excluded from workspace)
 #   - packages/npm/wasmsh-pyodide/package.json
+#   - packages/npm/langchain-wasmsh/package.json
 #   - packages/python/wasmsh-pyodide-runtime/pyproject.toml
+#   - packages/python/langchain-wasmsh/pyproject.toml
 #   - deploy/helm/wasmsh/Chart.yaml (appVersion; chart version stays
 #     independent because the chart's lifecycle is not tied 1:1 to the
 #     app version — bump it deliberately when the chart API changes)
@@ -59,13 +61,17 @@ for crate in wasmsh-pyodide-probe wasmsh-pyodide; do
     echo "  crates/$crate/Cargo.toml"
 done
 
-# npm package
-sedi "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$REPO_ROOT/packages/npm/wasmsh-pyodide/package.json"
-echo "  packages/npm/wasmsh-pyodide/package.json"
+# npm packages
+for pkg in wasmsh-pyodide langchain-wasmsh; do
+    sedi "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$REPO_ROOT/packages/npm/$pkg/package.json"
+    echo "  packages/npm/$pkg/package.json"
+done
 
-# Python package
-sedi "s/^version = \".*\"/version = \"$VERSION\"/" "$REPO_ROOT/packages/python/wasmsh-pyodide-runtime/pyproject.toml"
-echo "  packages/python/wasmsh-pyodide-runtime/pyproject.toml"
+# Python packages
+for pkg in wasmsh-pyodide-runtime langchain-wasmsh; do
+    sedi "s/^version = \".*\"/version = \"$VERSION\"/" "$REPO_ROOT/packages/python/$pkg/pyproject.toml"
+    echo "  packages/python/$pkg/pyproject.toml"
+done
 
 # Helm chart appVersion.  The chart's own `version:` is left alone — chart
 # versioning is semver over the chart API, not over the app it deploys,

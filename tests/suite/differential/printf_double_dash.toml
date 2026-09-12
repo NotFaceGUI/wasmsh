@@ -1,0 +1,20 @@
+[test]
+name = "printf-double-dash-ends-options"
+tags = ["printf", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["printf"]
+
+# `--` ends option processing, so the first operand is the format string even when
+# it begins with a dash. Without this `printf -- '- %s\n' x` printed `--`.
+[input]
+script = "printf -- '- %s\\n' value\nprintf -- '%s-%s\\n' a b"
+
+[expect]
+status = 0
+stdout = "- value\na-b\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

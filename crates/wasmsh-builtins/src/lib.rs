@@ -276,6 +276,17 @@ fn process_echo_escapes(s: &str) -> String {
 /// left-align (`%-`), zero-pad (`%0`), and `\n`, `\t`, `\\` escape sequences.
 /// Repeats the format string while there are remaining arguments (POSIX behavior).
 fn builtin_printf(ctx: &mut BuiltinContext<'_>, argv: &[&str]) -> i32 {
+    // A leading `--` ends option processing (bash compatibility); without this
+    // `printf -- '%s\n' x` prints the literal format `--`.
+    let argv = match argv {
+        [prog, rest @ ..] if matches!(rest.first(), Some(&"--")) => {
+            let mut trimmed: Vec<&str> = Vec::with_capacity(argv.len() - 1);
+            trimmed.push(*prog);
+            trimmed.extend_from_slice(&rest[1..]);
+            trimmed
+        }
+        _ => argv.to_vec(),
+    };
     if argv.len() < 2 {
         ctx.output
             .stderr(b"printf: usage: printf format [arguments]\n");
@@ -1310,6 +1321,8 @@ struct ReadOpts<'a> {
     exact_nchars: Option<usize>,
     array_name: Option<&'a str>,
     fd: Option<u32>,
+    /// `-r`: a backslash is an ordinary character rather than an escape.
+    raw: bool,
     remaining_args: &'a [&'a str],
 }
 
@@ -1323,11 +1336,16 @@ fn parse_read_opts<'a>(argv: &'a [&'a str]) -> ReadOpts<'a> {
         exact_nchars: None,
         array_name: None,
         fd: None,
+        raw: false,
         remaining_args: &[],
     };
     while let Some(arg) = args.first() {
         match *arg {
-            "-r" | "-s" | "-e" => args = &args[1..],
+            "-r" => {
+                opts.raw = true;
+                args = &args[1..];
+            }
+            "-s" | "-e" => args = &args[1..],
             "-p" => {
                 opts.prompt = take_read_opt_value(&mut args);
             }
@@ -1382,6 +1400,13 @@ fn builtin_read(ctx: &mut BuiltinContext<'_>, argv: &[&str]) -> i32 {
     let var_names = read_var_names(&opts);
     let Some((line, remaining, found_delimiter)) = read_input(ctx, &opts) else {
         return 1;
+    };
+    // Without `-r`, `\` escapes the following character (including IFS
+    // characters) and is removed. With `-r` the line is taken verbatim.
+    let line = if opts.raw {
+        line
+    } else {
+        unescape_read_line(&line)
     };
 
     store_read_remaining(ctx, &remaining);
@@ -1550,26 +1575,101 @@ fn read_into_array(state: &mut ShellState, line: &str, arr_name: &str) {
 }
 
 /// Split a line by IFS and assign fields to the given variable names.
+///
+/// The separators *between* words are preserved inside the value handed to the
+/// final variable: `read -r a rest` on `a\tb\tc` gives `rest` the exact text
+/// `b\tc`, not a space-joined `b c`. Earlier variables receive one field each.
 fn read_assign_vars(state: &mut ShellState, line: &str, var_names: &[&str]) {
-    let fields = ifs_split_fields(state, line);
+    let ifs = state
+        .get_var("IFS")
+        .unwrap_or_else(|| SmolStr::from(" \t\n"));
+    let mut rest = line;
     for (i, var_name) in var_names.iter().enumerate() {
-        let val = if i == var_names.len() - 1 {
-            // Last variable gets the rest of the line
-            if i < fields.len() {
-                fields[i..].join(" ")
+        if i + 1 == var_names.len() {
+            // Last variable: the remainder, minus trailing IFS whitespace.
+            let value = if ifs.is_empty() {
+                rest.to_string()
             } else {
-                String::new()
-            }
-        } else if let Some(field) = fields.get(i) {
-            (*field).to_string()
+                rest.trim_end_matches(|c: char| is_ifs_whitespace(c, &ifs))
+                    .to_string()
+            };
+            state.set_var(SmolStr::from(*var_name), SmolStr::from(value.as_str()));
         } else {
-            String::new()
-        };
-        state.set_var(SmolStr::from(*var_name), SmolStr::from(val.as_str()));
+            let (field, consumed) = take_read_field(rest, &ifs);
+            state.set_var(SmolStr::from(*var_name), SmolStr::from(field.as_str()));
+            rest = &rest[consumed..];
+        }
     }
 }
 
-/// Split a line by IFS characters, filtering empty fields.
+/// Remove backslash escapes from a `read` record (used when `-r` is absent).
+/// A backslash escapes the next character whether or not it is an IFS
+/// character; a trailing backslash escapes nothing and is kept.
+fn unescape_read_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// IFS characters that are also whitespace delimit runs rather than single
+/// fields, and are ignored at the start and end of a record.
+fn is_ifs_whitespace(c: char, ifs: &str) -> bool {
+    (c == ' ' || c == '\t' || c == '\n') && ifs.contains(c)
+}
+
+/// Extract the next field from `line`, returning the field text and the byte
+/// offset just past the delimiter that ended it. Leading IFS whitespace is
+/// skipped, and a run of IFS whitespace counts as a single delimiter.
+fn take_read_field(line: &str, ifs: &str) -> (String, usize) {
+    if ifs.is_empty() {
+        return (line.to_string(), line.len());
+    }
+    let is_delim = |c: char| ifs.contains(c);
+    let mut chars = line.char_indices().peekable();
+    while let Some(&(_, c)) = chars.peek() {
+        if is_ifs_whitespace(c, ifs) {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    let start = chars.peek().map_or(line.len(), |&(i, _)| i);
+    let mut end = start;
+    while let Some(&(i, c)) = chars.peek() {
+        if is_delim(c) {
+            break;
+        }
+        end = i + c.len_utf8();
+        chars.next();
+    }
+    let field = line[start..end].to_string();
+    while let Some(&(_, c)) = chars.peek() {
+        if is_ifs_whitespace(c, ifs) {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if let Some(&(_, c)) = chars.peek() {
+        if is_delim(c) {
+            chars.next();
+        }
+    }
+    let consumed = chars.peek().map_or(line.len(), |&(i, _)| i);
+    (field, consumed)
+}
+
+/// Split a line by IFS characters, filtering empty fields (used by `read -a`).
 fn ifs_split_fields<'a>(state: &ShellState, line: &'a str) -> Vec<&'a str> {
     let ifs = state
         .get_var("IFS")

@@ -1,0 +1,34 @@
+[test]
+name = "heredoc-arithmetic-and-command-substitution"
+tags = ["heredoc", "expansion", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["heredoc", "parameter-expansion", "arithmetic-expansion", "command-substitution", "cat"]
+
+# An unquoted here-doc body expands `$var`, `${...}`, `$(( ))`, `$(...)` and
+# backticks. Previously only `$var` was expanded; arithmetic and command
+# substitution were emitted literally. A quoted delimiter still suppresses all
+# expansion.
+[input]
+script = """
+v=world
+cat <<EOF
+var=$v
+arith=$((2 + 3))
+nested=$(( $(echo 4) + 1 ))
+cmd=$(echo hi)
+tick=`echo tk`
+EOF
+cat <<"EOF"
+raw=$v
+EOF
+"""
+
+[expect]
+status = 0
+stdout = "var=world\narith=5\nnested=5\ncmd=hi\ntick=tk\nraw=$v\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

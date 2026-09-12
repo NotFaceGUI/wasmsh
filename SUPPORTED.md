@@ -621,6 +621,36 @@ A follow-up differential audit against the in-process runtime
   splitting is now quote-aware, and `"${arr[@]}"` / `"$@"` yield one field per
   element.
 
+### Fixed in the audit-driven pass (v0.9.2)
+
+A differential audit that used wasmsh as the only bash sandbox reported a batch
+of divergences. Re-testing the "kills the whole process" class directly showed
+none of those triggers terminates the runtime; the real defects were silent
+wrong results and scope leaks. Each is guarded by a case in
+`tests/suite/differential/`:
+
+- `sed 's/^/X/'` dropped the first character (the regex engine treats a leading
+  `^` as consuming); `s/[[:space:]]*$//` left trailing space; `s/a*/Y/g` swallowed
+  the character after a zero-width match. `^`/`$` are now line anchors enforced
+  by the caller, and zero-width global matches follow sed's suppression rule.
+- Pathname expansion was word-scoped: `"$dir"/*.sh` did not glob, and an
+  unquoted `$p` whose value contained `*` did not glob. Quoting is now a
+  per-byte mask, so quoted bytes stay literal while unquoted metacharacters
+  remain active; `\*` matches a literal asterisk.
+- `${v: -2}` and `${v:1:-2}` (negative string offset/length) returned empty.
+- An unquoted here-document did not expand `$(( ))`, `$( )` or backticks.
+- A child shell (`sh -c`, `sh file`) inherited the caller's `set -u`/`-e`/
+  `pipefail`; bash resets them. A child shell now starts with default options.
+- A fatal expansion (nounset, `${x:?}`, recursion) or `exit` inside `( … )`
+  ended the whole runtime instead of just the subshell.
+- Functions and aliases defined in `( … )` leaked into the parent.
+- `trap … EXIT` set inside a child `sh script` never fired.
+- `read` re-joined IFS-split fields with spaces, corrupting tab-separated data,
+  and ignored `-r`. Separators are preserved and `-r`/backslash semantics work.
+- `printf -- '%s\n' x` printed the literal format `--`.
+- `xargs -I{}` (attached replacement string) was a parse error.
+- `cmp` did not accept `-` for standard input.
+
 ### Remaining known divergences (not yet fixed)
 
 - `${arr[@]:1:-1}` (negative slice length on an array): bash reports an error,
@@ -631,6 +661,8 @@ A follow-up differential audit against the in-process runtime
 - `readonly` assignment fails the command with status 1 but does not abort a
   script; bash's abort behaviour here is inconsistent (it depends on `;` versus
   newline separation), so wasmsh uses the predictable non-fatal form.
+- `$((1/0))` and unbounded recursion recover with a non-zero status where bash
+  aborts the shell or overflows the stack; wasmsh is the more forgiving of the two.
 
 ---
 

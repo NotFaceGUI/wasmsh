@@ -1,0 +1,26 @@
+[test]
+name = "cmp-reads-stdin-from-dash"
+tags = ["cmp", "stdin", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["cmp", "printf", "base64"]
+
+# POSIX cmp treats `-` as standard input, which is how binary round-trip checks
+# compare a decoded stream against the original file.
+[input]
+script = """
+printf 'payload' > ref.bin
+printf 'payload' | cmp -s - ref.bin
+echo "same rc=$?"
+printf 'different' | cmp -s - ref.bin
+echo "diff rc=$?"
+"""
+
+[expect]
+status = 0
+stdout = "same rc=0\ndiff rc=1\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

@@ -1,0 +1,25 @@
+[test]
+name = "xargs-attached-replace-string"
+tags = ["xargs", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["xargs", "find", "basename", "mkdir", "printf"]
+
+# GNU xargs accepts the replacement string attached to `-I` (`-I{}`), which is the
+# form almost every real script uses; the separated form `-I {}` must keep working.
+[input]
+script = """
+mkdir -p d
+printf 'x\\n' > d/one.txt
+find d -name 'one.txt' | xargs -I{} basename {}
+find d -name 'one.txt' | xargs -I {} basename {}
+"""
+
+[expect]
+status = 0
+stdout = "one.txt\none.txt\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

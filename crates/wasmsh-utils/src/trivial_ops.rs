@@ -464,6 +464,51 @@ pub(crate) fn util_cmp(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
         return 2;
     }
 
+    // `-` denotes standard input (POSIX cmp).
+    if args[0] == "-" || args[1] == "-" {
+        let mut stdin_data1 = Vec::new();
+        let mut stdin_data2 = Vec::new();
+        if args[0] == "-" {
+            let Some(mut stdin) = ctx.stdin.take() else {
+                ctx.output.stderr(b"cmp: missing operand\n");
+                return 2;
+            };
+            if stdin.read_to_end(&mut stdin_data1).is_err() {
+                ctx.output.stderr(b"cmp: error reading stdin\n");
+                return 2;
+            }
+        }
+        if args[1] == "-" {
+            let Some(mut stdin) = ctx.stdin.take() else {
+                ctx.output.stderr(b"cmp: missing operand\n");
+                return 2;
+            };
+            if stdin.read_to_end(&mut stdin_data2).is_err() {
+                ctx.output.stderr(b"cmp: error reading stdin\n");
+                return 2;
+            }
+        }
+        let data1 = if args[0] == "-" {
+            stdin_data1
+        } else {
+            let path1 = resolve_path(ctx.cwd, args[0]);
+            match read_file_bytes(ctx, &path1, args[0]) {
+                Some(data) => data,
+                None => return 2,
+            }
+        };
+        let data2 = if args[1] == "-" {
+            stdin_data2
+        } else {
+            let path2 = resolve_path(ctx.cwd, args[1]);
+            match read_file_bytes(ctx, &path2, args[1]) {
+                Some(data) => data,
+                None => return 2,
+            }
+        };
+        return cmp_data(ctx, &data1, &data2, args[0], args[1], silent, verbose);
+    }
+
     let path1 = resolve_path(ctx.cwd, args[0]);
     let path2 = resolve_path(ctx.cwd, args[1]);
 

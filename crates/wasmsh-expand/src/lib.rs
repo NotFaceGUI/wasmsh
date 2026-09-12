@@ -73,21 +73,85 @@ pub struct ExpandedWord {
     /// True when the original word contained any quoting (single, double, or escape).
     /// Brace expansion must be suppressed for quoted words.
     pub was_quoted: bool,
+    /// One flag per byte of `text`: `true` when that byte came from a quoted
+    /// part and must therefore be treated literally by pathname expansion.
+    /// Empty when the caller does not need per-character quoting.
+    pub literal: Vec<bool>,
+}
+
+/// Expand a part, recording per-byte quoting for pathname expansion.
+///
+/// Quoting is inherited (a `Literal` inside `DoubleQuoted` is literal), while
+/// an unquoted `$param` contributes glob-active text — bash applies pathname
+/// expansion to the result of an unquoted parameter expansion.
+fn expand_part_masked(
+    part: &WordPart,
+    state: &mut ShellState,
+    text: &mut String,
+    mask: &mut Vec<bool>,
+    quoted: bool,
+    depth: usize,
+) {
+    if depth > MAX_EXPAND_DEPTH {
+        return;
+    }
+    match part {
+        WordPart::Literal(s) => push_masked(text, mask, s, quoted),
+        WordPart::SingleQuoted(s) => push_masked(text, mask, s, true),
+        WordPart::DoubleQuoted(parts) => {
+            for p in parts {
+                expand_part_masked(p, state, text, mask, true, depth + 1);
+            }
+        }
+        WordPart::Parameter(name) => {
+            let mut value = String::new();
+            expand_parameter(name, state, &mut value, depth + 1);
+            push_masked(text, mask, &value, quoted);
+        }
+        WordPart::Arithmetic(expr) => {
+            let value = eval_arithmetic(expr, state).to_string();
+            push_masked(text, mask, &value, quoted);
+        }
+        // Command and process substitution are resolved by the runtime before
+        // pathname expansion; nothing to emit here.
+        _ => {}
+    }
+}
+
+fn push_masked(text: &mut String, mask: &mut Vec<bool>, value: &str, literal: bool) {
+    text.push_str(value);
+    mask.resize(mask.len() + value.len(), literal);
+}
+
+fn expand_word_masked(word: &Word, state: &mut ShellState) -> (String, Vec<bool>) {
+    let mut text = String::new();
+    let mut mask = Vec::new();
+    for part in &word.parts {
+        expand_part_masked(part, state, &mut text, &mut mask, false, 0);
+    }
+    if text.starts_with('~') && (text == "~" || text.starts_with("~/")) {
+        if let Some(home) = state.get_var("HOME") {
+            let rest = text[1..].to_string();
+            text = format!("{home}{rest}");
+            mask = vec![false; text.len()];
+        }
+    }
+    (text, mask)
 }
 
 /// Expand a list of words for argv, preserving quote metadata so the
-/// runtime can skip brace expansion on quoted arguments.
+/// runtime can skip brace expansion on quoted arguments and apply glob
+/// expansion per character rather than per word.
 pub fn expand_words_argv(words: &[Word], state: &mut ShellState) -> Vec<ExpandedWord> {
     words
         .iter()
         .map(|w| {
-            let was_quoted = w
-                .parts
-                .iter()
-                .any(|p| matches!(p, WordPart::SingleQuoted(_) | WordPart::DoubleQuoted(_)));
+            let (text, literal) = expand_word_masked(w, state);
+            let was_quoted = literal.iter().any(|&b| b);
             ExpandedWord {
-                text: expand_word(w, state),
+                text,
                 was_quoted,
+                literal,
             }
         })
         .collect()
@@ -526,30 +590,55 @@ fn try_expand_substring(name: &str, state: &ShellState, out: &mut String) -> boo
     if rest.starts_with(['-', '=', '+', '?']) {
         return false;
     }
-    // Check it's a numeric offset (arithmetic expressions are not supported).
-    let is_numeric = rest.starts_with(|c: char| c.is_ascii_digit());
+    // A negative offset must be separated from the colon by whitespace
+    // (`${var: -2}`) — with no space, the `-` is a default-value operator.
+    // Arithmetic expressions are not supported; offsets and lengths are
+    // parsed as signed integers, and a negative length counts back from the
+    // end of the value (`${var:1:-2}`).
+    let trimmed = rest.trim_start();
+    let leading_ws = trimmed.len() != rest.len();
+    let is_numeric = trimmed.starts_with(|c: char| c.is_ascii_digit())
+        || (leading_ws && trimmed.starts_with('-'));
     if !is_numeric {
         return false;
     }
     let Some(val) = state.get_var(var_name) else {
         return true; // Handled but empty
     };
-    let (offset_str, length_str) = if let Some(sep) = rest.find(':') {
-        (&rest[..sep], Some(&rest[sep + 1..]))
+    let (offset_str, length_str) = if let Some(sep) = trimmed.find(':') {
+        (&trimmed[..sep], Some(&trimmed[sep + 1..]))
     } else {
-        (rest, None)
+        (trimmed, None)
     };
-    let offset: usize = offset_str.parse().unwrap_or(0);
-    let s = val.as_str();
-    if offset <= s.len() {
-        let substr = &s[offset..];
-        if let Some(len_s) = length_str {
-            let len: usize = len_s.parse().unwrap_or(substr.len());
-            out.push_str(&substr[..len.min(substr.len())]);
-        } else {
-            out.push_str(substr);
-        }
+    let chars: Vec<char> = val.chars().collect();
+    let len = i64::try_from(chars.len()).unwrap_or(i64::MAX);
+    let offset: i64 = offset_str.trim().parse().unwrap_or(0);
+    if offset < 0 && len + offset < 0 {
+        // A negative offset beyond the start of the value yields nothing
+        // (bash: `${v: -7}` on a 6-character value is empty).
+        return true;
     }
+    let start = if offset < 0 {
+        (len + offset).max(0)
+    } else {
+        offset.min(len)
+    };
+    let end = match length_str {
+        Some(spec) => {
+            let count: i64 = spec.trim().parse().unwrap_or(len - start);
+            if count < 0 {
+                (len + count).max(start)
+            } else {
+                (start + count).min(len)
+            }
+        }
+        None => len,
+    };
+    let start = usize::try_from(start).unwrap_or(chars.len());
+    let end = usize::try_from(end.max(0))
+        .unwrap_or(chars.len())
+        .min(chars.len());
+    out.extend(chars[start..end].iter());
     true
 }
 
@@ -621,6 +710,33 @@ fn scan_braced_param(bytes: &[u8], mut pos: usize) -> (usize, usize) {
     (end, pos)
 }
 
+/// Scan a `$(( ... ))` arithmetic expansion. `pos` points at the first `(`
+/// of the opening pair. Returns the index of the first `)` of the closing
+/// pair, so the inner expression is `bytes[pos + 2 .. end]`. Returns `None`
+/// when unbalanced.
+fn scan_arith_expansion(bytes: &[u8], pos: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = pos + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return if bytes.get(i + 1) == Some(&b')') {
+                        Some(i)
+                    } else {
+                        None
+                    };
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Scan a bare `$name` (alphanumeric + underscore) starting at `pos`. Returns `(end, new_pos)`.
 fn scan_bare_var(bytes: &[u8], mut pos: usize) -> usize {
     while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
@@ -669,6 +785,18 @@ fn expand_dollar_in_operand(
             out,
             depth + 1,
         );
+    } else if *pos + 1 < bytes.len() && bytes[*pos] == b'(' && bytes[*pos + 1] == b'(' {
+        // `$((expr))` arithmetic expansion inside raw text (here-doc bodies).
+        // The parser normally produces a dedicated `Arithmetic` part; this
+        // path exists for text that never goes through the word parser.
+        if let Some(end) = scan_arith_expansion(bytes, *pos) {
+            let inner = &operand[*pos + 2..end];
+            *pos = end + 2;
+            let value = eval_arithmetic(inner, state);
+            out.push_str(&value.to_string());
+        } else {
+            out.push('$');
+        }
     } else if *pos < bytes.len() && (bytes[*pos].is_ascii_alphabetic() || bytes[*pos] == b'_') {
         let start = *pos;
         *pos = scan_bare_var(bytes, *pos);

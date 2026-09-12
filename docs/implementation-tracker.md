@@ -106,3 +106,25 @@
 - **发布结果**：`Standalone Release` run `34681588108` 全绿——Validate release source（2m11s，在 ubuntu-24.04 上跑 workspace 测试 + suite_runner + clippy -D warnings）→ Build release candidate（5m32s）→ Release host consumption ubuntu-24.04 / macos-15 / windows-2025 三平台全过 → Verify release candidate → Upload tested release artifact → **Publish standalone GitHub Release**。Release v0.9.1 已创建，asset：`wasmsh-standalone-0.9.1-5730aa520b4f.tar.gz`（3,860,855 bytes）。
 - **真实 WASM 产物复核**（此前只在原生内核验证，本轮补齐）：下载 Release 资产解包，用 `nodejs/` loader 在同一 `WasmShell` 会话内实测——四种深层嵌套（算术 2000 层、awk 400 层、命令替换 200 层、`if` 200 层）全部返回普通错误，且随后的 `echo SESSION_ALIVE` 正常执行，证明实例不再被 trap 永久毒化；`return` 正确解绑（`a`/`done`）、`$((1/0))` 返回 st=1 并写 stderr、`echo a#b` → `a#b`、`$(( $1 + 1 ))` → 8、`"${a[@]}"` → `[x][y][z]`、反引号 → `[bt]`、`printf 'A\101B\n'` → `AAB`，均在真实 WASM 上确认。
 - **发布产物校验**：`build-manifest.json` version=0.9.1、ref=v0.9.1、commit=5730aa520b4f。
+
+
+## 11. v0.9.2 —— 沙箱差分审计驱动的语义修复（2026-09-12 续）
+
+触发：一次以 wasmsh 为唯一 bash 沙箱的多阶段审计交付中，harness 报告了一批"进程级致命"与"静默错结果"。本轮先**直接复现**再动手：把所有"致命"触发逐条作为脚本跑真实内核并与真实 bash 对拍，结论与报告相反——14 条"进程级致命"里没有一条会终止运行时（详见审计交付 `DIVERGENCES.md` 第 1 节与 `cases-fatal/VERIFICATION.txt`）。真正需要修的是若干**静默错结果**与**作用域**缺陷。
+
+- **更正的前提**：此前认为 command-not-found、`set -e`、`set -o pipefail`、`${PIPESTATUS[*]}`、`set -u`、`${x:?}`、`$((1/0))`、脚本以非零结尾、脚本内 `exit N`、函数体内 `grep` 无匹配、`trap EXIT`、递归、`set -o noclobber`、`>(...)` 会杀死整个进程。逐条复测均不成立（`$((1/0))` 与递归是"更宽容"而非致命）。审计侧据此取消了全部 fixture 排除，PD2 由 49/60 变为 60/60。
+- **sed（`streaming_sed.rs`）**：`s/^/X/` 丢首字符（`^` 被 `posix-regex` 当作消耗一个字符）、行尾 `[[:space:]]*$` 不裁剪、`s/a*/Y/g` 零宽匹配多吞一个字符。改为把 `^`/`$` 拆出作为**行首/行尾约束**由调用方判定，零宽匹配后按 sed 规则抑制紧随的非空匹配。
+- **路径展开（`expand` + `runtime` + `pattern`）**：引号是"整词"而非"逐字符"，导致 `"$dir"/*.sh` 完全不展开；未加引号的 `$p`（值内含 `*`）也不展开（VM 子集把裸 `Parameter` 当安全词）。改为逐字节引号掩码 + 掩码内转义元字符，并让含未引号参数/算术的词走完整解释器；glob 匹配器支持 `\*` 字面量。
+- **参数切片（`expand`）**：`${v: -2}`、`${v:1:-2}` 返回空。负偏移/负长度改为从末尾计数，越界按 bash 返回空。
+- **here-doc（`expand` + `runtime`）**：未加引号的 here-doc 不展开 `$(( ))`、`$( )` 与反引号；顺带修正 `scan_arith_double_paren` 把 `$((7))` 误判为 `$( (7) )` 的扫描错位。
+- **子 shell 作用域（`runtime`）**：`sh -c`/`sh file` 继承调用者的 `set -u/-e/pipefail`（bash 会重置）；子 shell 内的致命展开（nounset、`${x:?}`、递归耗尽）或 `exit` 会终止**整个运行时**；`( … )` 内定义的函数/别名泄漏到父级；子 shell 的 `trap … EXIT` 从不触发。分别以"新进程重置 set 选项""子 shell 内捕获 exit_requested 并还原""子 shell 保存/恢复 functions+aliases""孤立子 shell 结束时补跑 EXIT trap"修复。
+- **`read`（`wasmsh-builtins`）**：按 IFS 拆分后把字段用空格重新拼接，**破坏制表符分隔数据**（`read -r a rest` 得 `b c` 而非 `b	c`）；`-r` 被忽略。改为保留分隔符原文、实现 `-r` 与反斜杠转义语义。对 TSV/ETL 场景影响最直接。
+- **`printf --`**：未把 `--` 当作选项终止符，`printf -- '%s
+' x` 打印字面量 `--`。
+- **`xargs -I{}`（`data_ops`）**：只支持分离形式 `-I {}`，GNU 的粘连形式 `-I{}` 报解析错。
+- **`cmp`（`trivial_ops`）**：不支持 `-` 表示 stdin，二进制往返校验无法用管道完成。
+- **新增差分用例（11 个，均先红后绿并与真实 bash 逐字节对拍）**：`sed_line_anchors`、`glob_quoting_mask`、`param_substring_negative`、`heredoc_expansions`、`child_shell_option_isolation`、`child_shell_exit_trap`、`subshell_scopes_fatal_and_functions`、`read_preserves_separators`、`printf_double_dash`、`xargs_attached_replace`、`cmp_stdin_dash`。
+- **`tools/bump-version.sh`**：此前遗漏两个 langchain 包，v0.9.1 只能手工补；现已把 npm/python 的 `langchain-wasmsh` 纳入循环。
+- **发布**：`tools/bump-version.sh 0.9.2` 同步全部 manifest（Cargo workspace + 内部 pin 17 处、pyodide crates、npm/python 四个包、Helm `appVersion`）；三个 Cargo.lock 仅移动 workspace 成员自身版本，第三方 pin 未浮动。
+- **本地证据（本轮）**：`cargo test --workspace --locked` 全绿；`cargo test -p wasmsh-testkit --test suite_runner --locked` 全绿（含新增 11 个差分用例）；`cargo clippy --workspace --all-targets --locked -- -D warnings` 干净；`cargo fmt --all` 干净。
+- **审计交付侧**：`E:\Work\work\sh-audit` 的 `build.sh` 重新自包含（26 个 heredoc 全部与宿主逐字节一致），修正 6 条错误的期望值、把硬编码的 "PROCESS-FATAL" 探针改为真实执行、修正分类器（表头误计 + 未写 `pg2.lang.status`），并按实测重写 `DIVERGENCES.md`/`README.md`。整条流水线现在**单次调用**跑完，`RUN-ALL.status=0`、PG2 60/60、`test_cases` 27/27、`verify` 18/18。

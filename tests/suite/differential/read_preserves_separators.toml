@@ -1,0 +1,25 @@
+[test]
+name = "read-preserves-field-separators"
+tags = ["read", "ifs", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["read", "printf"]
+
+# `read` splits on IFS but must not rewrite the text: a tab-separated record read
+# into one variable stays tab-separated, and the last of several names receives the
+# remainder with its original separators.
+[input]
+script = """
+printf 'a\\tb\\tc\\n' | { read -r whole; echo "[$whole]"; }
+printf 'a\\tb\\tc\\n' | { read -r first rest; echo "first=[$first] rest=[$rest]"; }
+printf 'a b   c\\n' | { read -r p q; echo "p=[$p] q=[$q]"; }
+"""
+
+[expect]
+status = 0
+stdout = "[a\tb\tc]\nfirst=[a] rest=[b\tc]\np=[a] q=[b   c]\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

@@ -1,0 +1,28 @@
+[test]
+name = "sed-line-anchors-and-zero-width-matches"
+tags = ["sed", "regex", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["sed", "printf"]
+
+# `^` and `$` are zero-width line anchors. The bundled regex engine treats a
+# leading `^` as a consuming element, which produced `Xb` for `s/^/X/` on `ab`,
+# and a zero-width global match used to swallow the following character
+# (`s/a*/Y/g` on `baaab` produced `YYYY` instead of `YbYbY`).
+[input]
+script = """
+printf 'ab\\n' | sed 's/^/X/'
+printf 'ab\\n' | sed 's/$/Z/'
+printf 'abc   \\n' | sed 's/[[:space:]]*$//'
+printf 'baaab\\n' | sed 's/a*/Y/g'
+printf 'apple\\n' | sed 's/^a/A/'
+"""
+
+[expect]
+status = 0
+stdout = "Xab\nabZ\nabc\nYbYbY\nApple\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

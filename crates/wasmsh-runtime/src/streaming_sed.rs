@@ -214,56 +214,182 @@ fn streaming_sed_addr_matches(
     }
 }
 
+/// Split sed's line anchors off a BRE pattern.
+///
+/// `posix-regex` does not treat `^`/`$` as zero-width anchors on a subject
+/// line: a leading `^` consumes one character, so `s/^/X/` on `ab` left `Xb`.
+/// A sed script is applied once per line, so the anchors are enforced by the
+/// caller as start/end constraints instead of being handed to the regex.
+fn streaming_sed_split_anchors(pattern: &str) -> (&str, bool, bool) {
+    let mut pat = pattern;
+    let anchored_start = pat.starts_with('^');
+    if anchored_start {
+        pat = &pat[1..];
+    }
+    let anchored_end = streaming_sed_has_trailing_anchor(pat);
+    if anchored_end {
+        pat = &pat[..pat.len() - 1];
+    }
+    (pat, anchored_start, anchored_end)
+}
+
+/// True when `pattern` ends with an unescaped `$` anchor. An odd number of
+/// preceding backslashes escapes the `$` into a literal dollar.
+fn streaming_sed_has_trailing_anchor(pattern: &str) -> bool {
+    if !pattern.ends_with('$') {
+        return false;
+    }
+    let bytes = pattern.as_bytes();
+    let mut backslashes = 0usize;
+    let mut i = bytes.len() - 1;
+    while i > 0 && bytes[i - 1] == b'\\' {
+        backslashes += 1;
+        i -= 1;
+    }
+    backslashes.is_multiple_of(2)
+}
+
+struct SedMatch {
+    start: usize,
+    end: usize,
+    groups: Vec<Option<(usize, usize)>>,
+}
+
+/// Find the next acceptable match at or after `from`. `posix-regex` returns
+/// the leftmost match in the slice it is given, so a match rejected by an
+/// anchor constraint is retried one character later. Group offsets are
+/// returned relative to `text`.
+fn streaming_sed_find_match(
+    text: &str,
+    from: usize,
+    re: &posix_regex::PosixRegex<'_>,
+    anchored_start: bool,
+    anchored_end: bool,
+) -> Option<SedMatch> {
+    let len = text.len();
+    let mut pos = if anchored_start { 0 } else { from };
+    loop {
+        if pos > len {
+            return None;
+        }
+        let remaining = &text[pos..];
+        if let Some(caps) = re.matches(remaining.as_bytes(), Some(1)).into_iter().next() {
+            if let Some((rs, re_end)) = caps.first().copied().flatten() {
+                let start = pos + rs;
+                let end = pos + re_end;
+                let start_ok = !anchored_start || start == 0;
+                let end_ok = !anchored_end || end == len;
+                if start_ok && end_ok {
+                    let groups = caps
+                        .iter()
+                        .map(|g| g.map(|(s, e)| (pos + s, pos + e)))
+                        .collect();
+                    return Some(SedMatch { start, end, groups });
+                }
+            }
+        }
+        if anchored_start || pos == len {
+            return None;
+        }
+        pos += text[pos..].chars().next().map_or(1, char::len_utf8);
+    }
+}
+
 /// Perform a sed `s///` substitution with POSIX BRE regex support.
 /// Falls back to literal replacement if the pattern fails to compile.
-///
-/// For global (`g`) replacements we iterate one match at a time because
-/// `posix-regex`'s `matches()` may return fewer results than expected
-/// for simple patterns — the safe approach is to find-then-advance in
-/// a loop.
 fn streaming_sed_substitute(text: &str, pattern: &str, replacement: &str, global: bool) -> String {
     use posix_regex::compile::PosixRegexBuilder;
 
-    let compiled = PosixRegexBuilder::new(pattern.as_bytes())
+    let (bare_pattern, anchored_start, anchored_end) = streaming_sed_split_anchors(pattern);
+
+    if bare_pattern.is_empty() {
+        return streaming_sed_substitute_empty(text, replacement, anchored_start, anchored_end);
+    }
+
+    match PosixRegexBuilder::new(bare_pattern.as_bytes())
         .with_default_classes()
-        .compile();
+        .compile()
+    {
+        Ok(re) => streaming_sed_substitute_regex(
+            text,
+            &re,
+            replacement,
+            global,
+            anchored_start,
+            anchored_end,
+        ),
+        Err(_) => {
+            if global {
+                text.replace(bare_pattern, replacement)
+            } else {
+                text.replacen(bare_pattern, replacement, 1)
+            }
+        }
+    }
+}
 
-    let Ok(re) = compiled else {
-        // Fall back to literal replacement.
-        return if global {
-            text.replace(pattern, replacement)
+/// A zero-width BRE. `^` selects the start of the line, `$` the end; `^$`
+/// matches only an empty line.
+fn streaming_sed_substitute_empty(
+    text: &str,
+    replacement: &str,
+    anchored_start: bool,
+    anchored_end: bool,
+) -> String {
+    if anchored_start && anchored_end {
+        return if text.is_empty() {
+            replacement.to_string()
         } else {
-            text.replacen(pattern, replacement, 1)
+            text.to_string()
         };
-    };
+    }
+    let at = if anchored_end { text.len() } else { 0 };
+    let mut out = String::with_capacity(text.len() + replacement.len());
+    out.push_str(&text[..at]);
+    out.push_str(replacement);
+    out.push_str(&text[at..]);
+    out
+}
 
+fn streaming_sed_substitute_regex(
+    text: &str,
+    re: &posix_regex::PosixRegex<'_>,
+    replacement: &str,
+    global: bool,
+    anchored_start: bool,
+    anchored_end: bool,
+) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
+    // sed suppresses a zero-width match immediately after a non-empty one, so
+    // `s/a*/Y/g` over `baaab` yields `YbYbY` rather than `YbYYbY`.
+    let mut suppress_empty_here = false;
 
-    loop {
-        if cursor > text.len() {
-            break;
+    while let Some(m) = streaming_sed_find_match(text, cursor, re, anchored_start, anchored_end) {
+        if m.start == m.end && suppress_empty_here && m.start == cursor {
+            if cursor >= text.len() {
+                break;
+            }
+            let ch = text[cursor..].chars().next().unwrap_or('\0');
+            out.push(ch);
+            cursor += ch.len_utf8();
+            suppress_empty_here = false;
+            continue;
         }
-        let remaining = &text.as_bytes()[cursor..];
-        let matches = re.matches(remaining, Some(1));
-        let Some(caps) = matches.into_iter().next() else {
+        out.push_str(&text[cursor..m.start]);
+        streaming_sed_expand_replacement(&mut out, replacement, text, &m.groups);
+        if m.end > m.start {
+            cursor = m.end;
+            suppress_empty_here = true;
+        } else if m.start >= text.len() {
+            cursor = m.end;
             break;
-        };
-        let Some(Some((rel_start, rel_end))) = caps.first().copied() else {
-            break;
-        };
-        let abs_start = cursor + rel_start;
-        let abs_end = cursor + rel_end;
-
-        out.push_str(&text[cursor..abs_start]);
-        // Expand replacement template with captures relative to `remaining`.
-        streaming_sed_expand_replacement(&mut out, replacement, &text[cursor..], &caps);
-        cursor = if abs_end == abs_start {
-            abs_end + 1
         } else {
-            abs_end
-        };
-
+            let ch = text[m.start..].chars().next().unwrap_or('\0');
+            out.push(ch);
+            cursor = m.start + ch.len_utf8();
+            suppress_empty_here = false;
+        }
         if !global {
             break;
         }
@@ -278,14 +404,14 @@ fn streaming_sed_substitute(text: &str, pattern: &str, replacement: &str, global
 fn streaming_sed_expand_replacement(
     out: &mut String,
     template: &str,
-    subject: &str,
-    caps: &[Option<(usize, usize)>],
+    text: &str,
+    groups: &[Option<(usize, usize)>],
 ) {
     let mut chars = template.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\\' => streaming_sed_expand_escape(out, &mut chars, subject, caps),
-            '&' => streaming_sed_expand_whole_match(out, subject, caps),
+            '\\' => streaming_sed_expand_escape(out, &mut chars, text, groups),
+            '&' => streaming_sed_expand_whole_match(out, text, groups),
             other => out.push(other),
         }
     }
@@ -294,8 +420,8 @@ fn streaming_sed_expand_replacement(
 fn streaming_sed_expand_escape(
     out: &mut String,
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    subject: &str,
-    caps: &[Option<(usize, usize)>],
+    text: &str,
+    groups: &[Option<(usize, usize)>],
 ) {
     let Some(&next) = chars.peek() else {
         out.push('\\');
@@ -303,8 +429,8 @@ fn streaming_sed_expand_escape(
     };
     if let Some(digit) = next.to_digit(10) {
         chars.next();
-        if let Some(Some((s, e))) = caps.get(digit as usize).copied() {
-            out.push_str(&subject[s..e]);
+        if let Some(Some((s, e))) = groups.get(digit as usize).copied() {
+            out.push_str(text.get(s..e).unwrap_or(""));
         }
         return;
     }
@@ -320,11 +446,11 @@ fn streaming_sed_expand_escape(
 
 fn streaming_sed_expand_whole_match(
     out: &mut String,
-    subject: &str,
-    caps: &[Option<(usize, usize)>],
+    text: &str,
+    groups: &[Option<(usize, usize)>],
 ) {
-    if let Some(Some((s, e))) = caps.first().copied() {
-        out.push_str(&subject[s..e]);
+    if let Some(Some((s, e))) = groups.first().copied() {
+        out.push_str(text.get(s..e).unwrap_or(""));
     }
 }
 

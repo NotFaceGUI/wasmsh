@@ -348,6 +348,13 @@ fn parse_xargs_opts<'a>(argv: &'a [&'a str]) -> XargsOpts<'a> {
         if arg == "-I" && i + 1 < argv.len() {
             opts.replace_str = Some(argv[i + 1]);
             i += 2;
+        } else if let Some(replace) = arg.strip_prefix("-I") {
+            // Attached form: `xargs -I{} cmd` (GNU xargs).
+            if replace.is_empty() {
+                break;
+            }
+            opts.replace_str = Some(replace);
+            i += 1;
         } else if arg == "-n" && i + 1 < argv.len() {
             opts.max_args = argv[i + 1].parse().ok();
             i += 2;

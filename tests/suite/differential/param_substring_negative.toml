@@ -1,0 +1,28 @@
+[test]
+name = "param-substring-negative-offset-and-length"
+tags = ["expansion", "parameter-substring", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["parameter-substring", "echo"]
+
+# A negative offset counts back from the end (`${v: -2}`) and a negative length
+# counts back from the end of the value (`${v:1:-2}`). An offset that reaches
+# past the start yields nothing. `${v:-2}` stays the default-value operator.
+[input]
+script = """
+v=abcdef
+echo "[${v: -2}]"
+echo "[${v:1:-2}]"
+echo "[${v:2:3}]"
+echo "[${v: -10}]"
+echo "[${v:-2}]"
+"""
+
+[expect]
+status = 0
+stdout = "[ef]\n[bcd]\n[cde]\n[]\n[abcdef]\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

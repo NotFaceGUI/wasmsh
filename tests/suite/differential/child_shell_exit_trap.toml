@@ -1,0 +1,27 @@
+[test]
+name = "child-shell-runs-its-own-exit-trap"
+tags = ["trap", "trap-exit", "subshell", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["trap", "trap-exit", "echo", "exit"]
+
+# `sh script` is a child process: a trap the child installs must fire when the
+# child ends, before the parent continues. Previously an isolated child run
+# never invoked its EXIT handler, so the trap fired only when the whole
+# runtime exited.
+[input]
+script = """
+printf "trap 'echo CHILD-EXIT' EXIT\\necho child-body\\n" > t.sh
+sh t.sh
+echo "rc=$?"
+echo parent-after
+"""
+
+[expect]
+status = 0
+stdout = "child-body\nCHILD-EXIT\nrc=0\nparent-after\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

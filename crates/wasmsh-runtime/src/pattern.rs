@@ -867,6 +867,15 @@ fn glob_step(pattern: &[u8], pi: usize, ch: u8) -> GlobPatternStep {
             let (new_pi, matched) = glob_match_char_class(pattern, pi + 1, ch);
             GlobPatternStep::Class(new_pi, matched)
         }
+        // A backslash quotes the next pattern byte, so `\*` matches a literal
+        // asterisk. A trailing backslash stands for itself.
+        b'\\' if pi + 1 < pattern.len() => {
+            if pattern[pi + 1] == ch {
+                GlobPatternStep::Consume(pi + 2)
+            } else {
+                GlobPatternStep::Mismatch
+            }
+        }
         literal if literal == ch => GlobPatternStep::Consume(pi + 1),
         _ => GlobPatternStep::Mismatch,
     }

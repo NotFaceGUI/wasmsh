@@ -1,0 +1,25 @@
+[test]
+name = "child-shell-starts-with-default-options"
+tags = ["child-shell", "set", "nounset", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["set", "nounset", "sh", "echo"]
+
+# `set -u`/`-e`/`pipefail` affect the shell that set them. A child shell (`sh -c`,
+# `sh file`) starts with the defaults, so an unset variable in the child is not an
+# error even when the parent ran `set -u`.
+[input]
+script = """
+set -u
+sh -c 'echo child-ok; echo "[$unset_here]"'
+echo "parent-after rc=$?"
+"""
+
+[expect]
+status = 0
+stdout = "child-ok\n[]\nparent-after rc=0\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

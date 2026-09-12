@@ -1,0 +1,27 @@
+[test]
+name = "subshell-contains-fatal-and-functions"
+tags = ["subshell", "nounset", "function", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["subshell", "nounset", "function", "echo"]
+
+# A fatal expansion inside `( … )` must end only the subshell, and a function
+# defined inside it must not survive into the parent.
+[input]
+script = """
+set -u
+( echo "[$missing]" ) 2>/dev/null
+echo "subshell rc=$?"
+( inner() { echo INNER; }; inner )
+inner 2>/dev/null
+echo "after rc=$?"
+"""
+
+[expect]
+status = 0
+stdout = "subshell rc=1\nINNER\nafter rc=127\n"
+
+[oracle]
+compare = true
+shells = ["bash"]
