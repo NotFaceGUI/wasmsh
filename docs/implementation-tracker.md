@@ -221,3 +221,13 @@
 - **"external 用不了管道，是唯一架构级改造"——不成立。** 注册宿主 executor（`host/node-external-host.mjs`）后 `printf hi | hostcat | wc -c` → `2`；流式/背压/提前结束/取消均已实现。黑盒测得"用不了"是因为没有注册 host executor。其"fd 桥接契约"在重新发明已交付能力。
 - **CI 的 target/feature/crate 名全推错——不成立。** 真实构建目标是 `wasm32-unknown-unknown`、crate 为 `wasmsh-browser`；workflow 已在 GitHub-hosted runner 上连续全绿（run `34689670098` / `34690078437`）。
 - **补充新发现**：`$SECONDS` 在单次 `exec` 内不推进（9.6s 原生忙等后仍为 `0`），只在顶层 `exec` 之间更新。这是真差异，但不在本次四条 P0 范围内，未修。
+
+## 19. v0.9.6 —— P0 修复与 AI shell skill 随产物发布（2026-09-12 续）
+
+- **提交**：`7c95be2` `fix(semantics): scope prefix assignments and close three shell divergences` → `c5e43f5` `docs: add an AI shell skill and ship it in the standalone artifact` → `21d3ec1` `chore(release): bump version to 0.9.6`；推送 `main` 后打 tag `v0.9.6`。
+- **新增 `SKILL.md`**：面向"把 wasmsh 当作自己执行环境的 AI 助手"的操作指南，而不是嵌入 API 参考。内容包括可依赖的 shell/工具/VFS 能力、最容易误判的能力边界（默认拒绝的网络、宿主注册的 external、无真实后台作业）、桩命令与限制的对照表、确定性契约和失败排查清单，并指向 `SUPPORTED.md`。
+- **纳入产物硬门禁**：`tools/standalone/package.mjs` 把 `SKILL.md` 拷进归档根；`verify-package.mjs` 将其列入 `requiredFiles`，缺失即让构建/发布失败（本地实测删除后报 `final artifact is missing SKILL.md`）；产物 `README.md` 与根 `README.md` 索引均加入链接。
+- **发布结果**：`Standalone Release` run `34693234336` 全绿（validate → build → verify → 三平台 host matrix → publish）；Release v0.9.6 已创建，asset `wasmsh-standalone-0.9.6-21d3ec108afa.tar.gz`（3,927,550 bytes，归档 SHA256 `92d57cdabfcecd60cde8a7cddf881e9846c4fe37076ac49a56a7665b58a62ad4`）。
+- **真实产物读回**：下载 Release 资产，归档 SHA256 与 GitHub digest 一致；`sha256sum -c SHA256SUMS` 32 项全 OK（含 `SKILL.md`）；`verify-package.mjs` 报 `verified 3 targets without Python/Pyodide runtime assets`；manifest version=0.9.6 / commit=21d3ec108afa / ref=v0.9.6 / run_id=34693234336 / `wasm-opt version 117` / 三 target 均 3,416,591 bytes；`node-smoke.mjs` 与 `external-smoke.mjs` 通过。
+- **P0 在正式产物上复核**：用 v0.9.6 的 `nodejs/` loader 实测 4 条全 PASS——跨 `exec` 不再泄漏（`V=1` → `V=`）、`sh -c 'cat' < f` 正确读 stdin、`"$@"` 多字段展开、`${v%%[ ]*}` 方括号类展开。
+- **未做**：本轮不含 `sleep`/`timeout` 真实时间语义、`&` 后台作业、`awk getline`、网络 `status:0` 加固；这些是"强化 A 通用"的后续候选，不是本轮发布范围。
