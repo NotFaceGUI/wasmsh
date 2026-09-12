@@ -61,7 +61,15 @@
 
 用户要求：把沙箱修到与真实 bash 语义一致，并由差分测试守护，不分阶段交付。
 
-本轮提交：本地 `main` 上的 `fix(semantics): bash differential hardening across shell, awk, and utils`（未推送；amend 会改变哈希，故此处按提交主题记录）。
+本轮提交：`97eebd1`（语义硬化）→ `3aeb107`（版本 0.9.0 + README）→ `ccd7837`/`f4e23ec`/`50092dc`（release 暴露问题的修复）。
+
+- **版本与发布（2026-09-12）**：`tools/bump-version.sh 0.9.0` 同步全部 manifest（Cargo workspace + 内部 pin、`wasmsh-pyodide`/`-probe`、npm/py 包、Helm `appVersion`），并同步 `langchain-wasmsh` 两个包的版本。README 去掉 “fork” 措辞、SUPPORTED 章节标题改为 `Delivery Status`。推送 `main` 并创建 `v0.9.0` tag，触发 `Standalone Release` workflow。
+- **release 暴露并修复的 3 个问题**：
+  1. `oracle.rs` 的 Git-for-Windows 回退用运行时 `cfg!(windows)` 守卫却调用 `#[cfg(windows)]` 函数，导致 **Linux 编译失败**；改为 cfg 守卫语句，并用 `--target x86_64-unknown-linux-gnu` 在本地交叉校验核心 crate 与 testkit 通过。
+  2. `line_continuation_before_redirect` 用例写 `/in.txt`、`/out.txt`，在 Linux 上真实 bash 无权限写根目录而失败；改为相对路径（wasmsh 用 VFS cwd、oracle 用临时目录，互不干扰且可移植）。
+  3. `bump-version.sh` 用 `cargo generate-lockfile` 会重新解析全部依赖，把 `wasm-bindgen` 从 0.2.127 浮动到 0.2.128，与 `versions.env` 固定的 `wasm-bindgen-cli 0.2.127` 不匹配，导致 `wasm-pack --mode no-install` 构建失败；改用 `cargo update --workspace` 只移动本地成员版本，并还原 lockfile。
+- **发布结果**：`Standalone Release` run 34675198161 全绿——validate（workspace 测试 + suite + clippy）→ build candidate → 三平台 host matrix（ubuntu/macos/windows）Node/bundler/external smoke → Verify release candidate → Upload tested artifact → **Publish standalone GitHub Release**（Release v0.9.0 已创建）。此前两次失败分别由上述第 1、2、3 点造成，均已修复后才重新打 tag。
+- **读回验证限制**：发布完成后本机 GitHub API/`gh` token 失效、curl TLS 抖动，无法再从本机读回 Release 元数据；发布成功的依据是 workflow 中 `Publish standalone GitHub Release` 任务的成功结论与 `git push` 的输出。
 
 - **C 类（用户未确认项）结论**：两项**都是 bug**。C20 `awk 'BEGIN{s="abc   "; sub(/ +$/,"",s)}'` 只删一个字符——根因是 `posix-regex` 对以 `$` 结尾的模式不做 POSIX 左最长匹配，已在 `regex_posix::find/leftmost_match` 用锚定回扫修正；C21 `awk 'BEGIN{printf "%c",65}'` 输出 `6`——`format_char_spec` 把数字当字符串取首字符，已改为把数字当字符码。另在 oracle 下**新发现**两条静默偏差并修复：`awk -F'\t'` 不解析转义（`decode_awk_escapes`）、`$(( ... $(cmd) ... ))` 忽略命令替换（运行期先解析）；以及 token 间 `\`+换行未作续行（`skip_blanks`）。
 
