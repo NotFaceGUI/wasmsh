@@ -1,0 +1,37 @@
+[test]
+name = "command-prefix-assignment-is-temporary"
+tags = ["assignment", "env", "prefix", "differential", "P0"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["echo", "export", "readonly"]
+
+# A prefix assignment (`V=1 cmd`) applies only to that command. Bash restores the
+# previous value (or unset state) once the command finishes; it must not leak into
+# the parent shell or a later command. `export V`/`readonly V` are the exception:
+# naming the variable there promotes the prefix value into the environment.
+[input]
+script = """
+V=1 echo hi
+echo "after echo=[$V]"
+V=1 :
+echo "after colon=[$V]"
+export V=0
+V=1 export W
+echo "export W leaves V=[$V] W=[$W]"
+V=1 export V
+echo "export V promotes V=[$V]"
+f() { echo "in f V=[$V]"; }
+V=1 f
+echo "after f V=[$V]"
+printf 'b\\n' | V=1 cat
+echo "after pipe V=[$V]"
+"""
+
+[expect]
+status = 0
+stdout = "hi\nafter echo=[]\nafter colon=[]\nexport W leaves V=[0] W=[]\nexport V promotes V=[1]\nin f V=[1]\nafter f V=[1]\nb\nafter pipe V=[1]\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

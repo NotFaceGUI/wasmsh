@@ -1,0 +1,28 @@
+[test]
+name = "child-shell-inherits-stdin-redirection"
+tags = ["sh", "stdin", "redirect", "subshell", "differential", "P0"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["children", "cat", "echo", "printf"]
+
+# `sh -c 'cat' < file` and `sh file < file` must forward the input redirection
+# into the child shell; the child's stdin is the redirected file, not the empty
+# inherited stream. Previously the redirection was dropped and `cat` failed with
+# "missing operand".
+[input]
+script = """
+printf 'one\\ntwo\\n' > /tmp/in.txt
+cat < /tmp/in.txt
+sh -c 'cat' < /tmp/in.txt
+printf 'cat' > /tmp/reader.sh
+sh /tmp/reader.sh < /tmp/in.txt
+"""
+
+[expect]
+status = 0
+stdout = "one\ntwo\none\ntwo\none\ntwo\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

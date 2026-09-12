@@ -1,0 +1,35 @@
+[test]
+name = "quoted-at-expands-to-one-field-per-parameter"
+tags = ["expansion", "positional", "at", "differential", "P0"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["printf", "set", "shift", "parameter-strip"]
+
+# `"$@"` expands to one field per positional parameter, and to zero fields when
+# there are none — it must not collapse into a single joined field. It also must
+# stay correct on the right-hand side of a pipe, where a function's positional
+# parameters come from its invocation (none here), not the pipeline.
+[input]
+script = """
+set -- a b c
+printf '[%s]\\n' "$@"
+g() { printf '<%s>\\n' "$@"; }
+g
+printf 'b\\n' | g
+g x y
+shift 2
+printf '(%s)\\n' "$@"
+set --
+printf '{%s}\\n' "$@"
+h() { cat "$@"; }
+printf 'stream\\n' | h
+"""
+
+[expect]
+status = 0
+stdout = "[a]\n[b]\n[c]\n<>\n<>\n<x>\n<y>\n(c)\n{}\nstream\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

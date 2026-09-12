@@ -27,9 +27,13 @@ protocol events, session isolation, and cooperative step-budget cancellation.
 The complete Node host tier adds live clock callbacks, structured network
 policy plus a redirect-aware broker, finite external commands, and progressive
 external pipelines. The final-artifact Node/bundler smoke and Playwright suite
-exercise these against a real build; that suite is wired into
-`.github/workflows/wasm-build.yml` but the cloud run is pending, so treat local
-Windows results as the only executed evidence so far. The browser worker has no
+exercise these against a real build, and that suite has run green in the cloud:
+`Standalone Release` run `34689670098` (tag `v0.9.5`) passed validate → build →
+verify → three-platform host matrix (ubuntu-24.04 / macos-15 / windows-2025) →
+publish, and `Standalone WASM` run `34690078437` passed on `main`. The `v0.9.5`
+Release asset was downloaded and re-verified locally (archive SHA256
+`cc2cc06cf972fe19bf8bda475fc33cb8a5ed36c3bb2dcfa779cc1bb062d0f7d8`, all
+`SHA256SUMS` OK, three target WASMs byte-identical). The browser worker has no
 native process executor.
 
 Known limits: the included browser network path refuses synchronous XHR because
@@ -37,8 +41,8 @@ it cannot enforce redirect policy before the next request; browser native
 external processes require a separate trusted broker; `Cancel` is cooperative;
 and the runtime is not a full GNU Bash, PTY, or job-control implementation.
 Windows/Linux/macOS host consumption is defined in
-`.github/workflows/wasm-build.yml`; this local Windows run cannot provide
-cloud runner evidence for Linux/macOS. See
+`.github/workflows/wasm-build.yml` and has executed green in the cloud run above.
+See the [target verification report](docs/verification-report.md) and
 [`docs/implementation-tracker.md`](docs/implementation-tracker.md) for the
 actual verification status.
 
@@ -584,7 +588,9 @@ fixed; each is now guarded by a case in `tests/suite/differential/`:
 - `wc -l` on input without a trailing newline, and GNU column alignment
 - `getopts` with `OPTARG`/`OPTIND`, clustering, attached args, `--`, and `:`
 - `tar -C` directory switching for create and extract
-- `sh file` / `sh -c` running as a child shell (no variable/function leakage)
+- `sh file` / `sh -c` running as a child shell, with options reset and no
+  variable/function leakage into the parent, and stdin redirection forwarded
+  (`sh -c 'cat' < file`)
 
 ### Fixed in the sandbox-hardening pass
 
@@ -745,6 +751,35 @@ Driven by a bash differential audit's remaining gap list. Each fix has a
   `LC_ALL=C`, so a numeric `%c` is a byte code; `sprintf` keeps character
   semantics. The differential oracle is now pinned to `LC_ALL=C` too, so a
   locale difference is not misreported as a divergence.
+
+### Fixed in the AI-shell stability pass (unreleased)
+
+Four defects that an external black-box audit found while using the standalone
+WASM as the only bash sandbox. Each is reproduced by a differential case that
+compares byte-for-byte against a real `bash`.
+
+- **Command-prefix assignments were permanent.** `V=1 echo hi` left `V=1` in the
+  shell, and the leak survived into later `exec` calls, so one script could
+  contaminate the next and defeat the "stable, reproducible environment" goal.
+  Prefix assignments are now scoped to the command; `export V` / `readonly V` /
+  `declare -x|-r V` still promote the value, matching bash.
+  Guarded by `tests/suite/differential/prefix_assignment_temporary.toml`.
+- **`sh -c '<cmd>' < file` lost stdin.** The child shell was launched with no
+  stdin target, so `cat` read the inherited (empty) stream and failed with
+  "missing operand". The launching command's input redirection is now forwarded
+  to `sh -c` and `sh file`. Guarded by
+  `tests/suite/differential/child_shell_stdin_redirect.toml`.
+- **`"$@"` collapsed into one joined field.** Multi-field parameter expansion is
+  now separate from single-string expansion: `"$@"` and `"${a[@]}"` yield one
+  field per element (zero fields when empty), on a pipe's right-hand side as
+  well. The VM fast path is bypassed for these words. Guarded by
+  `tests/suite/differential/quoted_at_multi_field.toml`.
+- **`${v%%[ ]*}` and other bracket-class strips returned empty.** `simple_glob_match`
+  only understood `*` and `?`, and `try_expand_array_single_element` mistook
+  `${v%%[ ]*}` for an array subscript. The matcher now supports `[abc]`,
+  `[a-z]`, and `[!…]`, the strip operators match the full pattern, and only a
+  valid identifier can be an array base. Guarded by
+  `tests/suite/differential/param_strip_bracket_class.toml`.
 
 ### Remaining known divergences (not yet fixed)
 

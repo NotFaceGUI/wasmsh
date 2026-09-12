@@ -1,0 +1,32 @@
+[test]
+name = "parameter-strip-honours-bracket-classes"
+tags = ["expansion", "pattern", "bracket", "differential", "P0"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["printf", "parameter-strip"]
+
+# `${v%pat}` / `${v%%pat}` / `${v#pat}` / `${v##pat}` match `pat` as a glob
+# pattern, which includes bracket classes. Previously a `[ ]` class was treated
+# as a literal and the strip returned an empty result.
+[input]
+script = """
+v='a b c'
+printf '[%s]\\n' "${v%%[ ]*}"
+printf '[%s]\\n' "${v%[ ]*}"
+printf '[%s]\\n' "${v#[ ]*}"
+printf '[%s]\\n' "${v##[! ]*}"
+w='x1y2z'
+printf '[%s]\\n' "${w%%[0-9]*}"
+printf '[%s]\\n' "${w##*[0-9]}"
+printf '[%s]\\n' "${w%[a-z]}"
+printf '[%s]\\n' "${w#?}"
+"""
+
+[expect]
+status = 0
+stdout = "[a]\n[a b]\n[a b c]\n[]\n[x]\n[z]\n[x1y2]\n[1y2z]\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

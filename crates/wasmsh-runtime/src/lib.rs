@@ -410,6 +410,24 @@ fn synthetic_word(part: &WordPart) -> Word {
     }
 }
 
+/// Whether a parameter name expands to multiple fields (`$@`, `${a[@]}`),
+/// including an optional slice (`${a[@]:1}`). `$*` is excluded: it joins into a
+/// single field. Mirrors the names recognised by
+/// [`wasmsh_expand::array_multi_expansion`].
+fn is_multi_field_parameter(name: &str) -> bool {
+    if name == "@" {
+        return true;
+    }
+    match name.find("[@]") {
+        Some(pos) => {
+            // The `[@]` must terminate the name or be followed by a slice.
+            let rest = &name[pos + 3..];
+            rest.is_empty() || rest.starts_with(':')
+        }
+        None => false,
+    }
+}
+
 fn resolve_path_from_cwd(cwd: &str, path: &str) -> String {
     if path.starts_with('/') {
         wasmsh_fs::normalize_path(path)
@@ -5392,13 +5410,30 @@ impl WorkerRuntime {
     fn vm_word_part_requires_full_shell_execution(part: &WordPart) -> bool {
         match part {
             WordPart::Literal(text) => Self::text_has_brace_or_glob_literal(text),
-            WordPart::SingleQuoted(_) | WordPart::DoubleQuoted(_) => false,
+            WordPart::SingleQuoted(_) => false,
+            // A multi-field parameter (`"$@"`, `"${a[@]}"`) expands to one
+            // field per element, which the VM's single-string word expansion
+            // cannot represent; route the command to the full interpreter.
+            // Quoted literals stay on the VM path: braces and globs are inert
+            // inside double quotes, so only parameters need a look.
+            WordPart::DoubleQuoted(parts) => parts.iter().any(Self::quoted_part_is_multi_field),
+            WordPart::Parameter(name) => is_multi_field_parameter(name),
             // An unquoted parameter or arithmetic expansion is subject to
             // field splitting and pathname expansion, which the VM subset does
             // not perform. Its result is only known at run time, so route the
             // whole command to the full interpreter. Command and process
             // substitution likewise require runtime access.
             _ => true,
+        }
+    }
+
+    /// Whether a part nested in double quotes needs the full interpreter: only
+    /// a parameter that expands to multiple fields does.
+    fn quoted_part_is_multi_field(part: &WordPart) -> bool {
+        match part {
+            WordPart::Parameter(name) => is_multi_field_parameter(name),
+            WordPart::DoubleQuoted(parts) => parts.iter().any(Self::quoted_part_is_multi_field),
+            _ => false,
         }
     }
 
@@ -9081,21 +9116,110 @@ impl WorkerRuntime {
             .collect();
         let argv = self.expand_globs_tagged(tagged);
 
+        // Command prefix assignments (`V=1 cmd`) are temporary: bash restores
+        // them once the command finishes. `export`/`readonly`/`declare -x|-r`
+        // are the exception — naming the variable there promotes the prefix
+        // value into the persistent shell environment.
+        let prefix_saves = self.save_prefix_assignment_targets(&exec.env);
         for assignment in &exec.env {
             self.execute_assignment(&assignment.name, assignment.value.as_ref());
         }
 
         if self.try_alias_expansion(&argv) {
+            self.restore_prefix_assignments(prefix_saves, &argv);
             return;
         }
 
         let Ok(exec_io) = self.prepare_exec_io(&exec.redirections) else {
+            self.restore_prefix_assignments(prefix_saves, &argv);
             return;
         };
         self.with_exec_io_scope(exec_io, |runtime| {
             runtime.trace_command(&argv);
             runtime.execute_argv_command(&argv);
         });
+        self.restore_prefix_assignments(prefix_saves, &argv);
+    }
+
+    /// Snapshot the variables a command-prefix assignment will write so they can
+    /// be restored after the command.
+    fn save_prefix_assignment_targets(
+        &self,
+        env: &[wasmsh_hir::HirAssignment],
+    ) -> Vec<(smol_str::SmolStr, Option<wasmsh_state::ShellVar>)> {
+        env.iter()
+            .map(|assignment| {
+                let raw = assignment.name.as_str();
+                let base = raw
+                    .strip_suffix('+')
+                    .unwrap_or(raw)
+                    .split('[')
+                    .next()
+                    .unwrap_or(raw);
+                let name = smol_str::SmolStr::from(base);
+                let prior = self.vm.state.env.get(base).cloned();
+                (name, prior)
+            })
+            .collect()
+    }
+
+    /// Restore non-promoted prefix assignments after a command has run.
+    fn restore_prefix_assignments(
+        &mut self,
+        saves: Vec<(smol_str::SmolStr, Option<wasmsh_state::ShellVar>)>,
+        argv: &[String],
+    ) {
+        if saves.is_empty() {
+            return;
+        }
+        let promoted = Self::promoted_prefix_names(argv);
+        for (name, prior) in saves {
+            if promoted
+                .as_ref()
+                .is_some_and(|set| set.contains(name.as_str()))
+            {
+                continue;
+            }
+            match prior {
+                Some(var) => {
+                    self.vm.state.env.set(name, var);
+                }
+                None => {
+                    let _ = self.vm.state.unset_var(&name);
+                }
+            }
+        }
+    }
+
+    /// Variable names that a command promotes from a prefix assignment into the
+    /// persistent environment, or `None` when the command does not promote any.
+    ///
+    /// Only `export`, `readonly`, and `declare`/`typeset` with `-x`/`-r` behave
+    /// this way; an ordinary builtin or external command leaves no trace.
+    fn promoted_prefix_names(argv: &[String]) -> Option<std::collections::HashSet<String>> {
+        let cmd = argv.first()?.as_str();
+        let args: &[String] = &argv[1..];
+        let promote = match cmd {
+            "export" | "readonly" => true,
+            "declare" | "typeset" => args
+                .iter()
+                .any(|arg| arg.starts_with('-') && arg[1..].chars().any(|c| c == 'x' || c == 'r')),
+            _ => false,
+        };
+        if !promote {
+            return None;
+        }
+        let mut set = std::collections::HashSet::new();
+        for arg in args {
+            if arg.starts_with('-') {
+                continue;
+            }
+            let name = arg.split('=').next().unwrap_or(arg);
+            if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                set.insert(name.to_string());
+            }
+        }
+        (!set.is_empty()).then_some(set)
     }
 
     /// Drain a pending nounset error from parameter expansion and report it
@@ -9657,7 +9781,7 @@ impl WorkerRuntime {
                     .iter()
                     .map(|s| smol_str::SmolStr::from(s.as_str()))
                     .collect();
-                let events = self.execute_shell_child(script, None, xtrace);
+                let events = self.execute_shell_child(script, self.inherited_child_stdin(), xtrace);
                 let child_status = self.last_subst_status;
                 self.vm.state.positional = old_positional;
                 self.vm.state.script_name = old_script_name;
@@ -9710,13 +9834,24 @@ impl WorkerRuntime {
             .state
             .source_stack
             .push(smol_str::SmolStr::from(path.as_str()));
-        let events = self.execute_shell_child(&content, None, xtrace);
+        let events = self.execute_shell_child(&content, self.inherited_child_stdin(), xtrace);
         let child_status = self.last_subst_status;
         self.vm.state.source_stack.pop();
 
         self.vm.state.positional = old_positional;
         self.vm.state.script_name = old_script_name;
         self.apply_isolated_script_events(events, child_status);
+    }
+
+    /// Stdin target a child shell (`sh -c`, `sh file`) inherits from the command
+    /// that launched it. `sh -c 'cat' < file` must forward the redirection into
+    /// the child; passing `None` dropped it and made `cat` read the inherited
+    /// (usually empty) stream instead.
+    fn inherited_child_stdin(&self) -> Option<InputTarget> {
+        match self.current_exec_io.as_ref().map(ExecIo::stdin_target_kind) {
+            Some(InputTarget::Inherit) | None => None,
+            Some(target) => Some(target),
+        }
     }
 
     /// Parse the leading `sh`/`bash` flags that precede the script operand.

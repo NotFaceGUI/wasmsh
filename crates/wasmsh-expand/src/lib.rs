@@ -142,19 +142,189 @@ fn expand_word_masked(word: &Word, state: &mut ShellState) -> (String, Vec<bool>
 /// Expand a list of words for argv, preserving quote metadata so the
 /// runtime can skip brace expansion on quoted arguments and apply glob
 /// expansion per character rather than per word.
+///
+/// A word that contains `"$@"` / `"${a[@]}"` expands into one field per
+/// element (bash semantics); every other word stays a single field.
 pub fn expand_words_argv(words: &[Word], state: &mut ShellState) -> Vec<ExpandedWord> {
-    words
-        .iter()
-        .map(|w| {
-            let (text, literal) = expand_word_masked(w, state);
-            let was_quoted = literal.iter().any(|&b| b);
-            ExpandedWord {
-                text,
-                was_quoted,
-                literal,
+    let mut result = Vec::with_capacity(words.len());
+    for w in words {
+        // The check is purely syntactic, so it must run before any expansion:
+        // probing by expansion would evaluate arithmetic (and command
+        // substitution) twice when the word turns out to be single-field.
+        if word_has_multi_field_parameter(&w.parts) {
+            if let Some(fields) = expand_word_multi(w, state) {
+                result.extend(fields);
+                continue;
             }
-        })
-        .collect()
+        }
+        let (text, literal) = expand_word_masked(w, state);
+        let was_quoted = literal.iter().any(|&b| b);
+        result.push(ExpandedWord {
+            text,
+            was_quoted,
+            literal,
+        });
+    }
+    result
+}
+
+/// Whether any part of a word is a parameter that expands to multiple fields
+/// (`$@`, `${a[@]}`). Purely syntactic; never evaluates anything.
+fn word_has_multi_field_parameter(parts: &[WordPart]) -> bool {
+    parts.iter().any(|part| match part {
+        WordPart::Parameter(name) => is_multi_field_parameter_name(name),
+        WordPart::DoubleQuoted(inner) => word_has_multi_field_parameter(inner),
+        _ => false,
+    })
+}
+
+/// Syntactic test for a multi-field parameter name. Mirrors
+/// [`array_multi_expansion`]'s accepted inputs: `@` and `name[@]` with an
+/// optional `:slice` suffix.
+fn is_multi_field_parameter_name(name: &str) -> bool {
+    if name == "@" {
+        return true;
+    }
+    match name.find("[@]") {
+        Some(pos) => {
+            let rest = &name[pos + 3..];
+            rest.is_empty() || rest.starts_with(':')
+        }
+        None => false,
+    }
+}
+
+/// One resolved chunk of a word for multi-field expansion.
+enum MultiAtom {
+    /// Literal text (already expanded) and whether it is quoted.
+    Text { text: String, literal: bool },
+    /// Elements of a multi-field parameter such as `"$@"`.
+    Fields {
+        elements: Vec<String>,
+        literal: bool,
+    },
+}
+
+/// Expand a word to multiple fields when it contains a multi-field parameter
+/// (`$@`, `${a[@]}`, or a slice thereof). Returns `None` when the word has no
+/// such parameter, so the caller can use the ordinary single-field path.
+fn expand_word_multi(word: &Word, state: &mut ShellState) -> Option<Vec<ExpandedWord>> {
+    let mut atoms = Vec::new();
+    let mut has_fields = false;
+    collect_multi_atoms(&word.parts, state, false, &mut atoms, &mut has_fields, 0);
+    if !has_fields {
+        return None;
+    }
+
+    let mut fields: Vec<String> = vec![String::new()];
+    let mut masks: Vec<Vec<bool>> = vec![Vec::new()];
+    let mut had_text = false;
+    for atom in atoms {
+        match atom {
+            MultiAtom::Text { text, literal } => {
+                if !text.is_empty() {
+                    fields.last_mut().unwrap().push_str(&text);
+                    masks
+                        .last_mut()
+                        .unwrap()
+                        .extend(std::iter::repeat_n(literal, text.len()));
+                    had_text = true;
+                }
+            }
+            MultiAtom::Fields { elements, literal } => {
+                if elements.is_empty() {
+                    continue;
+                }
+                fields.last_mut().unwrap().push_str(&elements[0]);
+                masks
+                    .last_mut()
+                    .unwrap()
+                    .extend(std::iter::repeat_n(literal, elements[0].len()));
+                for element in &elements[1..] {
+                    fields.push(element.clone());
+                    masks.push(vec![literal; element.len()]);
+                }
+                had_text = true;
+            }
+        }
+    }
+
+    // A word that consists only of an empty multi-field expansion disappears,
+    // matching bash: `printf '[%s]\n' "$@"` prints nothing with no positional
+    // parameters, while `x"$@"y` still yields the single field `xy`.
+    if !had_text && fields.len() == 1 && fields[0].is_empty() {
+        return Some(Vec::new());
+    }
+
+    Some(
+        fields
+            .into_iter()
+            .zip(masks)
+            .map(|(text, literal)| {
+                let was_quoted = literal.iter().any(|&b| b);
+                ExpandedWord {
+                    text,
+                    was_quoted,
+                    literal,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Walk word parts collecting resolved text and multi-field parameters.
+fn collect_multi_atoms(
+    parts: &[WordPart],
+    state: &mut ShellState,
+    quoted: bool,
+    atoms: &mut Vec<MultiAtom>,
+    has_fields: &mut bool,
+    depth: usize,
+) {
+    if depth > MAX_EXPAND_DEPTH {
+        return;
+    }
+    for part in parts {
+        match part {
+            WordPart::Literal(s) => atoms.push(MultiAtom::Text {
+                text: s.to_string(),
+                literal: quoted,
+            }),
+            WordPart::SingleQuoted(s) => atoms.push(MultiAtom::Text {
+                text: s.to_string(),
+                literal: true,
+            }),
+            WordPart::DoubleQuoted(inner) => {
+                collect_multi_atoms(inner, state, true, atoms, has_fields, depth + 1);
+            }
+            WordPart::Parameter(name) => {
+                if let Some(elements) = array_multi_expansion(name, state) {
+                    *has_fields = true;
+                    atoms.push(MultiAtom::Fields {
+                        elements,
+                        literal: quoted,
+                    });
+                } else {
+                    let mut value = String::new();
+                    expand_parameter(name, state, &mut value, depth + 1);
+                    atoms.push(MultiAtom::Text {
+                        text: value,
+                        literal: quoted,
+                    });
+                }
+            }
+            WordPart::Arithmetic(expr) => {
+                let value = eval_arithmetic(expr, state).to_string();
+                atoms.push(MultiAtom::Text {
+                    text: value,
+                    literal: quoted,
+                });
+            }
+            // Command and process substitution are resolved by the runtime
+            // before pathname expansion; nothing to emit here.
+            _ => {}
+        }
+    }
 }
 
 /// Expand `$var` and `${...}` references in a raw string (e.g. here-doc body).
@@ -277,7 +447,7 @@ fn try_expand_array_slice(name: &str, state: &mut ShellState, out: &mut String) 
     let end = bracket_pos + rel_end;
     let base = &name[..bracket_pos];
     let index = &name[bracket_pos + 1..end];
-    if base.is_empty() || (index != "@" && index != "*") {
+    if base.is_empty() || !is_valid_identifier(base) || (index != "@" && index != "*") {
         return false;
     }
     let Some(slice_spec) = name[end + 1..].strip_prefix(':') else {
@@ -413,6 +583,12 @@ fn try_expand_array_single_element(name: &str, state: &mut ShellState, out: &mut
     let base = &name[..bracket_pos];
     let index = &name[bracket_pos + 1..bracket_pos + end];
     if base.is_empty() || index.is_empty() {
+        return false;
+    }
+    // Only a plain variable name can be an array. A `base` containing operator
+    // characters is not an array subscript: `${v%%[ ]*}` is the strip operator
+    // applied to a bracket class, not element ` ` of an array named `v%%`.
+    if !is_valid_identifier(base) {
         return false;
     }
     let expanded_index = if index.contains('$') {
@@ -966,26 +1142,28 @@ fn expand_param_op_depth(
 // Glob matching utility (for substitution patterns)
 // ---------------------------------------------------------------------------
 
-/// Match a glob pattern against a string. Supports `*` (any string) and `?` (any char).
+/// Match a glob pattern against a string. Supports `*` (any string), `?` (any
+/// single character) and bracket classes (`[abc]`, `[a-z]`, `[!abc]`).
 fn simple_glob_match(pattern: &str, text: &str) -> bool {
     let p = pattern.as_bytes();
     let n = text.as_bytes();
     let mut pi = 0;
     let mut ni = 0;
-    let mut star_p = usize::MAX;
+    let mut star_p: Option<usize> = None;
     let mut star_n = 0;
     while ni < n.len() {
-        if pi < p.len() && (p[pi] == b'?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
-            star_p = pi;
+        if pi < p.len() && p[pi] == b'*' {
+            star_p = Some(pi);
             star_n = ni;
             pi += 1;
-        } else if star_p != usize::MAX {
-            pi = star_p + 1;
+        } else if let Some(next) = match_single(p, pi, n[ni]) {
+            pi = next;
+            ni += 1;
+        } else if let Some(sp) = star_p {
+            // Let the most recent `*` consume one more character and retry.
             star_n += 1;
             ni = star_n;
+            pi = sp + 1;
         } else {
             return false;
         }
@@ -996,9 +1174,86 @@ fn simple_glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// Check whether `pattern` contains glob meta-characters (`*` or `?`).
+/// Match a single pattern element at `pi` against byte `c`, returning the index
+/// just past that element on success. Handles `?`, bracket classes, and literal
+/// bytes. `*` is handled by the caller. A `[` with no valid closing `]` is
+/// treated as an ordinary character.
+fn match_single(p: &[u8], pi: usize, c: u8) -> Option<usize> {
+    let cur = *p.get(pi)?;
+    match cur {
+        b'?' => Some(pi + 1),
+        b'[' => match bracket_class_matches(p, pi, c) {
+            ClassOutcome::Matched(next) => Some(next),
+            ClassOutcome::NoMatch => None,
+            ClassOutcome::Invalid => (cur == c).then_some(pi + 1),
+        },
+        _ => (cur == c).then_some(pi + 1),
+    }
+}
+
+/// Result of interpreting a `[...]` bracket class.
+enum ClassOutcome {
+    /// The class is well formed and `c` is a member; payload is the index past `]`.
+    Matched(usize),
+    /// The class is well formed but `c` is not a member.
+    NoMatch,
+    /// There is no valid closing `]`; callers treat `[` literally.
+    Invalid,
+}
+
+/// Interpret the bracket class starting at `p[pi] == b'['` for byte `c`.
+fn bracket_class_matches(p: &[u8], pi: usize, c: u8) -> ClassOutcome {
+    let mut i = pi + 1;
+    let negated = matches!(p.get(i), Some(b'!' | b'^'));
+    if negated {
+        i += 1;
+    }
+    let mut matched = false;
+    let mut members = 0usize;
+    // A `]` immediately after `[` or `[!` is a literal member, not the end.
+    if p.get(i) == Some(&b']') {
+        members += 1;
+        matched |= c == b']';
+        i += 1;
+    }
+    while let Some(&ch) = p.get(i) {
+        if ch == b']' {
+            if members == 0 {
+                return ClassOutcome::Invalid;
+            }
+            let hit = if negated { !matched } else { matched };
+            return if hit {
+                ClassOutcome::Matched(i + 1)
+            } else {
+                ClassOutcome::NoMatch
+            };
+        }
+        // `a-z` range when followed by `-` and a non-`]` upper bound.
+        if p.get(i + 1) == Some(&b'-') {
+            if let Some(&hi) = p.get(i + 2) {
+                if hi != b']' {
+                    members += 1;
+                    if ch <= c && c <= hi {
+                        matched = true;
+                    }
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        members += 1;
+        if ch == c {
+            matched = true;
+        }
+        i += 1;
+    }
+    // Ran off the end without a closing `]`.
+    ClassOutcome::Invalid
+}
+
+/// Check whether `pattern` contains glob meta-characters (`*`, `?`, or `[`).
 fn is_glob_pattern(pattern: &str) -> bool {
-    pattern.contains('*') || pattern.contains('?')
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
 }
 
 /// Find the first substring of `text` that matches the glob `pattern` and return
@@ -1298,57 +1553,36 @@ fn expand_backslash_escapes(s: &str) -> String {
 /// Strip a glob pattern from the prefix of a string.
 /// If `greedy` is true, remove the longest match; otherwise the shortest.
 fn strip_prefix_glob<'a>(val: &'a str, pattern: &str, greedy: bool) -> Option<&'a str> {
-    if pattern == "*" {
-        return Some("");
-    }
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        // *SUFFIX pattern — find where suffix appears
-        if greedy {
-            val.rfind(suffix).map(|pos| &val[pos + suffix.len()..])
-        } else {
-            val.find(suffix).map(|pos| &val[pos + suffix.len()..])
+    // `${v#pat}` removes the shortest prefix matching `pat`; `${v##pat}` the
+    // longest. Iterate the candidate end offsets so bracket classes and other
+    // non-`*`/`?` patterns are handled by the same matcher.
+    let mut chosen: Option<usize> = None;
+    for end in 0..=val.len() {
+        if simple_glob_match(pattern, &val[..end]) {
+            let better = chosen.is_none_or(|best| if greedy { end > best } else { end < best });
+            if better {
+                chosen = Some(end);
+            }
         }
-    } else if let Some(prefix) = pattern.strip_suffix('*') {
-        // PREFIX* pattern — find prefix
-        if let Some(rest) = val.strip_prefix(prefix) {
-            Some(if greedy { "" } else { rest })
-        } else {
-            None
-        }
-    } else {
-        // Literal prefix match
-        val.strip_prefix(pattern)
     }
+    chosen.map(|end| &val[end..])
 }
 
 /// Strip a glob pattern from the suffix of a string.
 /// If `greedy` is true, remove the longest match; otherwise the shortest.
 fn strip_suffix_glob<'a>(val: &'a str, pattern: &str, greedy: bool) -> Option<&'a str> {
-    if pattern == "*" {
-        return Some("");
-    }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        // PREFIX* pattern — find prefix
-        if greedy {
-            val.find(prefix).map(|pos| &val[..pos])
-        } else {
-            val.rfind(prefix).map(|pos| &val[..pos])
+    // `${v%pat}` removes the shortest suffix matching `pat`; `${v%%pat}` the
+    // longest, mirroring `strip_prefix_glob`.
+    let mut chosen: Option<usize> = None;
+    for start in 0..=val.len() {
+        if simple_glob_match(pattern, &val[start..]) {
+            let better = chosen.is_none_or(|best| if greedy { start < best } else { start > best });
+            if better {
+                chosen = Some(start);
+            }
         }
-    } else if let Some(suffix) = pattern.strip_prefix('*') {
-        // *SUFFIX pattern — find suffix
-        if val.ends_with(suffix) {
-            Some(if greedy {
-                ""
-            } else {
-                val.strip_suffix(suffix).unwrap_or("")
-            })
-        } else {
-            None
-        }
-    } else {
-        // Literal suffix match
-        val.strip_suffix(pattern)
     }
+    chosen.map(|start| &val[..start])
 }
 
 // ---------------------------------------------------------------------------
@@ -2687,6 +2921,40 @@ mod tests {
             make_word(vec![WordPart::Parameter("X".into())]),
         ];
         assert_eq!(expand_words(&words, &mut state), vec!["echo", "hello"]);
+    }
+
+    #[test]
+    fn quoted_at_word_expands_to_one_field_per_parameter() {
+        let mut state = ShellState::new();
+        state.positional = vec!["a".into(), "b".into(), "c".into()];
+        let word = make_word(vec![WordPart::DoubleQuoted(vec![WordPart::Parameter(
+            "@".into(),
+        )])]);
+        let expanded = expand_words_argv(std::slice::from_ref(&word), &mut state);
+        let texts: Vec<&str> = expanded.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn quoted_at_word_vanishes_when_there_are_no_parameters() {
+        let mut state = ShellState::new();
+        let word = make_word(vec![WordPart::DoubleQuoted(vec![WordPart::Parameter(
+            "@".into(),
+        )])]);
+        let expanded = expand_words_argv(std::slice::from_ref(&word), &mut state);
+        assert!(expanded.is_empty());
+    }
+
+    #[test]
+    fn bracket_class_matches_ranges_and_negation() {
+        assert!(simple_glob_match("[ ]", " "));
+        assert!(!simple_glob_match("[ ]", "a"));
+        assert!(simple_glob_match("[! ]", "a"));
+        assert!(!simple_glob_match("[! ]", " "));
+        assert!(simple_glob_match("[0-9]", "5"));
+        assert!(!simple_glob_match("[0-9]", "x"));
+        // A `[` with no closing `]` stays literal.
+        assert!(simple_glob_match("[abc", "[abc"));
     }
 
     #[test]
