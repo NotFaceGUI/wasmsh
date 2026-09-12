@@ -7,7 +7,9 @@ stage = "differential"
 requires = ["backslash-escape", "redirection", "cat"]
 
 [input]
-script = "printf 'hello\\n' > /in.txt\ncat /in.txt \\\n  > /out.txt\ncat /out.txt"
+# Relative paths: the oracle runs in an isolated temp dir and wasmsh in its
+# own VFS cwd, so neither touches the host root.
+script = "printf 'hello\\n' > in.txt\ncat in.txt \\\n  > out.txt\ncat out.txt"
 
 [expect]
 status = 0
