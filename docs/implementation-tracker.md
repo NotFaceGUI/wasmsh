@@ -161,3 +161,8 @@
 
 - **提交**：`d12dc09` `fix(runtime): stop >(cmd > file) from panicking and poisoning the WASM instance` + `e96d0c6` `chore(release): bump version to 0.9.3`，`panic = "abort"`（wasm32）下无法 catch，故结构性消除可达 panic。
 - **发布结果**：`Standalone Release` run `34687056625`——Validate release source 通过（含新增 9 条输出进程替换回归）。
+- **v0.9.3 真实产物复核（发布后读回）**：下载 `wasmsh-standalone-0.9.3-e96d0c6ff5bb.tar.gz`，`build-manifest.json` version=0.9.3 / commit=e96d0c6f。用 `nodejs/` loader 在同一 `WasmShell` 会话内执行用户报告的原始复现 `tee >(wc -c > /tmp/_ps.txt) <<< hi`——**不再抛 RuntimeError，返回 `hi`，随后 `echo ALIVE` 正常**；连同 `tee >(cat > file)`、`cmd > >(consumer > file)`、`tee >(consumer)` 落盘、`<(cmd)`、`> >(cat)` 共 7 条断言全 PASS，证明 panic 已消除且实例不再被毒化。
+- **v0.9.3 发布结果**：run `34687056625` 全绿，Release v0.9.3 已创建（asset `wasmsh-standalone-0.9.3-e96d0c6ff5bb.tar.gz`）。
+- **v0.9.4 发布**：提交 `a0889e9` `fix(runtime): fire an EXIT trap installed inside a subshell` + `df75a84` `chore(release): bump version to 0.9.4`；run `34687244072` 全绿（含三平台 host matrix），Release v0.9.4 已创建（asset `wasmsh-standalone-0.9.4-df75a8461d19.tar.gz`）。
+- **v0.9.4 真实产物复核**：下载并读回，7 条断言全 PASS——原始 panic 复现仍正常、实例存活、`( trap ... EXIT; ... )` 现在按 bash 顺序输出 `body/INNER/after`、`exit 3` 组合输出 `b/C/rc=3`，以及被报告误判为差异的三条（c07 `['']['x']`、c32 仅 `A`、c47 `6`）均与 bash 一致。
+- **报告侧更正（已对拍确认）**：0.9.2 复跑报告把 `c07-empty-quotes`/`c32-case-fallthrough`/`c47-printf-c` 列为"真实差异"，其 bash 参考值有误——`bash -c "echo \"['']['x']\""` → `['']['x']`、`case a;;& b`（b 不匹配）→ 仅 `A`、`printf '%c' 65` → `6`（GNU coreutils 亦为 `6`）。这三条在报告自己的 `out/results.tsv` 中本就是 PASS，与表格自相矛盾。唯一真实差异 `c77-trap-exit` 已在 v0.9.4 修复。
