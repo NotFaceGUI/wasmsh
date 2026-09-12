@@ -4,7 +4,7 @@ tags = ["globbing", "quoting", "differential", "P0"]
 tier = "P0"
 class = "compat-bash"
 stage = "differential"
-requires = ["pathname-expansion", "echo", "printf"]
+requires = ["glob-expansion", "echo", "printf"]
 
 # Pathname expansion is decided per character, not per word: a quoted variable
 # prefix must not disable globbing for an unquoted `*` that follows it, and an

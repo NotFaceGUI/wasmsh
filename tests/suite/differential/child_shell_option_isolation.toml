@@ -4,7 +4,7 @@ tags = ["child-shell", "set", "nounset", "differential", "P0"]
 tier = "P0"
 class = "compat-bash"
 stage = "differential"
-requires = ["set", "nounset", "sh", "echo"]
+requires = ["set", "nounset", "children", "echo"]
 
 # `set -u`/`-e`/`pipefail` affect the shell that set them. A child shell (`sh -c`,
 # `sh file`) starts with the defaults, so an unset variable in the child is not an

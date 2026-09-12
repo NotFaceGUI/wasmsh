@@ -1,0 +1,32 @@
+[test]
+name = "tar-exclude-patterns"
+tags = ["tar", "archive", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["tar", "mkdir", "printf", "sort"]
+
+# GNU tar --exclude: a pattern with `/` matches the whole member name; one
+# without `/` matches the basename at any depth. Excluding a directory prunes
+# its whole subtree. `--exclude=PATTERN` is the attached form.
+[input]
+script = """
+mkdir -p t/a/b
+printf x > t/root.txt
+printf y > t/a/mid.txt
+printf z > t/a/b/deep.txt
+tar -cf one.tar --exclude='*.txt' -C t .
+tar -tf one.tar | sort
+tar -cf two.tar --exclude=mid.txt -C t .
+tar -tf two.tar | sort
+tar -cf three.tar --exclude='a/b' -C t .
+tar -tf three.tar | sort
+"""
+
+[expect]
+status = 0
+stdout = "./\n./a/\n./a/b/\n./\n./a/\n./a/b/\n./a/b/deep.txt\n./root.txt\n./\n./a/\n./a/mid.txt\n./root.txt\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

@@ -1,10 +1,10 @@
 [test]
 name = "cmp-reads-stdin-from-dash"
-tags = ["cmp", "stdin", "differential", "P1"]
+tags = ["cmp-utility", "stdin", "differential", "P1"]
 tier = "P1"
 class = "compat-bash"
 stage = "differential"
-requires = ["cmp", "printf", "base64"]
+requires = ["cmp-utility", "printf", "base64"]
 
 # POSIX cmp treats `-` as standard input, which is how binary round-trip checks
 # compare a decoded stream against the original file.

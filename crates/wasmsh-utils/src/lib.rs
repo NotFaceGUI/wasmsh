@@ -18,6 +18,7 @@ pub use clock::{ClockError, ClockProvider, FixedClock, UnavailableClock, UtcDate
 mod net_multipart;
 mod net_ops;
 pub mod net_types;
+mod od_ops;
 pub use net_types::{DefaultAction, NetworkPolicy, NetworkPolicyConfig, NetworkPolicyError};
 
 mod archive_ops;
@@ -30,6 +31,7 @@ mod file_ops;
 mod hash_ops;
 mod helpers;
 mod jaq_runner;
+mod join_ops;
 mod jq_ops;
 mod math_ops;
 mod regex_posix;
@@ -249,6 +251,7 @@ impl UtilRegistry {
         utils.insert("shuf", trivial_ops::util_shuf);
         utils.insert("cmp", trivial_ops::util_cmp);
         utils.insert("comm", trivial_ops::util_comm);
+        utils.insert("join", join_ops::util_join);
         utils.insert("fold", trivial_ops::util_fold);
         utils.insert("nproc", trivial_ops::util_nproc);
         utils.insert("expand", trivial_ops::util_expand);
@@ -283,6 +286,7 @@ impl UtilRegistry {
 
         // --- Binary utilities ---
         utils.insert("xxd", binary_ops::util_xxd);
+        utils.insert("od", od_ops::util_od);
         utils.insert("dd", binary_ops::util_dd);
         utils.insert("strings", binary_ops::util_strings);
         utils.insert("split", binary_ops::util_split);

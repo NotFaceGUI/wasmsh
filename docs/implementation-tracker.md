@@ -166,3 +166,20 @@
 - **v0.9.4 发布**：提交 `a0889e9` `fix(runtime): fire an EXIT trap installed inside a subshell` + `df75a84` `chore(release): bump version to 0.9.4`；run `34687244072` 全绿（含三平台 host matrix），Release v0.9.4 已创建（asset `wasmsh-standalone-0.9.4-df75a8461d19.tar.gz`）。
 - **v0.9.4 真实产物复核**：下载并读回，7 条断言全 PASS——原始 panic 复现仍正常、实例存活、`( trap ... EXIT; ... )` 现在按 bash 顺序输出 `body/INNER/after`、`exit 3` 组合输出 `b/C/rc=3`，以及被报告误判为差异的三条（c07 `['']['x']`、c32 仅 `A`、c47 `6`）均与 bash 一致。
 - **报告侧更正（已对拍确认）**：0.9.2 复跑报告把 `c07-empty-quotes`/`c32-case-fallthrough`/`c47-printf-c` 列为"真实差异"，其 bash 参考值有误——`bash -c "echo \"['']['x']\""` → `['']['x']`、`case a;;& b`（b 不匹配）→ 仅 `A`、`printf '%c' 65` → `6`（GNU coreutils 亦为 `6`）。这三条在报告自己的 `out/results.tsv` 中本就是 PASS，与表格自相矛盾。唯一真实差异 `c77-trap-exit` 已在 v0.9.4 修复。
+
+
+## 15. v0.9.5 —— 工具层补齐与 cwd 解析修复（2026-09-12 续）
+
+触发：0.9.2 复跑报告列出的"仍未修复"清单。逐条实测后分成三类：真 bug、缺失工具、有意桩。
+
+- **真 bug：`[ -f ]` / `[[ -f ]]` 不解析相对路径。** 文件谓词把原始操作数直接交给 `Vfs::stat`，而该 API 不含 cwd，于是 `[ -f rel.txt ]` 失败、`[ -f /abs/rel.txt ]` 成功。`-f -d -e -s -r -w -x -O -G -N` 以及 `[[ a -nt/-ot/-ef b ]]` 现均按 `$PWD` 归一化。这正是 `join empty-file` 用例失败的根因（`: > f` 后文件存在却测不到）。
+- **真 bug：`cd` 不解析相对路径且从不失败。** `cd sub` 把字面量 `sub` 存为 cwd，之后所有相对路径都基于 `sub/sub/...` 解析（`ls` 报 `.: not found: sub`），且目标不存在时静默返回 0。现按当前目录归一化，并在目标缺失/非目录时按 bash 输出 `No such file or directory` / `Not a directory` 且 rc=1。
+- **环境：`/tmp` 与 `$HOME` 不存在。** VFS 初始只有 `/`，`cd /tmp` 失败、往 `/tmp` 写临时文件需先 `mkdir`。现随 `WorkerRuntime::new()` 与 `Init` 重置一并播种 `/tmp`、`/home`、`/home/user`，与 AI 面向的 POSIX 布局契约一致（`init_seeds_deterministic_home_pwd_and_path` 单测即依赖此契约）。
+- **新增 `od`**（`crates/wasmsh-utils/src/od_ops.rs`）：`-A {o,d,x,n}`、`-t {a,c,d,o,u,x}` 带单位宽度、传统 `-b -c -d -o -x -a`、`-j`/`-N`、`-w`（非整单位宽度按 GNU 告警并退化为单单位）、`-v`、重复行 `*` 折叠。与 GNU od 在测试覆盖的旗标组合上逐字节一致（含 C locale 控制字节名 ` `/``/``/…，八进制宽 `ceil(bits/3)`、十六进制 `bits/4`，`-An` 不输出末尾偏移行）。
+- **新增 `join`**（`crates/wasmsh-utils/src/join_ops.rs`）：`-1/-2/-j`、`-t`、`-a`、`-v`、`-o`（含 `0` 与 `auto`）、`-e`、`-i`，重复键叉积，乱序输入打印 `is not sorted` 到 stderr 并 rc=1。修复 `[ -f ]` 后 `join` 空文件用例也通过。
+- **新增 `tar --exclude`**：含 `/` 的模式匹配整个成员名，不含 `/` 的匹配任意深度的 basename，排除目录即剪枝整棵子树；`--exclude PAT` 与 `--exclude=PAT` 两种写法。三组用例与 GNU tar 输出一致。
+- **新增 `sh -n` / `sh -x`**：`-n` 只解析并在语法错误时输出 `<name>: line N: syntax error: …` 且 rc=2，不执行；`-x` 追踪命令到 stderr 且照常执行；旗标可捆绑（`-nx`）并与 `-c` 组合。为此把 `parse_shell_flags` / `check_script_syntax` / `execute_shell_child` 抽出，并把 xtrace 透传进 isolated 子 shell（在 set 选项重置之后再置 `SHOPT_x`，否则会被新 shell 立即清掉）。
+- **`jq --version` / `yq --version`**：此前被当作 filter 解析报错，现直接输出版本行并 rc=0（`-V` 同义）。
+- **awk `printf "%c"` 高位码**：数值 > 0x7F 时输出 UTF-8 编码（255 → 2 字节）而非单个原始字节。运行时固定 `LC_ALL=C`，故数值 `%c` 是字节码；新增 `format_string_bytes`/`format_char_bytes` 走字节路径，`sprintf` 保持字符语义。同时把差分 oracle 也固定为 `LC_ALL=C`（`oracle.rs`），避免把 locale 差异误报成语义差异——这条正是 0.9.2 报告"awk %c 仍不一致"的真实原因。
+- **新增用例**：`od_dump_formats`、`join_relational`、`tar_exclude_patterns`、`sh_noexec_and_xtrace`、`test_relative_file_paths`、`awk_printf_char_byte`，以及 od/join 各 7 条 Rust 单测；`features.rs` 补 `od`、`join`、`children`、`cmp-utility` 登记（此前 `children`/`cmp-utility` 缺失导致多条既有用例被静默 SKIP，本轮一并修正，套件 SKIP 由 11 降到 5 个 pre-existing network/feature 项）。
+- **本地证据**：`cargo test --workspace --locked` 全绿（50 个测试目标）；TOML 套件 650 通过 / 5 SKIP / 0 失败；`cargo clippy --workspace --all-targets --locked -- -D warnings` 干净；`cargo fmt --all` 干净。

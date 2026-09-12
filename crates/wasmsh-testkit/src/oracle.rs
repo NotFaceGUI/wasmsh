@@ -196,15 +196,21 @@ pub fn run_oracle(script: &str, shell: &str) -> OracleOutcome {
 
 /// Environment overrides for the reference shell.
 ///
+/// The runtime pins a fixed UTF-8 / `LC_ALL=C` locale, so the oracle is pinned
+/// to `C` as well: otherwise a locale-sensitive case (for example awk
+/// `printf "%c", 255`, which emits one raw byte under `C` but a two-byte UTF-8
+/// encoding under a UTF-8 locale) reports a divergence that is really just a
+/// locale difference. See SUPPORTED.md "Environment-dependent differences".
+///
 /// On Windows, Git Bash needs `MSYS=winsymlinks:lnk` to create real symbolic
 /// links instead of silently copying; without it any `ln -s` differential
 /// case would compare against a copy and give a false result.
 fn oracle_env(_shell: &str) -> Vec<(&'static str, &'static str)> {
+    let mut env = vec![("LC_ALL", "C"), ("LANG", "C")];
     if cfg!(windows) {
-        vec![("MSYS", "winsymlinks:lnk")]
-    } else {
-        Vec::new()
+        env.push(("MSYS", "winsymlinks:lnk"));
     }
+    env
 }
 
 /// Compare wasmsh output against oracle output.

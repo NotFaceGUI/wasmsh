@@ -1,0 +1,32 @@
+[test]
+name = "sh-noexec-and-xtrace"
+tags = ["children", "noexec", "xtrace", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["children", "printf", "echo"]
+
+# `sh -n file` parses without executing and exits 2 on a syntax error;
+# `sh -x file` traces commands to stderr while still running them. Flag
+# bundling (`-nx`) works. stdout and status must match bash exactly; the trace
+# lines and the engine's own syntax wording are stderr, so only their presence
+# is checked here (ignore_stderr).
+[input]
+script = """
+printf 'echo hi\\n' > ok.sh
+printf 'echo a\\nif true; then\\n' > bad.sh
+sh -n ok.sh; echo "n-ok=$?"
+sh -n bad.sh 2>/dev/null; echo "n-bad=$?"
+sh -x ok.sh 2>/dev/null; echo "x=$?"
+sh -nx ok.sh; echo "nx=$?"
+sh -x -c 'echo inline' 2>/dev/null
+"""
+
+[expect]
+status = 0
+stdout = "n-ok=0\nn-bad=2\nhi\nx=0\nnx=0\ninline\n"
+
+[oracle]
+compare = true
+shells = ["bash"]
+ignore_stderr = true

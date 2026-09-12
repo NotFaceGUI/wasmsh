@@ -61,6 +61,13 @@ pub(crate) fn util_jq(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
     let mut args = &argv[1..];
     let mut opts = JqOpts::new();
 
+    // `jq --version` / `-V` must be answered before option parsing, otherwise
+    // the flag is treated as the filter and reported as a parse error.
+    if args.iter().any(|a| *a == "--version" || *a == "-V") {
+        ctx.output.stdout(b"jq-1.7.1-wasmsh\n");
+        return 0;
+    }
+
     while let Some(&arg) = args.first() {
         match parse_jq_option(ctx, &mut args, &mut opts, arg) {
             Ok(true) => {}

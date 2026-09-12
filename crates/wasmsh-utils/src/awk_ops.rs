@@ -2475,6 +2475,80 @@ impl AwkInterpreter {
         result
     }
 
+    /// Byte-oriented variant of [`Self::format_string`] used by `printf`.
+    ///
+    /// The runtime pins `LC_ALL=C`, where a numeric `%c` is a **byte** code:
+    /// `printf "%c", 255` emits the single byte `0xFF`, not its two-byte UTF-8
+    /// encoding. `sprintf` keeps the character-oriented [`Self::format_string`]
+    /// because its result is a string value, but `printf` writes bytes.
+    #[allow(clippy::unused_self)]
+    fn format_string_bytes(&self, fmt: &str, args: &[AwkValue]) -> Vec<u8> {
+        let mut result = Vec::new();
+        let chars: Vec<char> = fmt.chars().collect();
+        let mut i = 0;
+        let mut arg_idx = 0;
+
+        while i < chars.len() {
+            match chars[i] {
+                '%' => {
+                    if !self.push_format_spec_bytes(&mut result, &chars, &mut i, args, &mut arg_idx)
+                    {
+                        break;
+                    }
+                }
+                '\\' => {
+                    let mut escaped = String::new();
+                    self.push_escaped_format_char(&mut escaped, &chars, &mut i);
+                    result.extend_from_slice(escaped.as_bytes());
+                }
+                ch => {
+                    let mut buf = [0u8; 4];
+                    result.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    i += 1;
+                }
+            }
+        }
+
+        result
+    }
+
+    #[allow(clippy::unused_self)]
+    fn push_format_spec_bytes(
+        &self,
+        result: &mut Vec<u8>,
+        chars: &[char],
+        i: &mut usize,
+        args: &[AwkValue],
+        arg_idx: &mut usize,
+    ) -> bool {
+        *i += 1;
+        if *i >= chars.len() {
+            result.push(b'%');
+            return false;
+        }
+        if chars[*i] == '%' {
+            result.push(b'%');
+            *i += 1;
+            return true;
+        }
+        let Some((flags, width, precision, spec)) = parse_format_spec(chars, i, args, arg_idx)
+        else {
+            return false;
+        };
+        let arg = args
+            .get(*arg_idx)
+            .cloned()
+            .unwrap_or(AwkValue::Uninitialized);
+        *arg_idx += 1;
+        if spec == 'c' {
+            result.extend_from_slice(&format_char_bytes(width, &flags, &arg));
+        } else {
+            let formatted = format_one_spec(spec, width, precision, &flags, &arg);
+            result.extend_from_slice(formatted.as_bytes());
+        }
+        true
+    }
+
     #[allow(clippy::unused_self)]
     fn push_format_spec(
         &self,
@@ -2755,10 +2829,10 @@ impl AwkInterpreter {
         }
         let fmt = self.eval_expr(&args[0]).to_str();
         let arg_vals: Vec<AwkValue> = args[1..].iter().map(|a| self.eval_expr(a)).collect();
-        let s = self.format_string(&fmt, &arg_vals);
+        let bytes = self.format_string_bytes(&fmt, &arg_vals);
         match redirect {
-            Some(r) => self.write_redirected(r, s.as_bytes()),
-            None => self.write_output(s.as_bytes()),
+            Some(r) => self.write_redirected(r, &bytes),
+            None => self.write_output(&bytes),
         }
         ControlFlow::None
     }
@@ -3188,6 +3262,49 @@ fn format_char_spec(width: usize, flags: &FormatFlags, arg: &AwkValue) -> String
             .map_or(String::new(), |c| c.to_string()),
     };
     pad_string(&c, width, flags.left_align, ' ')
+}
+
+/// `%c` for the byte-oriented `printf` path.
+///
+/// A numeric argument is a byte code in `LC_ALL=C`, so any value in `0..=255`
+/// produces exactly one byte (including `0` and bytes above `0x7F`). A value
+/// above `255` falls back to its Unicode scalar in UTF-8, matching gawk. A
+/// string argument contributes the bytes of its first character.
+fn format_char_bytes(width: usize, flags: &FormatFlags, arg: &AwkValue) -> Vec<u8> {
+    let mut out = Vec::new();
+    match arg {
+        AwkValue::Num(n) => {
+            #[allow(clippy::cast_possible_truncation)]
+            let code = *n as i64;
+            if (0..=0xFF).contains(&code) {
+                out.push(code as u8);
+            } else if (0x100..=0x10_FFFF).contains(&code) {
+                if let Some(ch) = char::from_u32(code as u32) {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+        other => {
+            if let Some(ch) = other.to_str().chars().next() {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    let pad_total = width.saturating_sub(out.len());
+    if pad_total == 0 {
+        return out;
+    }
+    let pad = vec![b' '; pad_total];
+    if flags.left_align {
+        out.extend_from_slice(&pad);
+        out
+    } else {
+        let mut padded = pad;
+        padded.extend_from_slice(&out);
+        padded
+    }
 }
 
 /// Apply sign prefix (+, space, or -) to a formatted number string.

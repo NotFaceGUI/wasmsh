@@ -70,7 +70,7 @@ fn dbl_bracket_eval_primary(
     if let Some(result) = dbl_bracket_try_group(tokens, pos, fs, state) {
         return result;
     }
-    if let Some(result) = dbl_bracket_try_unary(tokens, pos, fs) {
+    if let Some(result) = dbl_bracket_try_unary(tokens, pos, fs, &state.cwd) {
         return result;
     }
     if *pos + 1 == tokens.len() {
@@ -109,7 +109,12 @@ fn dbl_bracket_take_truthy_token(tokens: &[String], pos: &mut usize) -> bool {
 }
 
 /// Try to evaluate a unary test (`-z`, `-n`, `-f`, etc.). Returns `None` if not a unary op.
-fn dbl_bracket_try_unary(tokens: &[String], pos: &mut usize, fs: &BackendFs) -> Option<bool> {
+fn dbl_bracket_try_unary(
+    tokens: &[String],
+    pos: &mut usize,
+    fs: &BackendFs,
+    cwd: &str,
+) -> Option<bool> {
     if *pos + 1 >= tokens.len() {
         return None;
     }
@@ -117,7 +122,7 @@ fn dbl_bracket_try_unary(tokens: &[String], pos: &mut usize, fs: &BackendFs) -> 
     match flag {
         b'z' | b'n' => Some(dbl_bracket_eval_string_test(tokens, pos, flag)),
         b'f' | b'd' | b'e' | b's' | b'r' | b'w' | b'x' | b'L' | b'h' | b'p' | b'S' | b't'
-        | b'N' | b'O' | b'G' => dbl_bracket_eval_file_test(tokens, pos, flag, fs),
+        | b'N' | b'O' | b'G' => dbl_bracket_eval_file_test(tokens, pos, flag, fs, cwd),
         _ => None,
     }
 }
@@ -145,6 +150,7 @@ fn dbl_bracket_eval_file_test(
     pos: &mut usize,
     flag: u8,
     fs: &BackendFs,
+    cwd: &str,
 ) -> Option<bool> {
     if *pos + 2 < tokens.len() && is_binary_op(&tokens[*pos + 2]) {
         return None;
@@ -152,7 +158,7 @@ fn dbl_bracket_eval_file_test(
     *pos += 1;
     let path_str = &tokens[*pos];
     *pos += 1;
-    Some(eval_file_test(flag, path_str, fs))
+    Some(eval_file_test(flag, path_str, fs, cwd))
 }
 
 /// Try to evaluate a binary test. Returns `None` if no binary op at pos+1.
@@ -230,9 +236,13 @@ fn eval_binary_op(lhs: &str, op: &str, rhs: &str, fs: &BackendFs, state: &mut Sh
         "=~" => eval_regex_match(lhs, rhs, state),
         "<" => lhs < rhs,
         ">" => lhs > rhs,
-        "-ef" => lhs == rhs,
-        "-nt" => eval_file_test(b'e', lhs, fs) && !eval_file_test(b'e', rhs, fs),
-        "-ot" => !eval_file_test(b'e', lhs, fs) && eval_file_test(b'e', rhs, fs),
+        "-ef" => resolve_test_path(&state.cwd, lhs) == resolve_test_path(&state.cwd, rhs),
+        "-nt" => {
+            eval_file_test(b'e', lhs, fs, &state.cwd) && !eval_file_test(b'e', rhs, fs, &state.cwd)
+        }
+        "-ot" => {
+            !eval_file_test(b'e', lhs, fs, &state.cwd) && eval_file_test(b'e', rhs, fs, &state.cwd)
+        }
         _ => eval_int_cmp(lhs, op, rhs),
     }
 }
@@ -281,13 +291,23 @@ fn eval_int_cmp(lhs: &str, op: &str, rhs: &str) -> bool {
     }
 }
 
+/// Resolve a file-test operand against the shell cwd (`Vfs::stat` has no cwd).
+fn resolve_test_path(cwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        wasmsh_fs::normalize_path(path)
+    } else {
+        wasmsh_fs::normalize_path(&format!("{cwd}/{path}"))
+    }
+}
+
 /// Evaluate a unary file test.
-fn eval_file_test(flag: u8, path: &str, fs: &BackendFs) -> bool {
+fn eval_file_test(flag: u8, path: &str, fs: &BackendFs, cwd: &str) -> bool {
     use wasmsh_fs::Vfs;
     if flag == b't' {
         return path == "0";
     }
-    match fs.stat(path) {
+    let path = resolve_test_path(cwd, path);
+    match fs.stat(&path) {
         Ok(meta) => match flag {
             b'f' => !meta.is_dir,
             b'd' => meta.is_dir,

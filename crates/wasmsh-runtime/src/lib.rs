@@ -4147,12 +4147,28 @@ fn parse_declare_flags(argv: &[String]) -> (DeclareFlags, Vec<usize>) {
 }
 
 impl WorkerRuntime {
+    /// Build the initial virtual filesystem.
+    ///
+    /// A POSIX system has `/tmp`, so seed it: without this `cd /tmp` fails and
+    /// relative paths under it cannot be created, which surprises scripts and
+    /// the ETL-style workflows that stage temporary files there.
+    fn fresh_filesystem() -> BackendFs {
+        let mut fs = BackendFs::new();
+        // The seeded `$HOME` must be a real directory, otherwise `cd` (which
+        // validates its target) fails on the default environment.
+        let _ = fs.create_dir("/home");
+        let _ = fs.create_dir("/home/user");
+        let _ = fs.create_dir("/tmp");
+        fs
+    }
+
     #[must_use]
     pub fn new() -> Self {
+        let fs = Self::fresh_filesystem();
         Self {
             config: BrowserConfig::default(),
             vm: Vm::with_limits(ShellState::new(), ExecutionLimits::default()),
-            fs: BackendFs::new(),
+            fs,
             utils: UtilRegistry::new(),
             builtins: wasmsh_builtins::BuiltinRegistry::new(),
             initialized: false,
@@ -4362,7 +4378,7 @@ impl WorkerRuntime {
                 recursion_limit: self.config.recursion_limit,
             },
         );
-        self.fs = BackendFs::new();
+        self.fs = Self::fresh_filesystem();
         self.current_exec_io = None;
         self.proc_subst_out_scopes.clear();
         self.proc_subst_in_scopes.clear();
@@ -7803,6 +7819,16 @@ impl WorkerRuntime {
         pending_input: Option<InputTarget>,
         new_process: bool,
     ) -> Vec<WorkerEvent> {
+        self.execute_isolated_input_events_full(input, pending_input, new_process, false)
+    }
+
+    fn execute_isolated_input_events_full(
+        &mut self,
+        input: &str,
+        pending_input: Option<InputTarget>,
+        new_process: bool,
+        xtrace: bool,
+    ) -> Vec<WorkerEvent> {
         let saved_state = self.vm.state.clone();
         let saved_functions = self.functions.clone();
         let saved_aliases = self.aliases.clone();
@@ -7822,6 +7848,11 @@ impl WorkerRuntime {
         });
         if new_process {
             self.reset_set_options_for_new_shell();
+        }
+        if xtrace {
+            // `sh -x`: trace the child's commands. Set after the option reset
+            // so a new shell does not immediately clear it.
+            self.vm.state.set_var("SHOPT_x".into(), "1".into());
         }
         let (mut inner_events, captured) = self.with_output_capture(true, true, |runtime| {
             runtime.with_nested_shell_scope(|nested| {
@@ -9591,23 +9622,42 @@ impl WorkerRuntime {
             return;
         }
 
+        // `sh -n` parses without executing; `sh -x` traces. Both may be bundled
+        // with each other and with `-c` (`sh -nx -c '...'`).
+        let (noexec, xtrace, consumed) = Self::parse_shell_flags(argv);
+        if noexec || xtrace {
+            // `-x` is implemented by exporting SHOPT_x into the child scope;
+            // `-n` is handled by parsing and discarding below.
+        }
+
         // Check for -c flag (inline script)
         // bash -c 'script' [name [args...]]
         // $0 = name (argv[3]), $1.. = args (argv[4..])
-        if argv[1] == "-c" {
-            if let Some(script) = argv.get(2) {
+        if argv.get(consumed).is_some_and(|a| a == "-c") {
+            let script_idx = consumed + 1;
+            if let Some(script) = argv.get(script_idx) {
+                if noexec {
+                    match Self::check_script_syntax(script, "sh") {
+                        Ok(()) => self.vm.state.last_status = 0,
+                        Err(msg) => {
+                            self.write_stderr(msg.as_bytes());
+                            self.vm.state.last_status = 2;
+                        }
+                    }
+                    return;
+                }
                 let old_positional = std::mem::take(&mut self.vm.state.positional);
                 let old_script_name = self.vm.state.script_name.take();
-                if let Some(name) = argv.get(3) {
+                if let Some(name) = argv.get(script_idx + 1) {
                     self.vm.state.script_name = Some(smol_str::SmolStr::from(name.as_str()));
                 }
                 self.vm.state.positional = argv
-                    .get(4..)
+                    .get(script_idx + 2..)
                     .unwrap_or_default()
                     .iter()
                     .map(|s| smol_str::SmolStr::from(s.as_str()))
                     .collect();
-                let events = self.execute_isolated_input_events_inner(script, None, true);
+                let events = self.execute_shell_child(script, None, xtrace);
                 let child_status = self.last_subst_status;
                 self.vm.state.positional = old_positional;
                 self.vm.state.script_name = old_script_name;
@@ -9617,13 +9667,14 @@ impl WorkerRuntime {
         }
 
         // Read script file from VFS
-        let path = if argv[1].starts_with('/') {
-            argv[1].clone()
+        let script_arg = argv.get(consumed).cloned().unwrap_or_default();
+        let path = if script_arg.starts_with('/') {
+            script_arg.clone()
         } else {
-            format!("{}/{}", self.vm.state.cwd, argv[1])
+            format!("{}/{}", self.vm.state.cwd, script_arg)
         };
         let Ok(h) = self.fs.open(&path, OpenOptions::read()) else {
-            let msg = format!("{}: {}: No such file or directory\n", argv[0], argv[1]);
+            let msg = format!("{}: {}: No such file or directory\n", argv[0], script_arg);
             self.write_stderr(msg.as_bytes());
             self.vm.state.last_status = 127;
             return;
@@ -9632,12 +9683,25 @@ impl WorkerRuntime {
         self.fs.close(h);
         let content = String::from_utf8_lossy(&data).to_string();
 
+        if noexec {
+            // `sh -n file`: report the first parse error like bash does, but do
+            // not execute. Status is 2 on a syntax error, 0 otherwise.
+            match Self::check_script_syntax(&content, &script_arg) {
+                Ok(()) => self.vm.state.last_status = 0,
+                Err(msg) => {
+                    self.write_stderr(msg.as_bytes());
+                    self.vm.state.last_status = 2;
+                }
+            }
+            return;
+        }
+
         // `sh file` runs in a child shell: `exit` ends the child only, and
         // variables/functions do not leak back into the caller.
         let old_positional = std::mem::take(&mut self.vm.state.positional);
         let old_script_name = self.vm.state.script_name.take();
-        self.vm.state.script_name = Some(smol_str::SmolStr::from(argv[1].as_str()));
-        self.vm.state.positional = argv[2..]
+        self.vm.state.script_name = Some(smol_str::SmolStr::from(script_arg.as_str()));
+        self.vm.state.positional = argv[consumed + 1..]
             .iter()
             .map(|s| smol_str::SmolStr::from(s.as_str()))
             .collect();
@@ -9646,13 +9710,82 @@ impl WorkerRuntime {
             .state
             .source_stack
             .push(smol_str::SmolStr::from(path.as_str()));
-        let events = self.execute_isolated_input_events_inner(&content, None, true);
+        let events = self.execute_shell_child(&content, None, xtrace);
         let child_status = self.last_subst_status;
         self.vm.state.source_stack.pop();
 
         self.vm.state.positional = old_positional;
         self.vm.state.script_name = old_script_name;
         self.apply_isolated_script_events(events, child_status);
+    }
+
+    /// Parse the leading `sh`/`bash` flags that precede the script operand.
+    ///
+    /// Returns `(noexec, xtrace, index_of_first_non_flag)`. `-n` and `-x` may
+    /// be bundled (`-nx`) or repeated; a lone `-` ends flag parsing, since it
+    /// refers to standard input.
+    #[allow(clippy::match_same_arms)]
+    fn parse_shell_flags(argv: &[String]) -> (bool, bool, usize) {
+        let mut noexec = false;
+        let mut xtrace = false;
+        let mut idx = 1;
+        while let Some(arg) = argv.get(idx) {
+            if arg == "-" || !arg.starts_with('-') || arg.len() < 2 {
+                break;
+            }
+            for ch in arg[1..].chars() {
+                match ch {
+                    'n' => noexec = true,
+                    'x' => xtrace = true,
+                    // Flags the runtime already honours through other paths, or
+                    // that have no effect here, are accepted and ignored.
+                    'a' | 'e' | 'u' | 'v' | 's' | 'i' | 'm' | 'b' | 'h' | 'H' | 'p' | 't' | 'f'
+                    | 'C' | 'E' | 'T' | 'P' | 'B' | 'r' | 'k' | 'd' => {}
+                    // `-c` is the inline-script marker and ends flag parsing.
+                    'c' => return (noexec, xtrace, idx),
+                    _ => {}
+                }
+            }
+            idx += 1;
+        }
+        (noexec, xtrace, idx)
+    }
+
+    /// Parse a script for `sh -n`, returning the diagnostic bash would print.
+    ///
+    /// Only syntax is checked; nothing is executed. `argv[0]` names the shell
+    /// used in the message, matching bash's `<name>: line N: ...` prefix.
+    fn check_script_syntax(script: &str, name: &str) -> Result<(), String> {
+        match wasmsh_parse::parse(script) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                // bash reports the 1-based line containing the error offset;
+                // an unterminated construct points at EOF, one past the last
+                // line, which is what this offset arithmetic yields.
+                let line = script
+                    .as_bytes()
+                    .iter()
+                    .take(err.offset as usize)
+                    .filter(|&&b| b == b'\n')
+                    .count()
+                    + 1;
+                Err(format!("{name}: line {line}: syntax error: {err}\n"))
+            }
+        }
+    }
+
+    /// Run a child shell, optionally tracing commands (`sh -x`).
+    ///
+    /// `-x` is applied by exporting `SHOPT_x` into the child process scope,
+    /// which the trace path already understands. The parent's option state is
+    /// saved and restored by the isolated-run machinery.
+    fn execute_shell_child(
+        &mut self,
+        script: &str,
+        pending_input: Option<InputTarget>,
+        xtrace: bool,
+    ) -> Vec<WorkerEvent> {
+        self.execute_isolated_input_events_full(script, pending_input, true, xtrace)
     }
 
     /// Deliver the events of an isolated child-shell run to the parent: merge

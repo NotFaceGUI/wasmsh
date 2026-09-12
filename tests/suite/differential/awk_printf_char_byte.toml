@@ -1,0 +1,26 @@
+[test]
+name = "awk-printf-char-is-a-byte-in-c-locale"
+tags = ["awk", "printf", "locale", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["awk", "printf", "wc"]
+
+# The runtime pins LC_ALL=C, where a numeric `%c` is a byte code: 255 emits one
+# raw byte (0xFF), not its two-byte UTF-8 encoding, and 0 emits one NUL byte.
+# `sprintf("%c")` keeps character semantics because its result is a string.
+[input]
+script = """
+awk 'BEGIN{printf "%c", 255}' | wc -c
+awk 'BEGIN{printf "%c", 0}' | wc -c
+awk 'BEGIN{printf "%c", 65}'; echo
+awk 'BEGIN{print sprintf("%c", 65)}'
+"""
+
+[expect]
+status = 0
+stdout = "1\n1\nA\nA\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

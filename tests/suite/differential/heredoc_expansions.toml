@@ -1,10 +1,10 @@
 [test]
 name = "heredoc-arithmetic-and-command-substitution"
-tags = ["heredoc", "expansion", "differential", "P1"]
+tags = ["here-doc", "expansion", "differential", "P1"]
 tier = "P1"
 class = "compat-bash"
 stage = "differential"
-requires = ["heredoc", "parameter-expansion", "arithmetic-expansion", "command-substitution", "cat"]
+requires = ["here-doc", "parameter-expansion", "arithmetic-expansion", "command-substitution", "cat"]
 
 # An unquoted here-doc body expands `$var`, `${...}`, `$(( ))`, `$(...)` and
 # backticks. Previously only `$var` was expanded; arithmetic and command

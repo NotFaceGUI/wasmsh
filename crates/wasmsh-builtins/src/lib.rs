@@ -671,8 +671,32 @@ fn builtin_cd(ctx: &mut BuiltinContext<'_>, argv: &[&str]) -> i32 {
         argv[1].to_string()
     };
 
+    // Resolve the operand against the current directory: `cd sub` from `/a`
+    // must land on `/a/sub`, not on the literal `sub`. Without this every later
+    // relative path is resolved against a bogus cwd.
+    let resolved = if target.starts_with('/') {
+        wasmsh_fs::normalize_path(&target)
+    } else {
+        wasmsh_fs::normalize_path(&format!("{}/{}", ctx.state.cwd, target))
+    };
+
+    // `cd` must fail when the target is not an existing directory.
+    match ctx.fs.and_then(|fs| fs.stat(&resolved).ok()) {
+        Some(meta) if meta.is_dir => {}
+        Some(_) => {
+            let msg = format!("cd: {target}: Not a directory\n");
+            ctx.output.stderr(msg.as_bytes());
+            return 1;
+        }
+        None => {
+            let msg = format!("cd: {target}: No such file or directory\n");
+            ctx.output.stderr(msg.as_bytes());
+            return 1;
+        }
+    }
+
     let old_pwd = ctx.state.cwd.clone();
-    ctx.state.cwd = target;
+    ctx.state.cwd = resolved;
     ctx.state.set_var("OLDPWD".into(), SmolStr::from(old_pwd));
     ctx.state
         .set_var("PWD".into(), SmolStr::from(ctx.state.cwd.as_str()));
@@ -884,10 +908,34 @@ fn test_check(args: &[&str], ctx: &BuiltinContext<'_>) -> bool {
     }
 }
 
+/// Resolve a file-test operand against the shell's working directory.
+///
+/// `Vfs::stat` normalizes a path but does not know the shell cwd, so a relative
+/// operand has to be made absolute here or `[ -f file ]` fails while
+/// `[ -f /abs/file ]` succeeds.
+fn test_path<'a>(val: &'a str, ctx: &BuiltinContext<'_>) -> std::borrow::Cow<'a, str> {
+    if val.starts_with('/') {
+        std::borrow::Cow::Borrowed(val)
+    } else {
+        std::borrow::Cow::Owned(wasmsh_fs::normalize_path(&format!(
+            "{}/{}",
+            ctx.state.cwd, val
+        )))
+    }
+}
+
 fn test_unary(op: &str, val: &str, ctx: &BuiltinContext<'_>) -> bool {
+    // `-n`/`-z`/`-t` test the operand itself; only the file predicates resolve
+    // it as a path.
     match op {
-        "-n" => !val.is_empty(),
-        "-z" | "!" => val.is_empty(),
+        "-n" => return !val.is_empty(),
+        "-z" | "!" => return val.is_empty(),
+        "-t" => return val == "0" && ctx.stdin.is_some(),
+        _ => {}
+    }
+    let val = test_path(val, ctx);
+    let val = val.as_ref();
+    match op {
         "-f" => ctx
             .fs
             .is_some_and(|fs| fs.stat(val).is_ok_and(|m| !m.is_dir)),
@@ -902,7 +950,6 @@ fn test_unary(op: &str, val: &str, ctx: &BuiltinContext<'_>) -> bool {
         "-N" => ctx
             .fs
             .is_some_and(|fs| fs.stat(val).is_ok_and(|m| m.size > 0)),
-        "-t" => val == "0" && ctx.stdin.is_some(),
         // These used to answer "does it exist", which made `test -r` on a
         // `chmod 000` file report success and any script gating on it take
         // the wrong branch.
@@ -2024,6 +2071,34 @@ mod tests {
         (status, sink)
     }
 
+    /// Like `run_builtin_with_state`, but with a VFS whose directories the
+    /// caller names. `cd` validates its target against the filesystem, so its
+    /// tests need real directories to move between.
+    fn run_builtin_with_state_and_dirs(
+        name: &str,
+        argv: &[&str],
+        state: &mut ShellState,
+        dirs: &[&str],
+    ) -> (i32, VecSink) {
+        let registry = BuiltinRegistry::new();
+        let mut sink = VecSink::default();
+        let builtin = registry.get(name).unwrap();
+        let mut fs = wasmsh_fs::MemoryFs::new();
+        for dir in dirs {
+            let _ = fs.create_dir(dir);
+        }
+        let status = {
+            let mut ctx = BuiltinContext {
+                state,
+                output: &mut sink,
+                fs: Some(&fs),
+                stdin: None,
+            };
+            builtin(&mut ctx, argv)
+        };
+        (status, sink)
+    }
+
     #[test]
     fn colon_returns_zero() {
         let (status, _) = run_builtin(":", &[":"]);
@@ -2093,7 +2168,8 @@ mod tests {
     #[test]
     fn cd_changes_cwd() {
         let mut state = ShellState::new();
-        let (status, _) = run_builtin_with_state("cd", &["cd", "/tmp"], &mut state);
+        let (status, _) =
+            run_builtin_with_state_and_dirs("cd", &["cd", "/tmp"], &mut state, &["/tmp"]);
         assert_eq!(status, 0);
         assert_eq!(state.cwd, "/tmp");
         assert_eq!(state.get_var("PWD").unwrap(), "/tmp");
@@ -2103,8 +2179,9 @@ mod tests {
     #[test]
     fn cd_dash_returns_to_oldpwd() {
         let mut state = ShellState::new();
-        run_builtin_with_state("cd", &["cd", "/tmp"], &mut state);
-        let (status, sink) = run_builtin_with_state("cd", &["cd", "-"], &mut state);
+        run_builtin_with_state_and_dirs("cd", &["cd", "/tmp"], &mut state, &["/tmp"]);
+        let (status, sink) =
+            run_builtin_with_state_and_dirs("cd", &["cd", "-"], &mut state, &["/tmp"]);
         assert_eq!(status, 0);
         assert_eq!(state.cwd, "/");
         assert_eq!(sink.stdout_str(), "/\n");
@@ -2114,7 +2191,8 @@ mod tests {
     fn cd_no_args_goes_home() {
         let mut state = ShellState::new();
         state.set_var("HOME".into(), "/home/user".into());
-        let (status, _) = run_builtin_with_state("cd", &["cd"], &mut state);
+        let (status, _) =
+            run_builtin_with_state_and_dirs("cd", &["cd"], &mut state, &["/home/user"]);
         assert_eq!(status, 0);
         assert_eq!(state.cwd, "/home/user");
     }

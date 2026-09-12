@@ -211,7 +211,7 @@ All utilities operate on the in-process VFS (no OS calls).
 | `sleep`      | Done   | Delay (no-op in sandbox; returns immediately) |
 | `date`       | Done   | Uses the host clock callback in standalone production mode; fixed time and legacy `WASMSH_DATE` are explicit test/compatibility modes. |
 
-### Simple utilities (18)
+### Simple utilities
 
 | Command      | Status | Notes |
 |--------------|--------|-------|
@@ -220,8 +220,10 @@ All utilities operate on the in-process VFS (no OS calls).
 | `tac`        | Done   | Reverse lines of file |
 | `nl`         | Done   | Number lines |
 | `shuf`       | Done   | Shuffle lines |
-| `cmp`        | Done   | Compare two files byte by byte |
+| `cmp`        | Done   | Compare two files byte by byte (incl. `-` for stdin) |
 | `comm`       | Done   | Compare two sorted files line by line |
+| `od`         | Done   | Octal/hex/decimal/character dump (`-A`, `-t`, legacy flags) |
+| `join`       | Done   | Join two sorted files on a field (`-1/-2/-j -t -a -v -o -e -i`) |
 | `fold`       | Done   | Wrap lines to specified width |
 | `nproc`      | Done   | Print number of processing units |
 | `expand`     | Done   | Convert tabs to spaces |
@@ -705,18 +707,59 @@ subshell ends, before the parent continues. A trap installed *outside* the
 subshell still does not fire inside it (bash fires it only when the outer shell
 exits). Guarded by `tests/suite/differential/subshell_exit_trap.toml`.
 
+### Fixed in the tool-completeness pass (v0.9.5)
+
+Driven by a bash differential audit's remaining gap list. Each fix has a
+`tests/suite/differential/` case compared byte-for-byte against bash/GNU tools.
+
+- **`[ -f ]` / `[[ -f ]]` ignored the cwd.** File predicates passed the raw
+  operand to `Vfs::stat`, which is cwd-agnostic, so `[ -f rel.txt ]` failed
+  while `[ -f /abs/rel.txt ]` succeeded. Relative operands now resolve against
+  `$PWD` for `-f -d -e -s -r -w -x -O -G -N` and for `[[ -nt/-ot/-ef ]]`.
+- **`cd relative` did not resolve, and never failed.** `cd sub` stored the
+  literal string `sub` as the cwd, so every later relative path resolved
+  against a bogus directory (`sub/sub/...`); a missing target silently
+  "succeeded". `cd` now normalizes against the current directory and reports
+  `No such file or directory` / `Not a directory` with status 1, as bash does.
+- **`/tmp` and `$HOME` did not exist.** The VFS started with only `/`, so
+  `cd /tmp` failed and staging temp files there needed an explicit `mkdir`.
+  `/tmp`, `/home`, and `/home/user` are now seeded, matching the POSIX layout
+  the AI-facing environment contract assumes.
+- **`od` was missing.** Implemented `od` with `-A {o,d,x,n}`, `-t {a,c,d,o,u,x}`
+  with unit sizes, the legacy `-b -c -d -o -x -a` flags, `-j`/`-N`, `-w`, `-v`,
+  and repeated-line `*` collapse. Output is byte-identical to GNU od across the
+  tested flag combinations, including C-locale control-byte names.
+- **`join` was missing.** Implemented `join` with `-1/-2/-j`, `-t`, `-a`, `-v`,
+  `-o` (including `0` and `auto`), `-e`, `-i`, duplicate-key cross products, and
+  the out-of-order diagnostic plus non-zero exit.
+- **`tar --exclude` was missing.** A pattern containing `/` matches the whole
+  member name; one without matches the basename at any depth, so a directory
+  exclusion prunes its subtree. Both `--exclude PAT` and `--exclude=PAT`.
+- **`sh -n` / `sh -x` were missing.** `-n` parses and reports a syntax error
+  (status 2) without executing; `-x` traces commands to stderr while running
+  them. Flags bundle (`-nx`) and combine with `-c`.
+- **`jq --version` / `yq --version`** were parsed as filters and reported as
+  parse errors; both now print their version line and exit 0.
+- **awk `printf "%c"` for a numeric code > 0x7F** emitted the value's UTF-8
+  encoding (2 bytes for 255) instead of the single raw byte. The runtime pins
+  `LC_ALL=C`, so a numeric `%c` is a byte code; `sprintf` keeps character
+  semantics. The differential oracle is now pinned to `LC_ALL=C` too, so a
+  locale difference is not misreported as a divergence.
+
 ### Remaining known divergences (not yet fixed)
 
 - `${arr[@]:1:-1}` (negative slice length on an array): bash reports an error,
   wasmsh returns the truncated slice. Negative-length string slices match bash.
 - `timeout`, `sleep`, and `nproc` remain intentional stubs (see the table
-  above); `join` and `od` are not implemented.
-- `jq`/`yq --version` are still parsed as filters rather than version queries.
+  above): `timeout` never executes its command (always 125), `sleep` returns
+  immediately, `nproc` is always 1. These are deliberate because the sandbox is
+  deterministic and has no wall clock or OS process model.
 - `readonly` assignment fails the command with status 1 but does not abort a
   script; bash's abort behaviour here is inconsistent (it depends on `;` versus
   newline separation), so wasmsh uses the predictable non-fatal form.
 - `$((1/0))` and unbounded recursion recover with a non-zero status where bash
   aborts the shell or overflows the stack; wasmsh is the more forgiving of the two.
+- `awk` has no `getline`.
 
 ---
 

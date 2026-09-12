@@ -1,0 +1,37 @@
+[test]
+name = "file-tests-resolve-relative-to-cwd"
+tags = ["test", "double-bracket", "filesystem", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["test", "double-bracket", "echo", "mkdir", "cd", "printf"]
+
+# `[ -f f ]` and `[[ -f f ]]` must resolve a relative operand against the shell
+# cwd; both used to stat the raw operand, so only absolute paths worked.
+[input]
+script = """
+mkdir -p sub
+printf 'x' > sub/f.txt
+echo x > rel.txt
+[ -f rel.txt ] && echo A1 || echo A2
+[ -e rel.txt ] && echo B1 || echo B2
+[ -d sub ] && echo C1 || echo C2
+[ -s rel.txt ] && echo D1 || echo D2
+[ -f sub/f.txt ] && echo E1 || echo E2
+[[ -f rel.txt ]] && echo F1 || echo F2
+[[ -e rel.txt ]] && echo G1 || echo G2
+[[ -d sub ]] && echo H1 || echo H2
+[[ -s rel.txt ]] && echo I1 || echo I2
+[[ ! -f missing.txt ]] && echo J1 || echo J2
+[[ -n abc ]] && echo K1 || echo K2
+[[ -z '' ]] && echo L1 || echo L2
+cd sub && [ -f f.txt ] && echo M1 || echo M2
+"""
+
+[expect]
+status = 0
+stdout = "A1\nB1\nC1\nD1\nE1\nF1\nG1\nH1\nI1\nJ1\nK1\nL1\nM1\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

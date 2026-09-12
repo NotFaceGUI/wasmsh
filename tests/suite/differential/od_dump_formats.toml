@@ -1,0 +1,33 @@
+[test]
+name = "od-dump-formats-match-gnu"
+tags = ["od", "binary", "differential", "P1"]
+tier = "P1"
+class = "compat-bash"
+stage = "differential"
+requires = ["od", "base64", "printf"]
+
+# GNU od: default is two-byte octal words; `-A` selects the offset radix, `-t`
+# selects the type and unit size, `-j`/`-N` select a byte range. Bytes are
+# materialised with base64 because printf cannot be trusted for 0x00/0xFF.
+# The oracle is run under LC_ALL=C (see oracle.rs), matching the runtime's
+# fixed locale, so the `%c` control-byte names here are locale-independent.
+[input]
+script = """
+printf 'AAECAwQFBgcICQoLDA0ODw==' | base64 -d > d.bin
+od d.bin
+od -An -tx1 d.bin
+od -An -to1 d.bin
+od -An -tc d.bin
+od -An -td1 d.bin
+od -An -tx2 d.bin
+od -An -tx1 -j3 -N4 d.bin
+od -An -tx4 d.bin
+"""
+
+[expect]
+status = 0
+stdout = "0000000 000400 001402 002404 003406 004410 005412 006414 007416\n0000020\n 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n 000 001 002 003 004 005 006 007 010 011 012 013 014 015 016 017\n  \\0 001 002 003 004 005 006  \\a  \\b  \\t  \\n  \\v  \\f  \\r 016 017\n    0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15\n 0100 0302 0504 0706 0908 0b0a 0d0c 0f0e\n 03 04 05 06\n 03020100 07060504 0b0a0908 0f0e0d0c\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

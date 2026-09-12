@@ -98,6 +98,14 @@ fn parse_combined_flags(flags: &str, opts: &mut YqOptions) -> bool {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn util_yq(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
+    // `yq --version` / `-V` must be answered before filter parsing, otherwise
+    // the flag is compiled as a jq filter and reported as a parse error.
+    if argv[1..].iter().any(|a| *a == "--version" || *a == "-V") {
+        ctx.output
+            .stdout(b"yq (https://github.com/mikefarah/yq/) version v4.44.3-wasmsh\n");
+        return 0;
+    }
+
     let (opts, consumed) = parse_yq_flags(&argv[1..]);
     let args = &argv[1 + consumed..];
 

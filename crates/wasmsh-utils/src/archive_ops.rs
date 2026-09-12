@@ -310,6 +310,29 @@ struct TarFlags<'a> {
     verbose: bool,
     archive: Option<&'a str>,
     change_dir: Option<&'a str>,
+    /// `--exclude` patterns, applied to archive member names while creating.
+    excludes: Vec<&'a str>,
+}
+
+/// Whether a member name is excluded by any `--exclude` pattern.
+///
+/// GNU tar matches a pattern containing `/` against the whole member name
+/// (after dropping a leading `./`); a pattern without `/` matches the basename
+/// at any depth, so `--exclude=drop` skips `./a/drop` too.
+fn tar_name_excluded(name: &str, excludes: &[&str]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    let trimmed = name.strip_prefix("./").unwrap_or(name);
+    let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    excludes.iter().any(|pattern| {
+        let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+        if pattern.contains('/') {
+            crate::helpers::simple_glob_match(pattern, trimmed)
+        } else {
+            crate::helpers::simple_glob_match(pattern, basename)
+        }
+    })
 }
 
 fn is_bare_tar_flags(arg: &str) -> bool {
@@ -338,6 +361,7 @@ fn parse_tar_flags<'a>(
         verbose: false,
         archive: None,
         change_dir: None,
+        excludes: Vec::new(),
     };
     let mut consumed = 1;
 
@@ -361,6 +385,14 @@ fn parse_tar_flags<'a>(
             flags.change_dir = Some(args[1]);
             args = &args[2..];
             consumed += 2;
+        } else if *arg == "--exclude" && args.len() > 1 {
+            flags.excludes.push(args[1]);
+            args = &args[2..];
+            consumed += 2;
+        } else if let Some(pattern) = arg.strip_prefix("--exclude=") {
+            flags.excludes.push(pattern);
+            args = &args[1..];
+            consumed += 1;
         } else if arg.starts_with('-') && arg.len() > 1 && !arg.starts_with("--") {
             let skip_next = parse_tar_bundled_flags(ctx, arg, args, &mut flags)?;
             tar_advance_skip(&mut args, &mut consumed, skip_next);
@@ -439,6 +471,7 @@ pub(crate) fn util_tar(ctx: &mut UtilContext<'_>, argv: &[&str]) -> i32 {
             &base_dir,
             flags.gzipped,
             flags.verbose,
+            &flags.excludes,
         )
     } else if flags.extract {
         tar_extract(ctx, archive_path, &base_dir, flags.gzipped, flags.verbose)
@@ -457,14 +490,18 @@ fn tar_create(
     base_dir: &str,
     gzipped: bool,
     verbose: bool,
+    excludes: &[&str],
 ) -> i32 {
     let mut tar_data = Vec::new();
 
     for file in files {
+        if tar_name_excluded(file, excludes) {
+            continue;
+        }
         let full = resolve_path(base_dir, file);
         match ctx.fs.stat(&full) {
             Ok(meta) if meta.is_dir => {
-                if tar_add_dir(ctx, &mut tar_data, &full, file, verbose) != 0 {
+                if tar_add_dir(ctx, &mut tar_data, &full, file, verbose, excludes) != 0 {
                     return 1;
                 }
             }
@@ -534,6 +571,7 @@ fn tar_add_dir(
     full_path: &str,
     name: &str,
     verbose: bool,
+    excludes: &[&str],
 ) -> i32 {
     let dir_name = if name.ends_with('/') {
         name.to_string()
@@ -558,8 +596,11 @@ fn tar_add_dir(
     for entry in entries {
         let child_full = child_path(full_path, &entry.name);
         let child_name = format!("{dir_name}{}", entry.name);
+        if tar_name_excluded(&child_name, excludes) {
+            continue;
+        }
         let rc = if entry.is_dir {
-            tar_add_dir(ctx, tar_data, &child_full, &child_name, verbose)
+            tar_add_dir(ctx, tar_data, &child_full, &child_name, verbose, excludes)
         } else {
             tar_add_file(ctx, tar_data, &child_full, &child_name, verbose)
         };

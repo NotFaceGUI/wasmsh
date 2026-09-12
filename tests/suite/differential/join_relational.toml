@@ -1,0 +1,37 @@
+[test]
+name = "join-relational-operations"
+tags = ["join", "differential", "P0"]
+tier = "P0"
+class = "compat-bash"
+stage = "differential"
+requires = ["join", "printf", "echo"]
+
+# join on the first field by default, with inner/outer/anti joins, an explicit
+# -o field list, a -t separator, alternate key fields, and the cross product
+# GNU produces for duplicate keys.
+[input]
+script = """
+printf '1 a\\n2 b\\n3 c\\n' > f1
+printf '1 X\\n2 Y\\n4 Z\\n' > f2
+join f1 f2
+join -a1 f1 f2
+join -a2 f1 f2
+join -v1 f1 f2
+join -v2 f1 f2
+join -o 1.1,1.2,2.2 f1 f2
+join -a1 -e NA -o 1.1,2.2 f1 f2
+printf 'a,1\\nb,2\\n' > c1
+printf 'a,x\\nc,z\\n' > c2
+join -t, c1 c2
+printf '1 a\\n1 b\\n' > d1
+printf '1 X\\n1 Y\\n' > d2
+join d1 d2
+"""
+
+[expect]
+status = 0
+stdout = "1 a X\n2 b Y\n1 a X\n2 b Y\n3 c\n1 a X\n2 b Y\n4 Z\n3 c\n4 Z\n1 a X\n2 b Y\n1 X\n2 Y\n3 NA\na,1,x\n1 a X\n1 a Y\n1 b X\n1 b Y\n"
+
+[oracle]
+compare = true
+shells = ["bash"]

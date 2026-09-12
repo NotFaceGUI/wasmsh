@@ -40,6 +40,8 @@ pub fn implemented_features() -> HashSet<&'static str> {
     f.insert("for-in");
     f.insert("case");
     f.insert("subshell");
+    // Child `sh`/`bash` invocation (`sh file`, `sh -c`, `sh -n`, `sh -x`).
+    f.insert("children");
     f.insert("brace-group");
     f.insert("function");
 
@@ -217,6 +219,8 @@ pub fn implemented_features() -> HashSet<&'static str> {
     f.insert("rg");
     f.insert("tree");
     f.insert("xxd");
+    f.insert("od");
+    f.insert("join");
     f.insert("dd");
     f.insert("strings");
     f.insert("split");
@@ -228,6 +232,7 @@ pub fn implemented_features() -> HashSet<&'static str> {
     f.insert("fd");
     f.insert("file");
     f.insert("comm");
+    f.insert("cmp-utility");
     f.insert("yq");
 
     f
