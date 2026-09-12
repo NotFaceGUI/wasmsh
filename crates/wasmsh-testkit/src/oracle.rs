@@ -81,7 +81,8 @@ pub fn resolve_shell(shell: &str) -> Result<PathBuf, String> {
         return Ok(found);
     }
 
-    if cfg!(windows) && shell == "bash" {
+    #[cfg(windows)]
+    if shell == "bash" {
         for candidate in windows_bash_candidates() {
             if is_executable(&candidate) {
                 return Ok(candidate);
