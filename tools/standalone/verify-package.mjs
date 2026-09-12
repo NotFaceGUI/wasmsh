@@ -75,7 +75,7 @@ for (const file of filesUnder(packageRoot)) {
 
 const manifestPath = join(packageRoot, "build-manifest.json");
 if (existsSync(manifestPath)) {
-  const requiredFiles = ["LICENSE", "README.md", "SUPPORTED.md", "VERSION", "SHA256SUMS"];
+  const requiredFiles = ["LICENSE", "README.md", "SKILL.md", "SUPPORTED.md", "VERSION", "SHA256SUMS"];
   for (const file of requiredFiles) {
     if (!existsSync(join(packageRoot, file))) fail(`final artifact is missing ${file}`);
   }

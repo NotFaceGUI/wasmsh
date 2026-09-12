@@ -65,7 +65,7 @@ copyFileSync(
   join(repoRoot, "tools/standalone/node-network-host.d.ts"),
   join(artifactRoot, "host/node-network-host.d.ts"),
 );
-for (const file of ["LICENSE", "SUPPORTED.md"]) {
+for (const file of ["LICENSE", "SUPPORTED.md", "SKILL.md"]) {
   copyFileSync(join(repoRoot, file), join(artifactRoot, file));
 }
 copyFileSync(join(repoRoot, "tools/standalone/README.md"), join(artifactRoot, "README.md"));

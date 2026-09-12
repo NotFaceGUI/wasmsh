@@ -1,8 +1,8 @@
 # AI Shell 沙箱：项目目标
 
-状态：需求与实施规划，尚未实施功能改造。分析日期：2026-09-09。
+状态：需求已实施并完成云端验证（截至 `v0.9.5`，2026-09-12）。分析日期：2026-09-09。
 
-分析基线：`NotFaceGUI/wasmsh`，提交 `61811885b4f1f730fd6236b5d08be3c29615558b`。本文基于本地源码与既有测试内容的静态核对，不表示测试已运行或 GitHub Actions 已成功构建。
+分析基线：`NotFaceGUI/wasmsh`，提交 `61811885b4f1f730fd6236b5d08be3c29615558b`。本文最初基于本地源码静态核对；后续 M0-M4 已实现，并由 GitHub-hosted runner 实际构建、三平台消费验证和发布，逐项证据见 [目标验证报告](verification-report.md)。
 
 ## 1. 核心目标
 
@@ -74,12 +74,12 @@ M0 产物是基础版本，不得提前标记 M1-M3 已完成。有限缓冲 ext
 
 ## 7. 总体验收
 
-- [ ] 本仓库 GitHub Actions 无须上游组织 runner、发布密钥或 Python 构建即可编译独立 WASM。
-- [ ] 产物包含 `.wasm`、配套加载器、类型声明、许可证、版本与 SHA-256 清单，干净目录可加载。
-- [ ] Python/Pyodide 资产既不被打包，也不在启动时隐式下载；默认无 `python`/`python3` external 注册。
-- [ ] 日期实时回调、网络策略、external 管道全部通过 [需求验收矩阵](design/ai-shell-requirements.md#6-验收矩阵)。
-- [ ] Windows/Linux/macOS 使用同一构建产物验证基础 shell 与宿主 external 契约。
-- [ ] 超时、取消、输出限额、会话隔离及能力拒绝可观察且不会伪报成功。
-- [ ] 记录每项测试使用的 commit、产物摘要、宿主环境与失败日志；明确未支持的 Bash/终端功能。
+- [x] 本仓库 GitHub Actions 无须上游组织 runner、发布密钥或 Python 构建即可编译独立 WASM。（`Standalone Release` `34689670098`、`Standalone WASM` `34690078437` 全绿）
+- [x] 产物包含 `.wasm`、配套加载器、类型声明、许可证、版本与 SHA-256 清单，干净目录可加载。（31 项 `SHA256SUMS` 全 OK，三 target 一致，Node/bundler smoke 通过）
+- [x] Python/Pyodide 资产既不被打包，也不在启动时隐式下载；默认无 `python`/`python3` external 注册。（`verify-package.mjs` 断言，Node smoke 覆盖禁用 `fetch`）
+- [x] 日期实时回调、网络策略、external 管道通过 [需求验收矩阵](design/ai-shell-requirements.md#6-验收矩阵) 的 Rust 与 Node/宿主部分；浏览器网络路径按设计失败封闭，浏览器无原生进程能力。（见 [验证报告](verification-report.md#5-尚未达成或有意的缺口)）
+- [x] Windows/Linux/macOS 使用同一构建产物验证基础 shell 与宿主 external 契约。（release/`main` 工作流的三平台 host matrix 通过）
+- [x] 超时、取消、输出限额、会话隔离及能力拒绝可观察且不会伪报成功。（`node-smoke.mjs` 断言 124/125/126/127、取消 130、会话隔离）
+- [x] 记录每项测试使用的 commit、产物摘要、宿主环境与失败日志；明确未支持的 Bash/终端功能。（[实施跟踪](implementation-tracker.md)、[验证报告](verification-report.md)、[SUPPORTED.md](../SUPPORTED.md) 已知差异清单）
 
 GitHub Actions 具体改造和下载交付要求见 [构建计划](guides/standalone-wasm-build-plan.md)。

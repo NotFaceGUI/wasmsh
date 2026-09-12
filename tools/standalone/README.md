@@ -4,12 +4,16 @@ This archive contains the independently built `wasmsh-browser` shell for the
 `wasm32-unknown-unknown` target. Use the loader and matching `.wasm` file from
 one target directory together.
 
+For a short guide aimed at an AI assistant using this shell as its execution
+environment (what is supported, the capability boundaries, and common traps), see
+`SKILL.md` in this archive.
+
 Each of `web/`, `nodejs/`, and `bundler/` contains the complete wasm-bindgen
 loader, declarations, package metadata, and WASM binary for that target.
 
 The archive root contains `VERSION`, `build-manifest.json`, `SHA256SUMS`,
-`LICENSE`, and `SUPPORTED.md`. The checksum file covers every shipped file
-except itself.
+`LICENSE`, `SKILL.md`, and `SUPPORTED.md`. The checksum file covers every shipped
+file except itself.
 
 The current public binding is `WasmShell`: construct it, install the host
 capabilities you intend to grant, call `init(0n, "[]")`, then call

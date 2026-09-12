@@ -175,7 +175,7 @@
 - **真 bug：`[ -f ]` / `[[ -f ]]` 不解析相对路径。** 文件谓词把原始操作数直接交给 `Vfs::stat`，而该 API 不含 cwd，于是 `[ -f rel.txt ]` 失败、`[ -f /abs/rel.txt ]` 成功。`-f -d -e -s -r -w -x -O -G -N` 以及 `[[ a -nt/-ot/-ef b ]]` 现均按 `$PWD` 归一化。这正是 `join empty-file` 用例失败的根因（`: > f` 后文件存在却测不到）。
 - **真 bug：`cd` 不解析相对路径且从不失败。** `cd sub` 把字面量 `sub` 存为 cwd，之后所有相对路径都基于 `sub/sub/...` 解析（`ls` 报 `.: not found: sub`），且目标不存在时静默返回 0。现按当前目录归一化，并在目标缺失/非目录时按 bash 输出 `No such file or directory` / `Not a directory` 且 rc=1。
 - **环境：`/tmp` 与 `$HOME` 不存在。** VFS 初始只有 `/`，`cd /tmp` 失败、往 `/tmp` 写临时文件需先 `mkdir`。现随 `WorkerRuntime::new()` 与 `Init` 重置一并播种 `/tmp`、`/home`、`/home/user`，与 AI 面向的 POSIX 布局契约一致（`init_seeds_deterministic_home_pwd_and_path` 单测即依赖此契约）。
-- **新增 `od`**（`crates/wasmsh-utils/src/od_ops.rs`）：`-A {o,d,x,n}`、`-t {a,c,d,o,u,x}` 带单位宽度、传统 `-b -c -d -o -x -a`、`-j`/`-N`、`-w`（非整单位宽度按 GNU 告警并退化为单单位）、`-v`、重复行 `*` 折叠。与 GNU od 在测试覆盖的旗标组合上逐字节一致（含 C locale 控制字节名 ` `/``/``/…，八进制宽 `ceil(bits/3)`、十六进制 `bits/4`，`-An` 不输出末尾偏移行）。
+- **新增 `od`**（`crates/wasmsh-utils/src/od_ops.rs`）：`-A {o,d,x,n}`、`-t {a,c,d,o,u,x}` 带单位宽度、传统 `-b -c -d -o -x -a`、`-j`/`-N`、`-w`（非整单位宽度按 GNU 告警并退化为单单位）、`-v`、重复行 `*` 折叠。与 GNU od 在测试覆盖的旗标组合上逐字节一致（含 C locale 控制字节名 `<NUL>`/`<BEL>`/`<BS>`/…，八进制宽 `ceil(bits/3)`、十六进制 `bits/4`，`-An` 不输出末尾偏移行）。
 - **新增 `join`**（`crates/wasmsh-utils/src/join_ops.rs`）：`-1/-2/-j`、`-t`、`-a`、`-v`、`-o`（含 `0` 与 `auto`）、`-e`、`-i`，重复键叉积，乱序输入打印 `is not sorted` 到 stderr 并 rc=1。修复 `[ -f ]` 后 `join` 空文件用例也通过。
 - **新增 `tar --exclude`**：含 `/` 的模式匹配整个成员名，不含 `/` 的匹配任意深度的 basename，排除目录即剪枝整棵子树；`--exclude PAT` 与 `--exclude=PAT` 两种写法。三组用例与 GNU tar 输出一致。
 - **新增 `sh -n` / `sh -x`**：`-n` 只解析并在语法错误时输出 `<name>: line N: syntax error: …` 且 rc=2，不执行；`-x` 追踪命令到 stderr 且照常执行；旗标可捆绑（`-nx`）并与 `-c` 组合。为此把 `parse_shell_flags` / `check_script_syntax` / `execute_shell_child` 抽出，并把 xtrace 透传进 isolated 子 shell（在 set 选项重置之后再置 `SHOPT_x`，否则会被新 shell 立即清掉）。
@@ -186,3 +186,38 @@
 - **提交**：`8bfe2a3` `feat(tools): add od, join, tar --exclude, sh -n/-x; fix cwd-relative file tests` + `e2f2a7e` `chore(release): bump version to 0.9.5`。
 - **发布结果**：`Standalone Release` run `34689670098` 全绿（validate → build → verify → 三平台 host matrix → publish）；Release v0.9.5 已创建，asset `wasmsh-standalone-0.9.5-e2f2a7e8c202.tar.gz`。
 - **真实 WASM 产物复核（发布后读回）**：`build-manifest.json` version=0.9.5 / commit=e2f2a7e8c202。用 `nodejs/` loader 在同一 `WasmShell` 会话内跑 15 条断言全 PASS——`od` 默认与 `-An -c` 两种格式、`join` 内连接与 `-v1`、`tar --exclude` 剪枝、`sh -n`（rc 0/2）与 `sh -x`（仍执行）、`jq --version` / `yq --version`、相对路径 `[ -f ]`、`cd sub` 归一化到 `/sub`、`cd /nope` rc=1、`/tmp` 存在、awk `%c 255` 单字节。
+
+## 16. 核心目标验证（2026-09-12 独立复核）
+
+对“GitHub Actions 编译独立 WASM + R1/R2/R3”核心目标做了一次独立验证，不采信代码自述，全部读回真实云端与产物证据。完整报告见 [目标验证报告](verification-report.md)。
+
+- **云端结论**：`Standalone Release` run `34689670098`（tag `v0.9.5`）全绿；`Standalone WASM` run `34690078437`（`main`）全绿，含 advisory `--all-features`；`CI` 最近 `main` run 全绿（含 `oracle` 差分 job）。
+- **真实产物读回**：重新下载 `wasmsh-standalone-0.9.5-e2f2a7e8c202.tar.gz`，归档 SHA256 `cc2cc06cf972fe19bf8bda475fc33cb8a5ed36c3bb2dcfa779cc1bb062d0f7d8` 与 GitHub digest 一致；`sha256sum -c SHA256SUMS` 31 项全 OK；`verify-package.mjs` 报 `verified 3 targets without Python/Pyodide runtime assets`；web/nodejs/bundler 三份 WASM 均 3,407,579 bytes 且 SHA256 同为 `8d0ce9e7a011dec8e555b6c56237aca00ebac2959532e283f4e1df1422d95071`；manifest `python_runtime_included=false`、`pyodide_runtime_included=false`。
+- **真实产物功能复核**：对上述解包目录运行 `node-smoke.mjs`（clock 同 Run 双采样与跨年界、网络允许/跨端口重定向拒绝且目标命中 0、失败封闭、有限与流式 external、PIPESTATUS/pipefail、124/125/126、取消 130 后恢复、会话隔离）、`external-smoke.mjs`、`bundler-smoke.mjs`，全部通过。
+- **本地全量回归（本轮）**：`cargo test --workspace --locked` 1597 passed / 0 failed（50 个测试目标）；`WASMSH_ORACLE=1 cargo test -p wasmsh-testkit --test suite_runner --locked` 651 passed / 5 feature-gate SKIP / 0 failed（真实 GNU bash 5.2.37 逐字节对拍）。
+- **结论**：核心目标达成；有意缺口（浏览器无原生进程、浏览器同步 XHR 网络失败封闭、`timeout`/`sleep`/`nproc` 桩、少量 Bash 差异）已在 `SUPPORTED.md` 与验证报告第 5 节列明，不违背“给 AI 稳定 bash 沙箱”的目标。
+- **文档整理**：修正 `SUPPORTED.md`、`docs/project-goals.md`、`docs/guides/standalone-wasm-build-plan.md`、`docs/design/ai-shell-requirements.md` 中“云端仍待运行”的过时状态；修复 `implementation-tracker.md` 内嵌原始控制字节导致的“binary file”读取问题（`<NUL>`/`<BEL>`/`<BS>` 文本化）。
+
+## 17. AI-shell 稳定性 P0 修复（2026-09-12 续）
+
+触发：另一个不含源码、把 standalone WASM 当作唯一 bash 沙箱的外部 agent 报告了四条"进程级"差异。我在真实 v0.9.5 产物上逐条复现，并与真实 GNU bash 5.2.37 对拍确认四条全部成立、且不在既有差分套件内。这一轮只修这四条，其余报告结论已核实为误判（详见第 18 节）。
+
+- **P0-1 命令前缀赋值永久化**：`V=1 cmd` 的赋值留在 shell 变量表，且跨独立 `exec` 残留（上一次会话污染下一次），直接击穿环境稳定目标。根因：`execute_exec` 直接 `set_var` 后不还原。改为执行前快照、执行后还原；`export`/`readonly`/`declare -x|-r` 显式点名该变量时按 bash 语义提升为持久变量。用例 `differential/prefix_assignment_temporary.toml`。
+- **P0-2 `sh -c '<cmd>' < file` 丢 stdin**：子 shell 以 `pending_input=None` 启动，重定向被丢弃，`cat` 报 `missing operand`。新增 `inherited_child_stdin()`，把启动命令的 stdin 目标转发给 `sh -c` 与 `sh file`。用例 `differential/child_shell_stdin_redirect.toml`。
+- **P0-3 `"$@"` 塌缩为单个拼接字段**：新增多字段展开路径 `collect_multi_atoms`/`expand_word_multi`，`"$@"`、`"${a[@]}"` 每个元素一个字段、空时零字段；并让 VM 快路径对这类词回退到完整解释器。用例 `differential/quoted_at_multi_field.toml`。
+- **P0-4 `${v%%[ ]*}` 等方括号类展开为空**：`simple_glob_match` 只认 `*`/`?`，且 `try_expand_array_single_element` 把 `${v%%[ ]*}` 误当数组下标。补齐 `[abc]`/`[a-z]`/`[!…]` 匹配、strip 操作符走完整 pattern、数组 base 必须是合法标识符；`try_expand_array_slice` 同步加标识符校验。用例 `differential/param_strip_bracket_class.toml`。
+- **回归过程中的一次自伤与修复**：多字段路径最初用一个"试展开"探测词类型，导致算术赋值/自增（`$(( x += 3 ))`、`x++`）被求值两次，`arithmetic_gaps/ag06`、`ag07` 由 5/6/8/7 变成 11 等错误值。改为纯语法判定 `word_has_multi_field_parameter`（只识别 `@`/`name[@]`），在任何展开之前判断，副作用只发生一次。
+- **本地证据**：`cargo test --workspace --locked` 1600 passed / 0 failed；`WASMSH_ORACLE=1` 差分套件 655 passed / 5 feature-gate SKIP / 0 failed（较 v0.9.5 的 651 增加 4 条新用例）；`cargo clippy -p wasmsh-expand -p wasmsh-runtime --all-targets -- -D warnings` 干净；`cargo fmt` 干净。
+- **真实 WASM 复核**：`cargo build --target wasm32-unknown-unknown --release -p wasmsh-browser` + `wasm-bindgen --target nodejs` 后，在同一 `WasmShell` 内跑 10 条断言全 PASS——原文四条复现（含跨 `exec` 泄漏 `V=1` → `V=`）、`V=1 export V` 提升、`sh -c 'cat' < f`、`sh file < f`、`printf "b\n" | g` 中 `g(){ cat "$@"; }`、`"$@"` 多字段、`${v%%[ ]*}`、`${w%%[0-9]*}`/`${w%[a-z]}`。
+- **未做**：本轮未修改网络策略、external、CI 链路；不改变任何已发布产物的能力声明。修复尚未打版本/发布，云端 CI 在推送后才会验证。
+
+## 18. 外部报告的事实更正（2026-09-12 续）
+
+外部 agent 在不含源码、仅黑盒使用 standalone WASM 的条件下，除四条真 P0 外还给出若干"现状判断"。逐条在真实 v0.9.5 产物上实测后，以下判断不成立，记录下来避免后续按错误前提设计：
+
+- **"curl 策略拒绝的退出码是 0（静默失败）"——不成立。** 实测：无 broker 的默认配置 `curl -s https://example.com` 返回 rc=6；装了 `installNodeNetworkBroker` 后结构化策略拒绝返回 rc=1；`wget` 同类返回 rc=1 并写 `network error: ... trusted redirect-aware broker` 诊断。从不返回 0。
+- **"curl 只有一个开关且当前 disabled"——不成立。** 实现是完整 `NetworkPolicy`（`enabled` + `default_action` + `allow` + `deny`），支持 `*.example.com` 严格子域、deny 优先、大小写/尾点/IDNA/IPv6/有效端口规范化，不支持的模式（`api.*.com`、CIDR）在初始化时报错；有 `wasmsh-utils` 单测与 `wasmsh-browser` network_security 测试守护。默认关闭网络是**安全默认**，不是能力缺失。这正是"网络是什么东西"的答案：**一个由宿主配置、默认拒绝的 HTTP 能力策略层**——`curl`/`wget` 的每个实际请求（含每次重定向跳转）在发出前经过它，规则来自宿主的可信配置而非 shell 变量；浏览器无逐跳控制能力时直接失败封闭。
+- **"需求① 时间 callback 还差调用内持续取时"——不成立。** 用每次 `+100ms` 的 callback，单次 `exec` 内三次 `date +%s.%N` 得到三个不同时间戳（`...600.100`/`.200`/`.300`），证明每次取时都调用 callback。"三次完全相同"只是 `Date.now()` 的毫秒精度，不是冻结。
+- **"external 用不了管道，是唯一架构级改造"——不成立。** 注册宿主 executor（`host/node-external-host.mjs`）后 `printf hi | hostcat | wc -c` → `2`；流式/背压/提前结束/取消均已实现。黑盒测得"用不了"是因为没有注册 host executor。其"fd 桥接契约"在重新发明已交付能力。
+- **CI 的 target/feature/crate 名全推错——不成立。** 真实构建目标是 `wasm32-unknown-unknown`、crate 为 `wasmsh-browser`；workflow 已在 GitHub-hosted runner 上连续全绿（run `34689670098` / `34690078437`）。
+- **补充新发现**：`$SECONDS` 在单次 `exec` 内不推进（9.6s 原生忙等后仍为 `0`），只在顶层 `exec` 之间更新。这是真差异，但不在本次四条 P0 范围内，未修。

@@ -1,15 +1,14 @@
 # 独立 sh WASM：GitHub Actions 构建计划
 
-状态：M0-M4 的代码和本地验收入口已在当前分支实施；GitHub Actions、浏览器
-云端构建和正式发布仍待运行。正式产物不能以本地手工 wasm-bindgen 目录替代。
+状态：M0-M4 的代码、云端构建、三平台消费验证和正式发布均已完成（截至 `v0.9.5`，2026-09-12）。正式产物由 Release 提供，不再以本地手工 wasm-bindgen 目录替代。逐项证据见 [目标验证报告](../verification-report.md)。
 总体目标见 [项目目标](../project-goals.md)。
 
 ## 1. 现有流程的可复用部分与阻碍
 
 | 文件 | 当前情况 | 处理要求 |
 | --- | --- | --- |
-| [wasm-build.yml](../../.github/workflows/wasm-build.yml) | 已迁移为独立 sh candidate、实物验证和 GitHub-hosted 三平台消费矩阵；尚无本地云端 run 证据 | 保持 `workflow_dispatch`、固定工具和最终上传门禁 |
-| [release.yml](../../.github/workflows/release.yml) | 已建立 standalone release 链路，并让 Release 等待 browser 与三平台 host matrix | 不继承上游密钥或包发布目标；tag 发布仍待实际 run 验证 |
+| [wasm-build.yml](../../.github/workflows/wasm-build.yml) | 已迁移为独立 sh candidate、实物验证和 GitHub-hosted 三平台消费矩阵；`main` run `34690078437` 全绿 | 保持 `workflow_dispatch`、固定工具和最终上传门禁 |
+| [release.yml](../../.github/workflows/release.yml) | 已建立 standalone release 链路，并让 Release 等待 browser 与三平台 host matrix；tag `v0.9.5` run `34689670098` 全绿并发布 | 不继承上游密钥或包发布目标；继续由 tag 触发正式发布 |
 | [ci.yml](../../.github/workflows/ci.yml) | 主 CI 使用 GitHub-hosted runner 做核心 Rust/WASM 检查 | 公开 PR 不依赖上游 runner；standalone 产物验证由 wasm-build workflow 提供 |
 | [setup-rust action](../../.github/actions/setup-rust/action.yml) | 从 rust-toolchain.toml 读取版本，安装系统编译依赖 | 复用版本单一来源；评估 Ubuntu runner 是否需要现有 apt 安装步骤 |
 | [rust-toolchain.toml](../../rust-toolchain.toml) | 固定 Rust 1.95.0，同时声明 unknown-unknown 和 emscripten | shell 主链路仅要求 unknown-unknown；移除默认 emscripten 安装需求或拆分 legacy 配置 |
@@ -17,7 +16,7 @@
 | [standalone build.sh](../../e2e/standalone/build.sh) | 仅负责把参数化 standalone builder 输出放入 E2E fixture | 正式构建使用 `tools/standalone/build.sh`，不在 E2E job 重编译 |
 | [standalone E2E](../../e2e/standalone/package.json) | 已有 Playwright 套件与 package-lock.json | 使用锁文件安装；验证即将上传的产物，避免另建一份不同二进制 |
 
-现有 wasm-build 的注释记录 GitHub-hosted runner 上发生过 worker 超时与 `WebAssembly.Table.grow()` 失败。因此迁移到 `ubuntu-24.04` 是待验证的实施选择，不是已验证修复。先以 Chromium 单 worker、有限并发运行，记录资源与错误；若仍失败，诊断编译/内存行为或选择本项目可用的 runner，不能删除 E2E 门禁掩盖问题。
+现有 wasm-build 的注释记录 GitHub-hosted runner 上发生过 worker 超时与 `WebAssembly.Table.grow()` 失败。迁移到 `ubuntu-24.04` 后的 Chrome/Playwright 与三平台 host matrix 已在 `v0.9.0`-`v0.9.5` 的 Release run 中连续通过，不再视为待验证选择；如后续出现资源失败，应诊断编译/内存行为，不能删除 E2E 门禁掩盖问题。
 
 ## 2. 构建输入与交付结构
 
@@ -43,8 +42,9 @@ wasmsh-standalone-<version>-<commit>/
 
 `host/` 是接入层交付目录；包含有限输入 executor、基于
 `StartRun`/`PollRun` 的非阻塞 Node stream executor，以及一个逐请求、禁止自动
-重定向的 Node HTTP(S) broker。M1-M3 的 Rust/WASM/Node 路径已有本地证据；
-browser native-process 和跨平台云端最终证据仍不能从本地测试推导。
+重定向的 Node HTTP(S) broker。M1-M3 的 Rust/WASM/Node 路径以及跨平台云端消费
+验证（ubuntu/macos/windows）均已完成；browser native-process 仍未实现，属有意
+的安全边界而非待补证据。
 
 build-manifest 至少包括版本、源 commit、构建 run ID、Rust/wasm-pack/wasm-opt/Node 版本、目标、特性与资源限制配置；SHA256SUMS 覆盖最终发布文件（清单自身除外）。报告 WASM 原始大小和 gzip 大小，首个成功基线之后再制定体积回归阈值。
 

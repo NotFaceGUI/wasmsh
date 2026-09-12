@@ -5,8 +5,10 @@
 面向 AI 助手提供统一的 Bash 兼容沙箱，减少对宿主 PowerShell / sh 和系统工具环境的依赖。主交付物为 GitHub Actions 编译的独立 sh WASM，不包含 WASM Python / Pyodide。
 
 - [项目目标、范围与里程碑](docs/project-goals.md)
+- [AI 助手快速上手（skill，随产物发布）](SKILL.md)
 - [时间回调、网络黑白名单与 external 管道需求](docs/design/ai-shell-requirements.md)
 - [独立 WASM 的 GitHub Actions 构建计划](docs/guides/standalone-wasm-build-plan.md)
+- [核心目标验证报告（云端 + 真实产物读回）](docs/verification-report.md)
 
 以上文档描述目标、边界和验收证据；实际已实现能力以
 [`SUPPORTED.md`](SUPPORTED.md) 与实施跟踪为准。当前主交付是独立 standalone
