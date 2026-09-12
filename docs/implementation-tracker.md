@@ -131,3 +131,17 @@
 - **提交**：`5bbc7b8` `fix(semantics): close silent-result and scope leaks found by a bash differential audit` + `7f8328a` `chore(release): bump version to 0.9.2`，推送 `main` 后打 tag `v0.9.2`。
 - **发布结果**：`Standalone Release` run `34685634969` 全绿——Validate release source（1m49s）→ Build release candidate（5m34s）→ Verify release candidate（46s）→ Release host consumption macos-15 / windows-2025 / ubuntu-24.04 → Upload tested release artifact → **Publish standalone GitHub Release**。Release v0.9.2 已创建：https://github.com/NotFaceGUI/wasmsh/releases/tag/v0.9.2 ，asset `wasmsh-standalone-0.9.2-7f8328ad4fde.tar.gz`（3,876,671 bytes）。
 - **真实 WASM 产物复核（发布后读回）**：下载 Release 资产，`sha256sum -c SHA256SUMS` 全 OK，`build-manifest.json` version=0.9.2 / ref=v0.9.2 / commit=7f8328ad4fde。用 `nodejs/` loader 在同一 `WasmShell` 会话内跑 18 条断言，覆盖本轮每条修复——`sed 's/^/X/'`→`Xab`、`s/[[:space:]]*$//` 裁剪、`s/a*/Y/g` 零宽匹配、`"$d"/*.sh` 展开、`${v: -2}`/`${v:1:-2}`、here-doc 内 `$(( ))`/`$( )`、`read` 保留制表符与 remainder、子 shell 不继承 `set -u`、`( … )` 内致命只终止子 shell、子 shell 函数不外泄、子 `sh` 的 EXIT trap 触发、`printf --`、`xargs -I{}`、`cmp -`，**18/18 PASS**，且末尾 `echo SESSION_ALIVE` 正常，证明实例未被 poison。
+
+
+## 12. v0.9.3 —— 输出进程替换 panic 与实例毒化修复（2026-09-12 续）
+
+触发：下游报告 `tee >(wc -c > /tmp/_ps.txt) <<< hi` 让 standalone WASM 以 `panicked at lib.rs: unreachable: buffered pipeline stage requires runtime access` trap 退出，并且该 `WasmShell` 对象之后永久不可用（`recursive use of an object` / `while it was borrowed`），`v0.8.0`~`v0.9.2` 全部可复现。
+
+- **复现**：原生内核不崩（`wasmsh-dev` 能拿到 isolated runtime），只有注册了 external handler 的配置才崩——而 `WasmShell::new()` 恒装 `external_spec_handler`。据此写出集成测试：`WorkerRuntime` + `set_external_handler(...)`，一行即稳定复现同一 `unreachable`。
+- **根因**：管道阶段分两类，`BufferedCommand`（`cmd > file`、复合命令）与 `External`（宿主可执行）必须在**拥有 runtime** 的 runner 里 poll。`<(cmd)` 的构建器对此有守卫：需要 runtime 且拿不到 isolated runtime 就返回 `None`，落回缓冲捕获；`>(cmd)` 的构建器**漏了同一守卫**，照建 runner，命令结束走 `finish()` → `poll_without_runtime()` → 命中 `unreachable!()`。
+- **修复一（消除 panic）**：抽出 `pipeline_requires_runtime()`，`try_build_live_process_subst_runner` 用与 `<(cmd)` 相同的守卫：`clone_for_isolated_process_subst()` 为 `None` 且管道需要 runtime 时返回 `None`，改走 `execute_inner_capture_stdout` 缓冲回退。命令正常完成，不再 panic。
+- **修复二（消除静默丢数据）**：`tee >(consumer)`、`cp x >(consumer)` 这类把替换路径当普通 argv 打开的工具，数据写进 VFS 而不经 runtime sink，导致回退路径下 consumer 收不到任何内容；`flush_process_subst_out` 现在在该文件非空时读取并删除它，作为 payload 喂给 consumer（与 `cmd > >(consumer)` 的 sink 路径互补）。
+- **修复三（fail-soft）**：`poll_without_runtime` / `close_without_runtime` 里那两个持有不变量的 `unreachable!()` 改为"关闭输出管道并报告 finished"，即使不变量将来被破坏也只是该命令无输出，而不是 abort 整个模块。
+- **关于 catch_unwind**：`wasm32-unknown-unknown` 实测 `panic = "abort"`（`rustc --print cfg` 确认），panic 是不可捕获的 trap，`catch_unwind` 无法释放 wasm-bindgen 借用标记，因此**结构性消除可达 panic** 才是唯一持久修法；报告里"catch 后显式释放借用"的建议在本目标下不成立，已如实记录在 `SUPPORTED.md`。
+- **回归**：新增 `crates/wasmsh-runtime/tests/output_process_substitution.rs` 9 条断言——3 个原 panic 触发、3 个原本正常的对照（`<(cmd)`、`> >(cat)`、`tee >(cat)`）、`tee >(consumer > file)` 与 `cmd > >(consumer > file)` 的落盘校验，以及"连跑三个触发后同一实例仍能 `echo alive`"的复用断言。
+- **本地证据**：`cargo test --workspace` 全绿（50 个测试目标）；`cargo test -p wasmsh-browser --lib` 250 通过（该 crate 的 `run_shell` 正是无 isolated runtime 的配置，含 `process_subst_out_*` 4 条既有用例）；TOML 套件全绿；`cargo clippy -p wasmsh-runtime --all-targets -- -D warnings` 干净；`cargo fmt --all` 干净。

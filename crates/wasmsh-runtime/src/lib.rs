@@ -983,14 +983,33 @@ impl StreamingPipeProcess<'_> {
         }
     }
 
+    /// Close this stage's output pipe, if the stage owns one.
+    fn close_output_pipe(&self) {
+        match self {
+            Self::External(process) => process.output.borrow_mut().close_write(),
+            Self::Buffered(process) => process.output.borrow_mut().close_write(),
+            Self::Read(_) | Self::Head(_) | Self::Tee(_) => {}
+        }
+    }
+
+    /// Poll a stage that is only driven by pure streaming.
+    ///
+    /// `External` and `Buffered` stages need runtime access; the pipeline
+    /// builders guarantee such a stage is never placed in a runner without an
+    /// isolated runtime. Should that invariant ever be violated, this must not
+    /// panic: a Rust panic in the WASM build is an abort that skips
+    /// wasm-bindgen's borrow release and permanently poisons the shell
+    /// instance. Instead the stage is closed and reported finished, so the
+    /// enclosing command completes (possibly with no output) and the instance
+    /// stays usable.
     fn poll_without_runtime(&mut self) -> PipeProcessPoll {
         match self {
             Self::Read(process) => process.poll(),
             Self::Head(process) => process.poll(),
             Self::Tee(process) => process.poll(),
-            Self::External(_) => unreachable!("streaming external process requires runtime access"),
-            Self::Buffered(_) => {
-                unreachable!("buffered pipeline stage requires runtime access")
+            Self::External(_) | Self::Buffered(_) => {
+                self.close_output_pipe();
+                PipeProcessPoll::Exited
             }
         }
     }
@@ -998,11 +1017,8 @@ impl StreamingPipeProcess<'_> {
     fn close_without_runtime(&mut self) {
         match self {
             Self::Tee(process) => process.close(),
-            Self::External(_) => unreachable!("streaming external process requires runtime access"),
             Self::Read(_) | Self::Head(_) => {}
-            Self::Buffered(_) => {
-                unreachable!("buffered pipeline stage requires runtime access")
-            }
+            Self::External(_) | Self::Buffered(_) => self.close_output_pipe(),
         }
     }
 }
@@ -8186,6 +8202,23 @@ impl WorkerRuntime {
             && self.network.is_none()
     }
 
+    /// Whether any stage of a process-substitution pipeline is driven by a
+    /// process that can only be polled with runtime access.
+    ///
+    /// `BufferedCommand` (`cmd > file`, a compound command) and `External`
+    /// (a host executable) both need a runtime to make progress; the purely
+    /// streaming stages (`cat`, `head`, `tee`, `grep`, …) do not. When such a
+    /// stage is present and no isolated runtime can be cloned, the pipeline
+    /// cannot be built live and the caller must use the buffered fallback.
+    fn pipeline_requires_runtime(&mut self, pipeline: &HirPipeline) -> bool {
+        pipeline.commands.iter().enumerate().any(|(idx, cmd)| {
+            matches!(
+                self.compile_pipeline_stage(cmd, idx == 0),
+                StreamingPipelineStage::BufferedCommand(_) | StreamingPipelineStage::External(_)
+            )
+        })
+    }
+
     fn clone_for_isolated_process_subst(&self) -> Option<Self> {
         if !self.can_use_isolated_process_subst_runtime() {
             return None;
@@ -8466,12 +8499,7 @@ impl WorkerRuntime {
         Rc<RefCell<Vec<wasmsh_vm::DiagnosticEvent>>>,
     )> {
         let pipeline = Self::parse_single_pipeline_input(inner)?;
-        let requires_runtime = pipeline.commands.iter().enumerate().any(|(idx, cmd)| {
-            matches!(
-                self.compile_pipeline_stage(cmd, idx == 0),
-                StreamingPipelineStage::BufferedCommand(_)
-            )
-        });
+        let requires_runtime = self.pipeline_requires_runtime(&pipeline);
         let mut isolated_runtime = if requires_runtime {
             self.clone_for_isolated_process_subst().map(Box::new)
         } else {
@@ -8547,8 +8575,18 @@ impl WorkerRuntime {
         inner: &str,
     ) -> Option<LiveProcessSubstRunner> {
         let pipeline = Self::parse_single_pipeline_input(inner)?;
+        // A buffered stage (`cmd > file`, a compound command, …) or an external
+        // command can only be driven by a live runner that owns a runtime. When
+        // no isolated runtime can be cloned (an external handler is registered,
+        // as the standalone WASM shell always does), such a pipeline is not
+        // live-capable: return `None` so the caller uses the buffered
+        // `execute_inner_capture_stdout` fallback instead of building a runner
+        // whose `finish()` would have to poll without a runtime and panic.
+        let mut isolated_runtime = self.clone_for_isolated_process_subst().map(Box::new);
+        if isolated_runtime.is_none() && self.pipeline_requires_runtime(&pipeline) {
+            return None;
+        }
         let source_pipe = Rc::new(RefCell::new(PipeBuffer::new(PIPEBUFFER_STREAMING_CAPACITY)));
-        let mut isolated_runtime = self.clone_for_isolated_process_subst();
         let (processes, stage_stderr, stage_pipe_stderr, final_pipe, _) =
             if let Some(runtime) = isolated_runtime.as_mut() {
                 runtime.build_live_process_subst_pipeline(&pipeline, Some(source_pipe.clone()))?
@@ -8557,7 +8595,7 @@ impl WorkerRuntime {
             };
 
         Some(LiveProcessSubstRunner {
-            isolated_runtime: isolated_runtime.map(Box::new),
+            isolated_runtime,
             source_pipe,
             processes,
             finished: vec![false; stage_stderr.len()],
@@ -8620,15 +8658,43 @@ impl WorkerRuntime {
 
     fn flush_process_subst_out(&mut self, sink: PendingProcessSubstOut) {
         let saved_status = self.vm.state.last_status;
+        // A redirection to the substitution path (`cmd > >(consumer)`) is
+        // routed to the runtime sink, so `data` already holds the payload.
+        // A utility that takes the path as a plain argv operand (`tee
+        // >(consumer)`, `cp x >(consumer)`) opens it through the filesystem
+        // instead and writes it there, leaving the sink empty. Collect that
+        // file so the consumer still receives the payload (bash semantics).
+        let staged = self.take_process_subst_staging(&sink.path);
         match sink.mode {
-            PendingProcessSubstOutMode::Buffered { data } => {
+            PendingProcessSubstOutMode::Buffered { mut data } => {
+                if data.is_empty() {
+                    if let Some(staged) = staged {
+                        data = staged;
+                    }
+                }
                 self.flush_buffered_process_subst_out(&sink.inner, data);
             }
-            PendingProcessSubstOutMode::Live { runner } => {
+            PendingProcessSubstOutMode::Live { mut runner } => {
+                if let Some(staged) = staged {
+                    runner.write_input(&staged);
+                }
                 self.flush_live_process_subst_out(runner);
             }
         }
         self.vm.state.last_status = saved_status;
+    }
+
+    /// Read and remove the VFS file backing an output substitution path, if a
+    /// command wrote one by opening the path directly.
+    fn take_process_subst_staging(&mut self, path: &str) -> Option<Vec<u8>> {
+        let handle = self.fs.open(path, OpenOptions::read()).ok()?;
+        let data = self.fs.read_file(handle).ok();
+        self.fs.close(handle);
+        self.fs.remove_file(path).ok();
+        match data {
+            Some(bytes) if !bytes.is_empty() => Some(bytes),
+            _ => None,
+        }
     }
 
     fn flush_buffered_process_subst_out(&mut self, inner: &str, data: Vec<u8>) {

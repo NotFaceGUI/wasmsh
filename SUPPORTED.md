@@ -651,6 +651,44 @@ wrong results and scope leaks. Each is guarded by a case in
 - `xargs -I{}` (attached replacement string) was a parse error.
 - `cmp` did not accept `-` for standard input.
 
+### Fixed in the output-process-substitution pass (v0.9.3)
+
+`tee >(wc -c > file) <<< hi` (and any `>(...)` whose consumer has its own
+redirection, compound command, or external command) aborted the whole WASM
+module with
+
+```
+internal error: entered unreachable code: buffered pipeline stage requires runtime access
+```
+
+Root cause: the `>(cmd)` builder did not mirror the `<(cmd)` builder's guard.
+When a pipeline stage needs runtime access (`BufferedCommand` for `cmd > file`
+or a compound command, `External` for a host executable) the runner must own an
+isolated runtime. `<(cmd)` returned `None` in that case and fell back to a
+buffered capture; `>(cmd)` built the runner anyway and, at end of command,
+polled it through the no-runtime path — where the invariant check used
+`unreachable!()`. The standalone `WasmShell` always installs an external spec
+handler, which disables the isolated runtime, so this path was reached on every
+call.
+
+Fixes:
+- The `>(cmd)` builder now shares the `<(cmd)` guard: if any stage requires
+  runtime access and no isolated runtime can be cloned, it returns `None` and
+  the command uses the buffered fallback. No panic, correct output.
+- A utility that opens the substitution path directly (`tee >(consumer)`,
+  `cp x >(consumer)`) writes it through the filesystem rather than the runtime
+  sink. The sink now falls back to reading and removing that file, so the
+  consumer still receives the payload instead of silently getting nothing.
+- The two `poll_without_runtime` / `close_without_runtime` arms that held the
+  invariant are no longer panicking; if the invariant is ever violated, the
+  stage is closed and reported finished so the shell instance survives.
+
+Note on recovery: wasm32-unknown-unknown is compiled with `panic = "abort"`
+(verified via `rustc --print cfg`), so a Rust panic is an uncatchable trap and
+`std::panic::catch_unwind` cannot be used to restore the wasm-bindgen borrow
+state. Eliminating reachable panics is the only durable mitigation; the
+invariant arms above now fail soft instead of aborting.
+
 ### Remaining known divergences (not yet fixed)
 
 - `${arr[@]:1:-1}` (negative slice length on an array): bash reports an error,
