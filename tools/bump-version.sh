@@ -73,11 +73,16 @@ echo "  packages/python/wasmsh-pyodide-runtime/pyproject.toml"
 sedi -E "s/^(appVersion: )\"[^\"]+\"/\1\"$VERSION\"/" "$REPO_ROOT/deploy/helm/wasmsh/Chart.yaml"
 echo "  deploy/helm/wasmsh/Chart.yaml (appVersion only)"
 
-# Regenerate Cargo.lock files
-echo "  Regenerating lockfiles..."
-(cd "$REPO_ROOT" && cargo generate-lockfile 2>/dev/null) || true
+# Refresh Cargo.lock files. Only the workspace members' own versions may
+# change here: `cargo generate-lockfile` would re-resolve every dependency and
+# float them (e.g. wasm-bindgen), which then mismatches the wasm-bindgen-cli
+# pinned in tools/standalone/versions.env and breaks the WASM release build.
+# `cargo update --workspace` rewrites just the local member versions and leaves
+# third-party pins untouched.
+echo "  Refreshing lockfiles (workspace members only)..."
+(cd "$REPO_ROOT" && cargo update --workspace 2>/dev/null) || true
 for crate in wasmsh-pyodide-probe wasmsh-pyodide; do
-    (cd "$REPO_ROOT/crates/$crate" && cargo generate-lockfile 2>/dev/null) || true
+    (cd "$REPO_ROOT/crates/$crate" && cargo update --workspace 2>/dev/null) || true
 done
 
 echo "Done. All packages set to $VERSION"
